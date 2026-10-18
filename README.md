@@ -1,6 +1,6 @@
 # Overpaint AI
 
-**WIP**
+**IMPORTANT: WIP**
 
 Differentiable stroke-based rendering for AI artifact cleanup and digital art upscaling.
 
