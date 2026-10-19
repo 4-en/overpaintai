@@ -101,3 +101,65 @@ def test_smudge_is_differentiable():
     out[:, 3].sum().backward()
     assert stroke.grad[0, :6].abs().sum() > 0  # curve geometry
     assert stroke.grad[0, 8:11].abs().sum() > 0  # opacity and hardness
+
+
+def test_smudge_backward_matches_numerical_gradient():
+    from overpaintai.canvas_engine import _dab_masks, _SmudgeDabs
+
+    torch.manual_seed(0)
+    B, n, R, H, W = 2, 6, 3, 12, 12
+    Wn, Hp, Wp = 2 * R + 1, H + 2 * R, W + 2 * R
+    dt = torch.float64
+    x = (0.3 + 0.06 * torch.arange(n, dtype=dt)).repeat(B, 1) + 0.01 * torch.rand(B, n, dtype=dt)
+    y = torch.full((B, n), 0.5, dtype=dt) + 0.02 * torch.rand(B, n, dtype=dt)
+    r = torch.full((B, n), 0.12, dtype=dt)
+    strength = torch.rand(B, n, dtype=dt) * 0.9
+    hardness = torch.tensor([0.3, 0.7], dtype=dt)
+    cx, cy = torch.round(x * (W - 1)).long(), torch.round(y * (H - 1)).long()
+    k = torch.arange(Wn)
+    offs = (k.view(-1, 1) * Wp + k.view(1, -1)).flatten()
+    cols, rows = cx.unsqueeze(-1) - R + k, cy.unsqueeze(-1) - R + k
+    window = (
+        cols.to(dt) / (W - 1), rows.to(dt) / (H - 1),
+        ((cols >= 0) & (cols < W)).to(dt), ((rows >= 0) & (rows < H)).to(dt),
+    )
+    canvas = torch.nn.functional.pad(torch.rand(B, 4, H, W, dtype=dt), (R, R, R, R)).reshape(B, 4, Hp * Wp)
+    inputs = [t.clone().requires_grad_(True) for t in (canvas, x, y, r, strength, hardness)]
+
+    def f(c, x, y, r, s, h):
+        return _SmudgeDabs.apply(c, x, y, r, s, h, cy * Wp + cx, offs, *window, 40.0, _dab_masks)
+
+    assert torch.autograd.gradcheck(f, inputs, eps=1e-6, atol=1e-6)
+
+
+def test_stroke_result_does_not_depend_on_batch():
+    torch.manual_seed(1)
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, compile_smudge=False).eval()
+    strokes = torch.sigmoid(torch.randn(5, 14) - torch.tensor([0.0] * 6 + [1.0, 1.0] + [0.0] * 6))
+    tools = torch.zeros(5, 5)
+    tools[:, 2] = 1.0  # smudge: per-stroke dab counts and window-size groups
+    layer = engine.forward_single_step(
+        engine.create_blank_paint_layer(5, SIZE, SIZE), torch.sigmoid(torch.randn(5, 14))
+    )
+    full = engine.forward_single_step(layer, strokes, tools)
+    single = torch.cat([engine.forward_single_step(layer[i : i + 1], strokes[i : i + 1], tools[i : i + 1]) for i in range(5)])
+    assert torch.allclose(full, single, atol=1e-5)
+
+
+def test_checkpointed_unroll_matches_plain_unroll():
+    torch.manual_seed(2)
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, compile_smudge=False).train()
+    raw = torch.randn(2, 3, 14)
+    logits = torch.randn(2, 3, engine.NUM_TOOLS)
+
+    def run(checkpoint_strokes):
+        r, lg = raw.clone().requires_grad_(True), logits.clone().requires_grad_(True)
+        out = engine(
+            engine.create_blank_paint_layer(2, SIZE, SIZE), torch.sigmoid(r), torch.softmax(lg, -1),
+            checkpoint_strokes=checkpoint_strokes,
+        )
+        engine.composite(out).mean().backward()
+        return out.detach(), r.grad, lg.grad
+
+    for a, b in zip(run(False), run(True)):
+        assert torch.allclose(a, b, atol=1e-6)

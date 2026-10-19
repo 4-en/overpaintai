@@ -32,6 +32,12 @@ All 5 tools utilize the continuous capsule distance field and respect the stroke
 - `3: Blur / Blend` - In-place isotropic Gaussian softening of color and alpha boundaries underneath the brush footprint without directional pigment displacement.
 - `4: Eraser` - Subtractive alpha removal (`A_next = A * (1 - eraser_mask)`), supporting both feathered soft erasing and razor-sharp cutouts to reveal the underlying background.
 
+### Performance Notes
+
+- The brush mask only keeps the winning curve segment per pixel for backward, and the smudge tool updates small per-dab windows with a hand-written backward pass, so memory scales with brush footprint rather than canvas size times curve samples.
+- For long unrolls, pass `checkpoint_strokes=True` to `engine(...)`: only the paint layer between strokes is kept, and strokes are recomputed during backward (~1.5x time, memory roughly independent of `K`).
+- The smudge dab math is fused with `torch.compile` on CUDA (`compile_smudge=True`); the first smudge stroke at a new shape triggers a few seconds of compilation.
+
 ## Predictor Architecture
 
 To balance global composition planning with 1:1 pixel accuracy for fine details:

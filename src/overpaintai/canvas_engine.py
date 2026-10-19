@@ -3,6 +3,107 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+
+
+def _brush_profile(
+    dist_sq: torch.Tensor, radius: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
+) -> torch.Tensor:
+    """Blends a soft Gaussian falloff (hardness 0) with a crisp disc edge (hardness 1)."""
+    hard = torch.sigmoid(edge_sharpness * (radius - torch.sqrt(dist_sq + 1e-8)))
+    soft = torch.exp(-2.0 * dist_sq / (radius * radius + 1e-6))
+    return (1.0 - hardness) * soft + hardness * hard
+
+
+def _dab_masks(
+    col_x: torch.Tensor,
+    row_y: torch.Tensor,
+    col_in: torch.Tensor,
+    row_in: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    r: torch.Tensor,
+    hardness: torch.Tensor,
+    strength: torch.Tensor,
+    edge_sharpness: float,
+) -> torch.Tensor:
+    """
+    Smudge transfer masks of all dabs on their windows, `(B, n, Wn * Wn)`: brush profile centered at
+    (`x`, `y`) `(B, n)` times `strength`. `col_x` / `row_y` `(B, n, Wn)` are the windows' normalized pixel
+    coordinates; `col_in` / `row_in` zero out pixels outside the image.
+    """
+    B, n, Wn = col_x.shape
+    d_sq = (col_x.unsqueeze(2) - x.view(B, n, 1, 1)) ** 2 + (row_y.unsqueeze(3) - y.view(B, n, 1, 1)) ** 2
+    m = _brush_profile(d_sq, r.view(B, n, 1, 1), hardness.view(B, 1, 1, 1), edge_sharpness)
+    m = m * (strength.view(B, n, 1, 1) * row_in.unsqueeze(3) * col_in.unsqueeze(2))
+    return m.view(B, n, Wn * Wn)
+
+
+# Fusing the mask math into a few kernels matters: it runs over every dab window
+_dab_masks_compiled = torch.compile(_dab_masks, dynamic=True)
+
+
+def _window_index(base: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
+    """Flat indices `(B, 4, n)` of a window: per-item start `base` `(B,)` plus shared offsets `offs` `(n,)`."""
+    idx = base.view(-1, 1, 1) + offs.view(1, 1, -1)
+    return idx.expand(base.shape[0], 4, offs.shape[0])
+
+
+def _run_dabs(canvas: torch.Tensor, masks: torch.Tensor, base: torch.Tensor, offs: torch.Tensor, diffs=None):
+    """
+    Applies dabs 1..n-1 in place to the flat padded canvas `(B, 4, L)`: each dab's window is blended
+    towards the window at the previous dab by its mask. Optionally records `dragged - cur` per dab.
+    """
+    for i in range(1, masks.shape[1]):
+        cur_idx = _window_index(base[:, i], offs)
+        cur = canvas.gather(2, cur_idx)
+        diff = canvas.gather(2, _window_index(base[:, i - 1], offs)) - cur
+        if diffs is not None:
+            diffs[:, i] = diff
+        canvas.scatter_(2, cur_idx, cur + masks[:, i : i + 1] * diff)
+    return canvas
+
+
+class _SmudgeDabs(torch.autograd.Function):
+    """
+    The whole smudge dab loop as one autograd node. Saving per-dab autograd state for window-sized ops
+    is dominated by full-canvas gradient bookkeeping, so the backward is written by hand: it walks the
+    dabs in reverse, updating a single gradient canvas in place window by window, then maps the mask
+    gradients back to the dab parameters with one vectorized vjp.
+    """
+
+    @staticmethod
+    def forward(ctx, canvas, x, y, r, strength, hardness, base, offs, col_x, row_y, col_in, row_in, edge, mask_fn):
+        with torch.no_grad():
+            masks = mask_fn(col_x, row_y, col_in, row_in, x, y, r, hardness, strength, edge)
+            diffs = canvas.new_empty((canvas.shape[0], masks.shape[1], 4, offs.shape[0]))
+            out = _run_dabs(canvas.clone(), masks, base, offs, diffs)
+        ctx.save_for_backward(x, y, r, strength, hardness, base, offs, col_x, row_y, col_in, row_in, masks, diffs)
+        ctx.edge, ctx.mask_fn = edge, mask_fn
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, y, r, strength, hardness, base, offs, col_x, row_y, col_in, row_in, masks, diffs = ctx.saved_tensors
+        G = grad_out.clone()
+        g_masks = torch.zeros_like(masks)
+        for i in range(masks.shape[1] - 1, 0, -1):
+            cur_idx = _window_index(base[:, i], offs)
+            g_new = G.gather(2, cur_idx)
+            m = masks[:, i : i + 1]
+            g_masks[:, i] = (g_new * diffs[:, i]).sum(dim=1)
+            G.scatter_(2, cur_idx, g_new * (1.0 - m))  # window was overwritten: its grad is only via `cur`
+            G.scatter_add_(2, _window_index(base[:, i - 1], offs), g_new * m)  # via `dragged`
+
+        params = [t.detach().requires_grad_(t.requires_grad) for t in (x, y, r, strength, hardness)]
+        grads = [None] * 5
+        wanted = [p for p in params if p.requires_grad]
+        if wanted:
+            with torch.enable_grad():
+                m_re = ctx.mask_fn(col_x, row_y, col_in, row_in, *params[:3], params[4], params[3], ctx.edge)
+                got = iter(torch.autograd.grad(m_re, wanted, g_masks))
+            grads = [next(got) if p.requires_grad else None for p in params]
+        return (G, *grads) + (None,) * 8
 
 
 class DifferentiableCanvasEngine(nn.Module):
@@ -38,6 +139,7 @@ class DifferentiableCanvasEngine(nn.Module):
         smudge_spacing: float = 0.25,
         smudge_length: float = 12.0,
         smudge_max_dabs: int = 128,
+        compile_smudge: bool = True,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
     ):
@@ -51,6 +153,7 @@ class DifferentiableCanvasEngine(nn.Module):
         self.smudge_spacing = smudge_spacing
         self.smudge_length = smudge_length
         self.smudge_max_dabs = smudge_max_dabs
+        self.compile_smudge = compile_smudge
         self.bg_texture_strength = bg_texture_strength
 
         self.register_buffer("bg_color", torch.tensor(bg_color, dtype=torch.float32).view(1, 3, 1, 1))
@@ -105,22 +208,70 @@ class DifferentiableCanvasEngine(nn.Module):
 
         self._cached_hw = (H, W)
 
-    @staticmethod
-    def _brush_profile(
-        dist_sq: torch.Tensor, radius: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
+    def _segment_profile(
+        self, seg: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
     ) -> torch.Tensor:
-        """Blends a soft Gaussian falloff (hardness 0) with a crisp disc edge (hardness 1)."""
-        hard = torch.sigmoid(edge_sharpness * (radius - torch.sqrt(dist_sq + 1e-8)))
-        soft = torch.exp(-2.0 * dist_sq / (radius * radius + 1e-6))
-        return (1.0 - hardness) * soft + hardness * hard
+        """
+        Profile of capsule segments `seg` `(B, N, H, W, 8)` (or broadcastable), with the last dimension
+        holding [ax, ay, abx, aby, r_start, r_end, a_start, a_end], evaluated on the pixel grid.
+        """
+        ax, ay, abx, aby, r0, r1, a0, a1 = seg.unbind(dim=-1)
+        apx = self.grid_x - ax
+        apy = self.grid_y - ay
+        h = ((apx * abx + apy * aby) / (abx * abx + aby * aby + 1e-8)).clamp(0.0, 1.0)
+        dist_sq = (apx - h * abx) ** 2 + (apy - h * aby) ** 2
+        r_seg = r0 + h * (r1 - r0)
+        a_seg = a0 + h * (a1 - a0)
+        return _brush_profile(dist_sq, r_seg, hardness, edge_sharpness) * a_seg
 
-    def _smudge(
+    def _stroke_mask(
         self,
-        premult: torch.Tensor,
         bx: torch.Tensor,
         by: torch.Tensor,
         rt: torch.Tensor,
         at: torch.Tensor,
+        hardness: torch.Tensor,
+        edge_sharpness: float,
+        chunk: int = 8,
+    ) -> torch.Tensor:
+        """
+        Brush mask `(B, 1, H, W)`: the max of the capsule profiles over all curve segments.
+
+        The max only passes gradient to the winning segment, so the winner per pixel is found without
+        autograd (in chunks, bounding peak memory), and only that segment's profile is recomputed
+        differentiably. Values and gradients match materializing all `(B, S-1, H, W)` segment profiles,
+        at a fraction of the saved memory.
+        """
+        B = bx.shape[0]
+        _, _, H, W = self.grid_x.shape
+        seg = torch.stack(
+            [bx[:, :-1], by[:, :-1], bx[:, 1:] - bx[:, :-1], by[:, 1:] - by[:, :-1],
+             rt[:, :-1], rt[:, 1:], at[:, :-1], at[:, 1:]],
+            dim=-1,
+        ).view(B, -1, 8)  # (B, S-1, 8)
+        n_seg = seg.shape[1]
+
+        with torch.no_grad():
+            best_val = torch.full((B, 1, H, W), -1.0, device=seg.device, dtype=seg.dtype)
+            best_idx = torch.zeros((B, 1, H, W), device=seg.device, dtype=torch.long)
+            for c in range(0, n_seg, chunk):
+                part = seg[:, c : c + chunk].view(B, -1, 1, 1, 8)
+                val, idx = self._segment_profile(part, hardness, edge_sharpness).max(dim=1, keepdim=True)
+                better = val > best_val
+                best_val = torch.where(better, val, best_val)
+                best_idx = torch.where(better, idx + c, best_idx)
+
+        if not (torch.is_grad_enabled() and (seg.requires_grad or hardness.requires_grad)):
+            return best_val
+        winner = torch.gather(seg, 1, best_idx.view(B, H * W, 1).expand(B, H * W, 8))  # (B, H*W, 8)
+        return self._segment_profile(winner.view(B, 1, H, W, 8), hardness, edge_sharpness)
+
+    def _smudge(
+        self,
+        premult: torch.Tensor,
+        ctrl: torch.Tensor,
+        bx: torch.Tensor,
+        by: torch.Tensor,
         hardness: torch.Tensor,
         w_smudge: torch.Tensor,
         edge_sharpness: float,
@@ -128,7 +279,7 @@ class DifferentiableCanvasEngine(nn.Module):
         """
         Physically-motivated smear of premultiplied RGBA `(B, 4, H, W)` along the stroke.
 
-        The curve is resampled into closely spaced dabs. At each dab, the paint under the brush is
+        The curve is split into closely spaced dabs. At each dab, the paint under the brush is
         replaced (at the smear rate times the dab profile) by the paint one step behind, translated
         forward by the dab-to-dab motion in whole pixels (exact copies, so nothing is blurred). Paint
         inside the footprint therefore travels with the brush:
@@ -139,44 +290,147 @@ class DifferentiableCanvasEngine(nn.Module):
         Carried paint drifts backwards relative to the brush by (1 - rate) per distance travelled and is
         left behind once it crosses the footprint (2 radii), so it is dragged about 2 / (1 - rate) radii.
         The rate is `opacity - (2 / smudge_length) * opacity^2`, which caps the drag distance at full
-        opacity to `smudge_length` radii while barely changing low opacities. Blurring is the Blur / Blend tool's job.
+        opacity to `smudge_length` radii while barely changing low opacities. Blurring is the Blur /
+        Blend tool's job.
+
+        Args:
+            ctrl: (B, 10) decoded [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2] (radii in canvas units)
+            bx, by: (B, S, 1, 1) curve samples, used to measure the stroke length
+            hardness, w_smudge: (B,)
+        """
+        H, W = premult.shape[-2:]
+        N = max(H, W) - 1
+
+        with torch.no_grad():
+            # Per-stroke dab count: spacing `smudge_spacing` * the stroke's smallest radius
+            length = torch.sqrt((bx[:, 1:] - bx[:, :-1]) ** 2 + (by[:, 1:] - by[:, :-1]) ** 2).sum(dim=1).flatten()
+            r_min = torch.minimum(ctrl[:, 6], ctrl[:, 7])
+            n_dabs = (length / (self.smudge_spacing * r_min)).ceil().long() + 1
+            n_dabs = n_dabs.clamp(2, self.smudge_max_dabs)
+
+            # Per-stroke window half-size R (pixels): profiles are truncated where they fall below ~1e-4
+            r_max = torch.maximum(ctrl[:, 6], ctrl[:, 7])
+            hard_ext = r_max + 9.2 / edge_sharpness  # sigmoid < 1e-4 beyond this
+            soft_ext = torch.maximum(2.15 * r_max, hard_ext)  # exp(-2 d^2 / r^2) < 1e-4 beyond 2.15 r
+            ext = torch.where(hardness < 1.0 - 1e-6, soft_ext, hard_ext)
+            R_px = (ext * N).ceil().long() + 1
+
+            # Bucket strokes by window size (sqrt(2) steps) so small brushes don't pay for large ones
+            bucket = torch.ceil(2.0 * torch.log2(R_px.float())).long()
+
+        groups = self._smudge_groups(bucket.tolist(), n_dabs.tolist(), R_px.tolist())
+        results = [
+            self._smudge_windows(
+                premult[g], ctrl[g], n_dabs[g], int(n_dabs[g].max()), int(R_px[g].max()),
+                hardness[g], w_smudge[g], edge_sharpness,
+            )
+            for g in groups
+        ]
+        if len(groups) == 1:
+            return results[0]
+        inverse = torch.argsort(torch.cat(groups))
+        return torch.cat(results, dim=0)[inverse]
+
+    # Measured cost of one dab (forward + backward): a fixed launch overhead plus a per-window-pixel cost
+    _DAB_OVERHEAD_PX = 120_000
+
+    def _smudge_groups(self, bucket: list, n_dabs: list, R_px: list) -> list:
+        """
+        Partitions the batch into groups that are smudged together (sharing a dab count and window size).
+        Contiguous runs of size buckets are merged when that is cheaper under the cost model
+        `n_max * (overhead + sum_items (2R_max + 1)^2)`; found exactly by dynamic programming.
+        """
+        device = self.grid_x.device
+        keys = sorted(set(bucket))
+        if len(keys) == 1:
+            return [torch.arange(len(bucket), device=device)]
+        members = [[i for i, b in enumerate(bucket) if b == key] for key in keys]
+
+        def cost(lo: int, hi: int) -> float:  # buckets lo..hi-1 as one group
+            items = [i for m in members[lo:hi] for i in m]
+            wn = 2 * max(R_px[i] for i in items) + 1
+            return max(n_dabs[i] for i in items) * (self._DAB_OVERHEAD_PX + len(items) * wn * wn)
+
+        k = len(keys)
+        best = [0.0] + [float("inf")] * k
+        split = [0] * (k + 1)
+        for hi in range(1, k + 1):
+            for lo in range(hi):
+                c = best[lo] + cost(lo, hi)
+                if c < best[hi]:
+                    best[hi], split[hi] = c, lo
+        groups, hi = [], k
+        while hi > 0:
+            lo = split[hi]
+            groups.append(torch.tensor([i for m in members[lo:hi] for i in m], device=device))
+            hi = lo
+        if len(groups) == 1:  # everything merged: keep batch order (no reordering to undo)
+            return [torch.arange(len(bucket), device=device)]
+        return groups[::-1]
+
+    def _smudge_windows(
+        self,
+        premult: torch.Tensor,
+        ctrl: torch.Tensor,
+        n_dabs: torch.Tensor,
+        n_max: int,
+        R: int,
+        hardness: torch.Tensor,
+        w_smudge: torch.Tensor,
+        edge_sharpness: float,
+    ) -> torch.Tensor:
+        """
+        Runs the smudge dabs for one bucket of strokes. Each dab only touches a (2R+1)^2 window around its
+        whole-pixel center, so the canvas is updated window by window via exact integer gather/scatter;
+        the paint "one step behind" is simply the window at the previous dab's center. Strokes with fewer
+        than `n_max` dabs repeat their final dab, which is a no-op (zero motion).
         """
         B, _, H, W = premult.shape
-        S = bx.shape[1]
+        x0, y0, x1, y1, x2, y2, r0, r2, a0, a2 = ctrl.unbind(dim=-1)
 
-        # Resample the curve into evenly spaced dabs (spacing relative to the smallest radius)
-        with torch.no_grad():
-            seg_len = torch.sqrt((bx[:, 1:] - bx[:, :-1]) ** 2 + (by[:, 1:] - by[:, :-1]) ** 2)
-            length = seg_len.sum(dim=1).flatten()
-            r_min = rt.amin(dim=1).flatten()
-            n_dabs = int((length / (self.smudge_spacing * r_min)).max().ceil().item()) + 1
-            n_dabs = max(2, min(self.smudge_max_dabs, n_dabs))
-
-        def resample(v: torch.Tensor) -> torch.Tensor:  # (B, S, 1, 1) -> (B, n_dabs)
-            return F.interpolate(v.view(B, 1, S), size=n_dabs, mode="linear", align_corners=True).view(B, n_dabs)
-
-        dx, dy, dr, da = resample(bx), resample(by), resample(rt), resample(at)
-
-        # Whole-pixel dab-to-dab motion; rounding absolute positions keeps rounding error from accumulating
-        px = torch.round(dx.detach() * (W - 1))
-        py = torch.round(dy.detach() * (H - 1))
-        shift_x = (px[:, 1:] - px[:, :-1]) * (2.0 / max(W - 1, 1))
-        shift_y = (py[:, 1:] - py[:, :-1]) * (2.0 / max(H - 1, 1))
+        # Dab positions evaluated directly on the quadratic Bezier, per-stroke spacing
+        j = torch.arange(n_max, device=premult.device, dtype=premult.dtype)
+        t = (j.view(1, -1) / (n_dabs.view(-1, 1) - 1).to(premult.dtype)).clamp(max=1.0)  # (B, n_max)
+        omt = 1.0 - t
+        dx = omt * omt * x0[:, None] + 2.0 * omt * t * x1[:, None] + t * t * x2[:, None]
+        dy = omt * omt * y0[:, None] + 2.0 * omt * t * y1[:, None] + t * t * y2[:, None]
+        dr = omt * r0[:, None] + t * r2[:, None]
+        da = omt * a0[:, None] + t * a2[:, None]
 
         rate = (da - (2.0 / self.smudge_length) * da * da).clamp(0.0, 1.0)
-        strength = (w_smudge.view(B, 1) * rate).view(B, n_dabs, 1, 1)
+        strength = w_smudge.view(B, 1) * rate  # (B, n_max)
 
-        canvas = premult
-        for i in range(1, n_dabs):
-            offset = torch.stack([shift_x[:, i - 1], shift_y[:, i - 1]], dim=-1).view(B, 1, 1, 2)
-            dragged = F.grid_sample(
-                canvas, self.base_grid - offset, mode="nearest", padding_mode="zeros", align_corners=True
+        Wn = 2 * R + 1
+        Hp, Wp = H + 2 * R, W + 2 * R
+        with torch.no_grad():
+            # Whole-pixel dab centers; in the R-padded canvas a window's top-left corner is (cy, cx)
+            cx = torch.round(dx * (W - 1)).long()  # (B, n_max)
+            cy = torch.round(dy * (H - 1)).long()
+            base = cy * Wp + cx
+            k = torch.arange(Wn, device=premult.device)
+            offs = (k.view(-1, 1) * Wp + k.view(1, -1)).flatten()  # (Wn * Wn,)
+
+            # Normalized coordinates of each window's columns / rows, and whether they lie in the image
+            cols = cx.unsqueeze(-1) - R + k  # (B, n_max, Wn)
+            rows = cy.unsqueeze(-1) - R + k
+            col_x = cols.to(premult.dtype) / (W - 1)
+            row_y = rows.to(premult.dtype) / (H - 1)
+            col_in = ((cols >= 0) & (cols < W)).to(premult.dtype)
+            row_in = ((rows >= 0) & (rows < H)).to(premult.dtype)
+
+        mask_fn = _dab_masks_compiled if (self.compile_smudge and premult.is_cuda) else _dab_masks
+        canvas = F.pad(premult, (R, R, R, R)).reshape(B, 4, Hp * Wp)
+        dab_params = (dx, dy, dr, strength, hardness)
+        if torch.is_grad_enabled() and any(t.requires_grad for t in (canvas, *dab_params)):
+            canvas = _SmudgeDabs.apply(
+                canvas, *dab_params, base, offs, col_x, row_y, col_in, row_in, edge_sharpness, mask_fn
             )
-            d_sq = (self.grid_x - dx[:, i].view(B, 1, 1, 1)) ** 2 + (self.grid_y - dy[:, i].view(B, 1, 1, 1)) ** 2
-            dab = self._brush_profile(d_sq, dr[:, i].view(B, 1, 1, 1), hardness.view(B, 1, 1, 1), edge_sharpness)
-            canvas = canvas + dab * strength[:, i : i + 1] * (dragged - canvas)
+        else:
+            with torch.no_grad():
+                masks = mask_fn(col_x, row_y, col_in, row_in, dx, dy, dr, hardness, strength, edge_sharpness)
+                canvas = _run_dabs(canvas, masks, base, offs)
 
-        return canvas
+        return canvas.view(B, 4, Hp, Wp)[:, :, R : R + H, R : R + W]
 
     def _gaussian_blur_rgba(self, x_rgba: torch.Tensor) -> torch.Tensor:
         """Applies fast separable Gaussian smoothing across 4 premultiplied RGBA channels."""
@@ -303,31 +557,11 @@ class DifferentiableCanvasEngine(nn.Module):
         rt = omt * r0 + t * r2  # (B, S, 1, 1)
         at = omt * a0 + t * a2  # (B, S, 1, 1)
 
-        # 3. Continuous Line-Segment (Capsule) Distance Field
-        ax, ay = bx[:, :-1], by[:, :-1]          # (B, S-1, 1, 1)
-        bx_end, by_end = bx[:, 1:], by[:, 1:]    # (B, S-1, 1, 1)
-        abx = bx_end - ax
-        aby = by_end - ay
-        ab_len_sq = abx * abx + aby * aby + 1e-8
-
-        apx = self.grid_x - ax  # (B, S-1, H, W)
-        apy = self.grid_y - ay  # (B, S-1, H, W)
-        h = ((apx * abx + apy * aby) / ab_len_sq).clamp(0.0, 1.0)  # (B, S-1, H, W)
-
-        closest_x = ax + h * abx
-        closest_y = ay + h * aby
-        dist_sq = (self.grid_x - closest_x) ** 2 + (self.grid_y - closest_y) ** 2
-
-        r_seg = rt[:, :-1] + h * (rt[:, 1:] - rt[:, :-1])  # (B, S-1, H, W)
-        a_seg = at[:, :-1] + h * (at[:, 1:] - at[:, :-1])  # (B, S-1, H, W)
-
-        # 4. Unified Continuous Hardness Brush Profile
+        # 3-4. Continuous capsule distance field along the curve, with the unified hardness profile.
         # Hard edge falloff (10%-90% alpha) spans `hard_edge_px` output pixels at any resolution.
         # sigmoid(k * x) rises from 0.1 to 0.9 over 2*ln(9)/k; one pixel is 1/(N-1) in grid units.
         edge_sharpness = 2.0 * math.log(9.0) * (max(H, W) - 1) / self.hard_edge_px
-
-        seg_profile = self._brush_profile(dist_sq, r_seg, hardness, edge_sharpness) * a_seg
-        brush_mask, _ = seg_profile.max(dim=1, keepdim=True)  # (B, 1, H, W)
+        brush_mask = self._stroke_mask(bx, by, rt, at, hardness, edge_sharpness)
 
         # 5. Tool weights unpacking: [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
         w = tool_weights.view(B, self.NUM_TOOLS, 1, 1, 1)
@@ -352,7 +586,10 @@ class DifferentiableCanvasEngine(nn.Module):
         # 7. STEP B: Smudge / Push — dab-sequential paint transport in premultiplied RGBA
         premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
         if tool_weights.requires_grad or bool((w_smudge > 0).any()):
-            premult_rgba = self._smudge(premult_rgba, bx, by, rt, at, hardness, w_smudge, edge_sharpness)
+            ctrl = torch.cat([p[:, 0:6].view(B, 6)] + [v.view(B, 1) for v in (r0, r2, a0, a2)], dim=1)
+            premult_rgba = self._smudge(
+                premult_rgba, ctrl, bx, by, hardness.view(B), w_smudge.view(B), edge_sharpness
+            )
         a_after_smudge = premult_rgba[:, 3:4].clamp(0.0, 1.0)
         rgb_after_smudge = torch.where(
             a_after_smudge > 1e-5,
@@ -383,16 +620,29 @@ class DifferentiableCanvasEngine(nn.Module):
         paint_layer: torch.Tensor,
         stroke_sequence: torch.Tensor,
         tool_weights_sequence: Optional[torch.Tensor] = None,
+        checkpoint_strokes: bool = False,
     ) -> torch.Tensor:
-        """Unrolls K sequential strokes onto the RGBA `paint_layer` `(B, 4, H, W)`."""
+        """
+        Unrolls K sequential strokes onto the RGBA `paint_layer` `(B, 4, H, W)`.
+
+        With `checkpoint_strokes=True` (and autograd enabled), only the paint layer between strokes is
+        kept for backward and each stroke is recomputed during backward: memory stops growing with the
+        per-stroke intermediates, at the cost of roughly one extra forward pass.
+        """
         if stroke_sequence.dim() == 2:
             return self.forward_single_step(paint_layer, stroke_sequence, tool_weights_sequence)
 
         B, K, _ = stroke_sequence.shape
+        use_ckpt = checkpoint_strokes and torch.is_grad_enabled()
         curr_layer = paint_layer
         for k in range(K):
             tw_k = tool_weights_sequence[:, k] if tool_weights_sequence is not None else None
-            curr_layer = self.forward_single_step(curr_layer, stroke_sequence[:, k], tw_k)
+            if use_ckpt:
+                curr_layer = checkpoint(
+                    self.forward_single_step, curr_layer, stroke_sequence[:, k], tw_k, use_reentrant=False
+                )
+            else:
+                curr_layer = self.forward_single_step(curr_layer, stroke_sequence[:, k], tw_k)
         return curr_layer
 
 
