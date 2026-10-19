@@ -133,7 +133,7 @@ class DifferentiableCanvasEngine(nn.Module):
         canvas_size: int = 256,
         num_stamps: int = 32,
         min_radius: float = 0.005,
-        max_radius: float = 0.25,
+        max_radius: float = 0.75,
         hard_edge_px: float = 1.0,
         blur_ratio: float = 0.035,
         smudge_spacing: float = 0.25,

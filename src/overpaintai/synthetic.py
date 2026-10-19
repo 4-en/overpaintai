@@ -18,6 +18,8 @@ def random_strokes(
     tool_probs: Sequence[float] = (1.0, 0.0, 0.0, 0.0, 0.0),
     radius_range: Tuple[float, float] = (0.12, 0.012),
     palette_size: Tuple[int, int] = (3, 6),
+    num_washes: int = 0,
+    wash_radius: Tuple[float, float] = (0.3, 0.75),
     generator: Optional[torch.Generator] = None,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -27,6 +29,8 @@ def random_strokes(
     Strokes go coarse to fine (radius shrinks log-linearly from `radius_range[0]` to `radius_range[1]`
     over the sequence, with jitter), are gently curved and tapered, and draw their colors from a small
     per-image palette with jitter, so images look like blocked-in paintings rather than confetti.
+    The first `num_washes` strokes are large, mostly soft washes (radius in `wash_radius`, up to filling the
+    canvas), like toning a canvas or blocking in a background before painting.
     """
     B, K = batch_size, num_strokes
     dev = device or engine.bg_color.device
@@ -39,12 +43,20 @@ def random_strokes(
     frac = torch.linspace(0.0, 1.0, K, device=dev).view(1, K)
     log_r = math.log(radius_range[0]) + frac * (math.log(radius_range[1]) - math.log(radius_range[0]))
     r0 = torch.exp(log_r + 0.35 * torch.randn(B, K, generator=g, device=dev))
+    if num_washes > 0:
+        w = min(num_washes, K)
+        lo, hi = wash_radius
+        r0[:, :w] = lo + (hi - lo) * rand(B, w)
     r2 = r0 * (0.5 + 0.7 * rand(B, K))
+    if num_washes > 0:
+        r2[:, :w] = r0[:, :w] * (0.7 + 0.4 * rand(B, w))
 
     # Curved strokes: random start, direction and length (in radii), sideways bend of the control point
     start = rand(B, K, 2)
     angle = 2.0 * math.pi * rand(B, K)
     length = r0 * (2.0 + 8.0 * rand(B, K))
+    if num_washes > 0:
+        length[:, :w] = r0[:, :w] * (0.3 + 1.5 * rand(B, w))  # washes are broad rather than long
     direction = torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
     end = (start + direction * length.unsqueeze(-1)).clamp(0.0, 1.0)
     normal = torch.stack([-direction[..., 1], direction[..., 0]], dim=-1)
@@ -60,6 +72,9 @@ def random_strokes(
 
     opacity = 0.6 + 0.4 * rand(B, K, 2)
     hardness = rand(B, K, 1)
+    if num_washes > 0:
+        opacity[:, :w] = 0.7 + 0.3 * rand(B, w, 2)
+        hardness[:, :w] = 0.6 * rand(B, w, 1)
 
     params = torch.cat(
         [

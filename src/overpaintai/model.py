@@ -104,7 +104,8 @@ class StrokePredictor(nn.Module):
         token_dim: width of the global tokens, queries and attention blocks.
         token_grid: side of the fixed token grid (tokens per view = token_grid^2).
         max_offset: maximum endpoint distance from the anchor, in view units.
-        radius_range: (min, max) stroke radius in view units.
+        radius_range: (min, max) stroke radius in view units; predicted on a log scale so fine and
+            canvas-filling strokes are equally easy to hit.
         num_tools: size of the tool logits (all engine tools; unused ones can be masked).
     """
 
@@ -120,7 +121,7 @@ class StrokePredictor(nn.Module):
         global_blocks: int = 2,
         query_blocks: int = 2,
         max_offset: float = 0.35,
-        radius_range: tuple = (0.004, 0.25),
+        radius_range: tuple = (0.004, 0.75),
         num_tools: int = 5,
     ):
         super().__init__()
@@ -302,9 +303,10 @@ class StrokePredictor(nn.Module):
         p0 = anchors + self.max_offset * torch.tanh(offsets[..., 0:2])
         p2 = anchors + self.max_offset * torch.tanh(offsets[..., 2:4])
         p1 = 2.0 * anchors - 0.5 * (p0 + p2)  # so that B(0.5) = 0.25 p0 + 0.5 p1 + 0.25 p2 = anchor
-        r_lo, r_hi = self.radius_range
-        # Start at a mid-size, half-opaque, medium-hard stroke in the target's color
-        radii = r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw - 1.5)
+        r_lo, r_hi = (math.log(r) for r in self.radius_range)
+        # Start at radius ~0.1 (view units), half-opaque, medium-hard, in the target's color
+        r_init = (math.log(0.1) - r_lo) / (r_hi - r_lo)
+        radii = torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
         opacity = 0.05 + 0.95 * torch.sigmoid(a_raw)
         hardness = torch.sigmoid(h_raw)
         tc = target_color.clamp(0.02, 0.98)

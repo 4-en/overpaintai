@@ -14,7 +14,7 @@ def stroke_features(s: Strokes, reverse: bool = False, weights: Dict[str, float]
     each scaled by its weight. With `reverse=True` the stroke is traversed end-to-start (endpoints, radius
     and opacity tapers swapped), which renders identically for non-directional tools.
     """
-    w = {"points": 1.0, "radii": 2.0, "opacity": 0.5, "hardness": 0.25, "color": 1.0, **(weights or {})}
+    w = {"points": 1.0, "radii": 0.25, "opacity": 0.5, "hardness": 0.25, "color": 1.0, **(weights or {})}
     points, radii, opacity = s.points, s.radii, s.opacity
     if reverse:
         points, radii, opacity = points.flip(2), radii.flip(-1), opacity.flip(-1)
@@ -22,7 +22,7 @@ def stroke_features(s: Strokes, reverse: bool = False, weights: Dict[str, float]
     return torch.cat(
         [
             w["points"] * points.reshape(B, N, 6),
-            w["radii"] * radii,
+            w["radii"] * torch.log(radii.clamp(min=1e-4)),  # log scale: relative size differences
             w["opacity"] * opacity,
             w["hardness"] * s.hardness,
             w["color"] * s.color,

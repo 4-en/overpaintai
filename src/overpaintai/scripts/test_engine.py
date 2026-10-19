@@ -21,8 +21,8 @@ def main():
     # Underpaint two non-overlapping adjacent strokes (Blue left, Red right) with hard Paint Brush (tool 0, hardness=1.0)
     # 14-param format: [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B]
     tool_paint = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]], device=device)
-    blue_stroke = torch.tensor([[0.18, 0.5, 0.28, 0.5, 0.36, 0.5, 0.55, 0.55, 1.0, 1.0, 1.0, 0.15, 0.45, 0.85]], device=device)
-    red_stroke = torch.tensor([[0.64, 0.5, 0.72, 0.5, 0.82, 0.5, 0.55, 0.55, 0.75, 0.75, 1.0, 0.85, 0.25, 0.15]], device=device)
+    blue_stroke = torch.tensor([[0.18, 0.5, 0.28, 0.5, 0.36, 0.5, 0.181, 0.181, 1.0, 1.0, 1.0, 0.15, 0.45, 0.85]], device=device)
+    red_stroke = torch.tensor([[0.64, 0.5, 0.72, 0.5, 0.82, 0.5, 0.181, 0.181, 0.75, 0.75, 1.0, 0.85, 0.25, 0.15]], device=device)
 
     paint_blue = engine.forward_single_step(empty_paint, blue_stroke, tool_paint)
     paint_two_color = engine.forward_single_step(paint_blue, red_stroke, tool_paint)
@@ -52,7 +52,7 @@ def main():
 
         stroke = torch.tensor([[
             0.15, 0.22, 0.50, 0.68, 0.88, 0.28,
-            0.65, 0.25, 0.95, 0.95, hardness_val,
+            0.214, 0.082, 0.95, 0.95, hardness_val,
             0.95, 0.25, 0.20
         ]], device=device)
 

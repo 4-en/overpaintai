@@ -2,9 +2,10 @@
 Train the stroke predictor.
 
 Modes:
-  teacher  Supervised pretraining on synthetic paintings with known strokes. The canvas holds the first
-           j*N ground-truth strokes (teacher forcing) and the model predicts the next N; loss = Hungarian-
-           matched stroke-parameter L1 + render loss against the ground-truth next canvas.
+  teacher  Supervised pretraining on synthetic paintings with known strokes. The canvas holds all but the
+           last k*N ground-truth strokes (k <= --teacher-tail, so the strokes to find are visible in the
+           target) and the model predicts the next N; loss = Hungarian-matched stroke-parameter L1 +
+           placement heatmap + render loss against the ground-truth next canvas.
   unroll   Render-loss training: paint K steps from a blank canvas with the model's own strokes and
            compare the paintings to the target (multi-scale loss). Works with synthetic targets or a
            folder of images; optionally adds a zoomed-in tile step to train the high-resolution path.
@@ -32,12 +33,12 @@ from tqdm import tqdm
 
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
-from overpaintai.data import ImageFolderDataset, SyntheticSource
+from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.losses import MultiScalePaintLoss, psnr
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.model import StrokePredictor
 from overpaintai.painting import Painter
-from overpaintai.viz import save_curve, save_frame
+from overpaintai.viz import save_curve, save_frame, save_progress
 
 TOOLS = {"paint": 0, "dry": 1, "smudge": 2, "blur": 3, "eraser": 4}
 
@@ -83,6 +84,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--detail-weight", type=float, default=1.0)
     g.add_argument("--scales", default="4,16")
     g.add_argument("--scale-weights", default="1,1")
+    g.add_argument("--teacher-tail", type=int, default=2,
+                   help="Teacher: predict one of the last K groups of N strokes (1 = the final, fully visible "
+                        "strokes); 0 = any group, including the first strokes of a blank canvas")
     g.add_argument("--match-weight", type=float, default=1.0, help="Teacher: stroke-parameter loss weight")
     g.add_argument("--render-weight", type=float, default=1.0, help="Teacher: render loss weight")
     g.add_argument("--heatmap-weight", type=float, default=0.1,
@@ -108,6 +112,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--resume", default=None, help="Continue a run from a checkpoint (all state)")
     g.add_argument("--init-from", default=None, help="Initialize model weights from a checkpoint only")
     g.add_argument("--val-every", type=int, default=1, help="Validate every N epochs")
+    g.add_argument("--preview-image", nargs="+", default=None, metavar="PATH",
+                   help="Image(s) painted after every epoch at --image-size; saved to <out>/previews/")
+    g.add_argument("--preview-steps", type=int, default=None, help="Painting steps for previews (default: --steps)")
     g.add_argument("--save-every", type=int, default=0, help="Also keep epoch_XXX.pt every N epochs")
     g.add_argument("--log-every", type=int, default=25, help="Step log interval")
     g.add_argument("--seed", type=int, default=0)
@@ -208,6 +215,10 @@ class Trainer:
         )
 
         self._setup_data()
+        self.preview_targets = None
+        if args.preview_image:
+            self.preview_targets = torch.cat([load_image(p, self.S, self.device) for p in args.preview_image])
+            (self.out / "previews").mkdir(exist_ok=True)
         total = args.epochs * self.steps_per_epoch
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda(args.warmup_steps, total, args.min_lr_ratio)
@@ -270,7 +281,12 @@ class Trainer:
         a, B, N = self.args, self.args.batch_size, self.N
         batch = self.synth.sample(B, self.gen)
         M = batch.params.shape[1]
-        j = int(torch.randint(0, M // N, (1,), generator=self.gen, device=self.device).item())
+        # Early strokes are mostly painted over in the target, so predicting them from a blank canvas is
+        # ill-posed (the best L1 answer is a hedged average). The last groups are (nearly) unoccluded and
+        # can be read off the target - canvas residual; planning from blank is left to unroll training.
+        groups = M // N
+        lo = max(0, groups - a.teacher_tail) if a.teacher_tail > 0 else 0
+        j = int(torch.randint(lo, groups, (1,), generator=self.gen, device=self.device).item())
         blank = self.engine.create_blank_paint_layer(B, self.S, self.S, self.device)
         with torch.no_grad():
             layer = self.engine(blank, batch.params[:, : j * N], batch.tools[:, : j * N]) if j > 0 else blank
@@ -402,6 +418,24 @@ class Trainer:
         )
         return metrics
 
+    @torch.no_grad()
+    def preview(self, name: str) -> Dict[str, float]:
+        """Paints the --preview-image(s) with the current (EMA) weights; saves every step as one strip."""
+        if self.preview_targets is None:
+            return {}
+        model = self.eval_painter.model
+        was_training = model.training
+        model.eval()
+        steps = self.args.preview_steps or self.args.steps
+        layers = self.eval_painter.paint(self.preview_targets, steps)
+        canvases = [self.eval_painter.composite(lay) for lay in layers]
+        p = psnr(canvases[-1], self.preview_targets).mean().item()
+        caption = f"{name} | step {self.global_step} | {steps} steps x {self.N} strokes | PSNR {p:.2f} dB"
+        for fname in (f"{name}.png", "latest.png"):
+            save_progress(self.out / "previews" / fname, self.preview_targets, canvases, caption)
+        model.train(was_training)
+        return {"preview_psnr": p}
+
     # --- checkpoints ----------------------------------------------------------------------------------
     def save(self, path: Path):
         torch.save(
@@ -450,6 +484,9 @@ class Trainer:
     def run(self):
         a = self.args
         step_log = self.out / "steps.csv"
+        if self.preview_targets is not None and self.epoch == 0:
+            p = self.preview("init")  # before any training (useful with --init-from)
+            tqdm.write(f"preview before training: PSNR {p['preview_psnr']:.2f} dB -> {self.out / 'previews'}")
         for epoch in range(self.epoch, a.epochs):
             self.epoch = epoch
             sums: Dict[str, float] = {}
@@ -472,6 +509,7 @@ class Trainer:
                 row.update(self.validate())
                 if row["val_psnr"] > self.best_psnr:
                     self.best_psnr, is_best = row["val_psnr"], True
+            row.update(self.preview(f"epoch_{epoch + 1:03d}"))
             self.history.append(row)
 
             self.save(self.out / "last.pt")
@@ -487,8 +525,9 @@ class Trainer:
             )
             val_txt = (f" | val PSNR {row['val_psnr']:.2f} dB (loss {row['val_loss']:.4f})"
                        f"{' * best' if is_best else ''}") if "val_psnr" in row else ""
+            preview_txt = f" | preview {row['preview_psnr']:.2f} dB" if "preview_psnr" in row else ""
             tqdm.write(f"epoch {epoch + 1}: train loss {row['train_loss']:.4f}, PSNR {row['train_psnr']:.2f} dB, "
-                       f"entropy {row['train_entropy']:.2f}{val_txt} | {row['time']:.0f}s")
+                       f"entropy {row['train_entropy']:.2f}{val_txt}{preview_txt} | {row['time']:.0f}s")
         print(f"done: best val PSNR {self.best_psnr:.2f} dB -> {self.out / 'best.pt'}")
 
     @staticmethod

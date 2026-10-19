@@ -2,7 +2,7 @@ import torch
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine, reverse_strokes
 
-SIZE = 64
+SIZE = 64  # engines below use max_radius=0.25: the stroke params in these tests were written for it
 
 
 def one_hot_tool(idx: int) -> torch.Tensor:
@@ -12,7 +12,7 @@ def one_hot_tool(idx: int) -> torch.Tensor:
 
 
 def test_reversed_stroke_renders_identically():
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE).eval()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).eval()
     layer = engine.create_blank_paint_layer(1, SIZE, SIZE)
     stroke = torch.tensor([[0.1, 0.3, 0.5, 0.6, 0.9, 0.4, 0.5, 0.2, 0.9, 0.4, 0.7, 0.8, 0.2, 0.1]])
     for tool in (0, 4):  # Paint and Eraser (eraser on top of a painted layer)
@@ -24,7 +24,7 @@ def test_reversed_stroke_renders_identically():
 
 
 def test_training_tool_weights_are_one_hot_with_gradients():
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE).train()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).train()
     raw = torch.randn(4, 14)
     logits = torch.randn(4, engine.NUM_TOOLS, requires_grad=True)
     _, tw = engine.decode_raw_actions(raw, logits)
@@ -53,7 +53,7 @@ def _px(x: float) -> int:
 
 
 def test_smudge_from_bare_canvas_digs_indent():
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE).eval()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).eval()
     layer = _bar(engine, engine.create_blank_paint_layer(1, SIZE, SIZE), 0.5, 0.8, (0.9, 0.2, 0.1))
     out, _ = _smudge(engine, layer, 0.1, 0.6)
     row = _px(0.5)
@@ -69,7 +69,7 @@ def test_smudge_from_bare_canvas_digs_indent():
 
 
 def test_smudge_carries_paint_along_the_stroke():
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE).eval()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).eval()
     layer = engine.create_blank_paint_layer(1, SIZE, SIZE)
     layer = _bar(engine, layer, 0.15, 0.35, (0.1, 0.4, 0.9))  # blue
     layer = _bar(engine, layer, 0.6, 0.85, (0.9, 0.2, 0.1))   # red
@@ -83,7 +83,7 @@ def test_smudge_carries_paint_along_the_stroke():
 
 def test_smudge_drag_distance_is_finite_at_full_opacity():
     def drag(smudge_length):
-        engine = DifferentiableCanvasEngine(canvas_size=SIZE, smudge_length=smudge_length).eval()
+        engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25, smudge_length=smudge_length).eval()
         layer = _bar(engine, engine.create_blank_paint_layer(1, SIZE, SIZE), 0.05, 0.2, (0.1, 0.4, 0.9))
         out, _ = _smudge(engine, layer, 0.15, 0.95)
         return out[0, 3, _px(0.5)]
@@ -95,7 +95,7 @@ def test_smudge_drag_distance_is_finite_at_full_opacity():
 
 
 def test_smudge_is_differentiable():
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE).train()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).train()
     layer = _bar(engine, engine.create_blank_paint_layer(1, SIZE, SIZE), 0.5, 0.8, (0.9, 0.2, 0.1))
     out, stroke = _smudge(engine, layer, 0.1, 0.6, requires_grad=True)
     out[:, 3].sum().backward()
@@ -134,7 +134,7 @@ def test_smudge_backward_matches_numerical_gradient():
 
 def test_stroke_result_does_not_depend_on_batch():
     torch.manual_seed(1)
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE, compile_smudge=False).eval()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25, compile_smudge=False).eval()
     strokes = torch.sigmoid(torch.randn(5, 14) - torch.tensor([0.0] * 6 + [1.0, 1.0] + [0.0] * 6))
     tools = torch.zeros(5, 5)
     tools[:, 2] = 1.0  # smudge: per-stroke dab counts and window-size groups
@@ -148,7 +148,7 @@ def test_stroke_result_does_not_depend_on_batch():
 
 def test_checkpointed_unroll_matches_plain_unroll():
     torch.manual_seed(2)
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE, compile_smudge=False).train()
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25, compile_smudge=False).train()
     raw = torch.randn(2, 3, 14)
     logits = torch.randn(2, 3, engine.NUM_TOOLS)
 

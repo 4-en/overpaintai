@@ -100,8 +100,12 @@ def test_training_modes_checkpoints_and_resume(tmp_path, image_folder):
     assert "val_psnr" in ckpt["history"][-1]
 
     folder = tmp_path / "folder"
+    preview = next(image_folder.rglob("*.png"))
     main(TINY + ["--mode", "unroll", "--data", str(image_folder), "--val-fraction", "0.3", "--epochs", "1",
-                 "--out", str(folder)])
+                 "--preview-image", str(preview), "--preview-steps", "3", "--out", str(folder)])
+    for name in ("init.png", "epoch_001.png", "latest.png"):
+        assert (folder / "previews" / name).exists(), name
+    assert "preview_psnr" in torch.load(folder / "last.pt", weights_only=False)["history"][-1]
     assert json.loads((folder / "args.json").read_text())["data"] == str(image_folder)
 
     with pytest.raises(SystemExit):

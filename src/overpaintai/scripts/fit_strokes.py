@@ -16,9 +16,9 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from PIL import Image
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
+from overpaintai.data import load_image
 from overpaintai.losses import MultiScalePaintLoss, psnr
 from overpaintai.synthetic import radius_to_param, random_strokes, render_targets
 from overpaintai.viz import save_curve, save_frame
@@ -52,16 +52,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="runs/fit", help="Output directory")
     return p.parse_args()
-
-
-def load_image(path: str, size: int, device: torch.device) -> torch.Tensor:
-    img = Image.open(path).convert("RGB")
-    w, h = img.size
-    side = min(w, h)  # center crop to square
-    img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
-    img = img.resize((size, size), Image.LANCZOS)
-    x = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8).view(size, size, 3)
-    return (x.permute(2, 0, 1).float() / 255.0).unsqueeze(0).to(device)
 
 
 def logit(x: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:

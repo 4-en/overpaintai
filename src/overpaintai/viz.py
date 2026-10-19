@@ -30,6 +30,23 @@ def save_frame(path: Path, target: torch.Tensor, canvas: torch.Tensor, text: str
     canvas_img.save(path)
 
 
+def save_progress(path: Path, target: torch.Tensor, steps: Sequence[torch.Tensor], text: str, min_tile: int = 256):
+    """
+    One row per image: [target | canvas after step 1 | ... | after step K | error of the last step],
+    each tile upscaled (nearest) to at least `min_tile` px, with a caption.
+    """
+    final = steps[-1]
+    err = (final - target).abs().mean(1, keepdim=True).expand(-1, 3, -1, -1).mul(2.0).clamp(0, 1)
+    rows = [torch.cat([target[i], *(s[i] for s in steps), err[i]], dim=2) for i in range(target.shape[0])]
+    img = Image.fromarray(to_uint8(torch.cat(rows, dim=1)))
+    scale = max(1, -(-min_tile // target.shape[-1]))
+    img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
+    out = Image.new("RGB", (img.width, img.height + 18), "white")
+    out.paste(img, (0, 18))
+    ImageDraw.Draw(out).text((4, 3), text, fill="black")
+    out.save(path)
+
+
 def save_curve(
     path: Path,
     rows: list,

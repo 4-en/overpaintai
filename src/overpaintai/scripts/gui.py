@@ -176,8 +176,8 @@ class PaintGUI:
         with torch.no_grad():
             paint = self.engine.create_blank_paint_layer(1, self.canvas_size, self.canvas_size, self.device)
             tool_paint = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0]], device=self.device)
-            blue_stroke = torch.tensor([[0.18, 0.5, 0.28, 0.5, 0.36, 0.5, 0.55, 0.55, 1.0, 1.0, 1.0, 0.15, 0.45, 0.85]], device=self.device)
-            red_stroke = torch.tensor([[0.64, 0.5, 0.72, 0.5, 0.82, 0.5, 0.55, 0.55, 0.70, 0.70, 1.0, 0.85, 0.25, 0.15]], device=self.device)
+            blue_stroke = torch.tensor([[0.18, 0.5, 0.28, 0.5, 0.36, 0.5, 0.181, 0.181, 1.0, 1.0, 1.0, 0.15, 0.45, 0.85]], device=self.device)
+            red_stroke = torch.tensor([[0.64, 0.5, 0.72, 0.5, 0.82, 0.5, 0.181, 0.181, 0.70, 0.70, 1.0, 0.85, 0.25, 0.15]], device=self.device)
             paint = self.engine.forward_single_step(paint, blue_stroke, tool_paint)
             self.paint_layer = self.engine.forward_single_step(paint, red_stroke, tool_paint)
         self.update_canvas_display()

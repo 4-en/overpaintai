@@ -35,6 +35,7 @@ class SyntheticSource:
         stroke_range: (min, max) strokes per painting; each batch draws one count in that range, rounded
             to a multiple of `multiple_of` (the model's strokes per step), so it splits into whole steps.
         tool_probs: probability of each engine tool in the ground truth.
+        washes: (min, max) large background washes at the start of each painting.
     """
 
     def __init__(
@@ -45,6 +46,7 @@ class SyntheticSource:
         multiple_of: int = 16,
         tool_probs: Sequence[float] = (1.0, 0.0, 0.0, 0.0, 0.0),
         radius_range: Tuple[float, float] = (0.12, 0.012),
+        washes: Tuple[int, int] = (1, 3),
     ):
         self.engine = engine
         self.image_size = image_size
@@ -52,15 +54,17 @@ class SyntheticSource:
         self.multiple_of = multiple_of
         self.tool_probs = tool_probs
         self.radius_range = radius_range
+        self.washes = washes
 
     def sample(self, batch_size: int, generator: torch.Generator) -> SyntheticBatch:
         device = self.engine.bg_color.device
         lo, hi = self.stroke_range
         m = int(torch.randint(lo, hi + 1, (1,), generator=generator, device=device).item())
         m = max(self.multiple_of, round(m / self.multiple_of) * self.multiple_of)
+        n_washes = int(torch.randint(self.washes[0], self.washes[1] + 1, (1,), generator=generator, device=device))
         params, tools = random_strokes(
             self.engine, batch_size, m, tool_probs=self.tool_probs, radius_range=self.radius_range,
-            generator=generator, device=device,
+            num_washes=n_washes, generator=generator, device=device,
         )
         target = render_targets(self.engine, params, tools, self.image_size)
         return SyntheticBatch(target=target, params=params, tools=tools)
@@ -69,6 +73,18 @@ class SyntheticSource:
 # ----------------------------------------------------------------------------------------------------
 # Image folders
 # ----------------------------------------------------------------------------------------------------
+def load_image(path: str, size: int, device: Optional[torch.device] = None) -> torch.Tensor:
+    """Loads an image as a `(1, 3, size, size)` tensor in [0, 1]: center-cropped to square, Lanczos-resized."""
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        w, h = img.size
+        side = min(w, h)
+        img = img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+        img = img.resize((size, size), Image.LANCZOS)
+    x = T.functional.pil_to_tensor(img).float() / 255.0
+    return x.unsqueeze(0).to(device)
+
+
 def list_images(root: str) -> list:
     files = sorted(p for p in Path(root).rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS and p.is_file())
     if not files:
