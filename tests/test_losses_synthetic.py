@@ -1,0 +1,67 @@
+import torch
+
+from overpaintai.canvas_engine import DifferentiableCanvasEngine
+from overpaintai.losses import MultiScalePaintLoss, psnr
+from overpaintai.synthetic import radius_to_param, random_strokes, render_targets
+
+
+def test_loss_is_zero_for_identical_images_and_reports_terms():
+    loss_fn = MultiScalePaintLoss(detail_weight=1.0, scales=(4, 16))
+    x = torch.rand(2, 3, 32, 32)
+    total, terms = loss_fn(x, x)
+    assert total.item() == 0.0
+    assert set(terms) == {"detail", "x4", "x16"}
+
+
+def test_coarse_terms_see_misplaced_strokes_that_detail_barely_does():
+    """A dot shifted beyond its own width: full-res L1 is maxed out, but coarse terms still improve
+    as it moves closer, so they provide a placement signal."""
+    def dot(cx):
+        img = torch.zeros(1, 3, 64, 64)
+        img[..., 30:34, cx : cx + 4] = 1.0
+        return img
+
+    target = dot(10)
+    coarse = MultiScalePaintLoss(detail_weight=0.0, scales=(16,))
+    detail = MultiScalePaintLoss(detail_weight=1.0, scales=())
+    far, near = dot(40), dot(20)
+    assert detail(near, target)[0] == detail(far, target)[0]  # no overlap either way
+    assert coarse(near, target)[0] < coarse(far, target)[0]
+    # Plain pooling cannot tell them apart once the dot leaves its pooling cell
+    pooled = MultiScalePaintLoss(detail_weight=0.0, scales=(16,), coarse_mode="pool")
+    assert pooled(near, target)[0] == pooled(far, target)[0]
+
+
+def test_masked_loss_ignores_padding():
+    loss_fn = MultiScalePaintLoss(scales=(4,))
+    pred, target = torch.rand(1, 3, 16, 16), torch.rand(1, 3, 16, 16)
+    mask = torch.zeros(1, 1, 16, 16)
+    mask[..., :8] = 1.0
+    target_changed = target.clone()
+    target_changed[..., 8:] = 0.0  # only inside the padding
+    assert torch.allclose(loss_fn(pred, target, mask)[0], loss_fn(pred, target_changed, mask)[0])
+
+
+def test_psnr_of_identical_images_is_high():
+    x = torch.rand(2, 3, 8, 8)
+    assert (psnr(x, x) > 90).all()
+
+
+def test_random_strokes_render_valid_targets():
+    engine = DifferentiableCanvasEngine(canvas_size=32).eval()
+    gen = torch.Generator().manual_seed(0)
+    params, tools = random_strokes(engine, 3, 20, generator=gen)
+    assert params.shape == (3, 20, 14) and tools.shape == (3, 20, 5)
+    assert params.min() >= 0.0 and params.max() <= 1.0
+    assert torch.equal(tools.argmax(-1), torch.zeros(3, 20, dtype=torch.long))  # paint only by default
+    # Coarse to fine: early strokes are larger than late ones on average
+    assert params[:, :5, 6].mean() > params[:, -5:, 6].mean()
+    img = render_targets(engine, params, tools, 32)
+    assert img.shape == (3, 3, 32, 32) and img.min() >= 0.0 and img.max() <= 1.0
+
+
+def test_radius_to_param_inverts_engine_mapping():
+    engine = DifferentiableCanvasEngine(canvas_size=32)
+    r = torch.tensor([0.01, 0.05, 0.2])
+    p = radius_to_param(engine, r)
+    assert torch.allclose(engine.min_radius + p * (engine.max_radius - engine.min_radius), r)

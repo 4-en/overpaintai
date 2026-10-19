@@ -60,6 +60,12 @@ Run the automated 6-panel visual test suite:
 overpaint-test
 ```
 
+Fit strokes directly to targets by gradient descent through the renderer (no network; synthetic targets by default, or `--image path`). Writes progress frames, a loss/PSNR curve and the fitted strokes to `--out`:
+
+```bash
+overpaint-fit --strokes 160 --stages 4 --out runs/fit
+```
+
 Launch the interactive real-time mouse painting GUI:
 
 ```bash
