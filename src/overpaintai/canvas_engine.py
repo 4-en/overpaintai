@@ -12,10 +12,20 @@ class DifferentiableCanvasEngine(nn.Module):
     Uses continuous capsule/line-segment distance fields along the Quadratic Bezier curve
     (eliminating discrete circle-stamp beading artifacts) and a true RGBA paint layer
     `(B, 4, H, W)` separated from a static or custom background `(B, 3, H, W)`.
+
+    Continuous Parameters (14 in [0, 1]):
+      [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B]
+
+    Discrete Tool Modes (5 tools, all sharing the continuous `hardness` attribute):
+      0: Paint Brush (Standard pigment deposition, from soft airbrush at h=0 to hard cel ink at h=1)
+      1: Dry / Textured Brush (Pigment deposition modulated by procedural canvas/chalk grain)
+      2: Smudge / Push (Directional pigment transport along the curve tangent without exit-dent dilution)
+      3: Blur / Blend (In-place isotropic softening of colors and edges underneath the brush)
+      4: Eraser (Subtractive alpha removal, from soft feathered eraser at h=0 to hard cutout at h=1)
     """
 
-    NUM_CONT_PARAMS = 13  # x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, R, G, B
-    NUM_TOOLS = 5         # Hard, Soft, Dry/Chalk, Smudge, Eraser
+    NUM_CONT_PARAMS = 14  # x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B
+    NUM_TOOLS = 5         # Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser
 
     def __init__(
         self,
@@ -24,8 +34,8 @@ class DifferentiableCanvasEngine(nn.Module):
         min_radius: float = 0.005,
         max_radius: float = 0.25,
         hard_edge_sharpness: float = 300.0,
-        smudge_pull_strength: float = 0.55,
-        smudge_blur_ratio: float = 0.045,
+        smudge_pull_strength: float = 0.65,
+        smudge_blur_ratio: float = 0.035,
         smudge_taps: int = 8,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
@@ -81,7 +91,7 @@ class DifferentiableCanvasEngine(nn.Module):
         default_bg = (self.bg_color.to(device) - self.bg_texture_strength * (0.5 - 0.5 * weave)).clamp(0.0, 1.0)
         self.register_buffer("default_bg", default_bg, persistent=False)
 
-        # Separable 1D Gaussian blur kernel for 4-channel premultiplied RGBA smudge diffusion
+        # Separable 1D Gaussian blur kernel for 4-channel premultiplied RGBA smudge & blur diffusion
         k_size = max(3, int(round(max(H, W) * self.smudge_blur_ratio)) | 1)
         sigma = k_size / 3.0
         coords = torch.arange(k_size, device=device, dtype=torch.float32) - (k_size - 1) / 2.0
@@ -104,9 +114,7 @@ class DifferentiableCanvasEngine(nn.Module):
     def create_blank_paint_layer(
         self, batch_size: int = 1, H: Optional[int] = None, W: Optional[int] = None, device: Optional[torch.device] = None
     ) -> torch.Tensor:
-        """
-        Returns a completely transparent RGBA paint layer of shape (B, 4, H, W) initialized to zeros.
-        """
+        """Returns a completely transparent RGBA paint layer of shape (B, 4, H, W) initialized to zeros."""
         H = H or self.canvas_size
         W = W or self.canvas_size
         device = device or self.bg_color.device
@@ -120,9 +128,7 @@ class DifferentiableCanvasEngine(nn.Module):
         device: Optional[torch.device] = None,
         textured: bool = True,
     ) -> torch.Tensor:
-        """
-        Returns the static RGB background image `(B, 3, H, W)` (either textured canvas weave or flat bg_color).
-        """
+        """Returns the static RGB background image `(B, 3, H, W)` (textured canvas weave or flat bg_color)."""
         H = H or self.canvas_size
         W = W or self.canvas_size
         device = device or self.bg_color.device
@@ -134,10 +140,7 @@ class DifferentiableCanvasEngine(nn.Module):
     def composite(
         self, paint_layer: torch.Tensor, background: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """
-        Composites the transparent RGBA `paint_layer` `(B, 4, H, W)` over the static `background` `(B, 3, H, W)`
-        to produce the final visible RGB image `(B, 3, H, W)`.
-        """
+        """Composites the transparent RGBA `paint_layer` `(B, 4, H, W)` over `background` `(B, 3, H, W)`."""
         B, C, H, W = paint_layer.shape
         assert C == 4, f"Expected 4-channel RGBA paint_layer, got {C} channels."
         if background is None:
@@ -153,10 +156,7 @@ class DifferentiableCanvasEngine(nn.Module):
         raw_tool_logits: Optional[torch.Tensor] = None,
         gumbel_tau: float = 1.0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Maps unconstrained neural network outputs R^13 into bounded [0, 1] stroke parameters.
-        Also returns tool weights (soft temperature-scaled Softmax during training, hard one-hot during eval).
-        """
+        """Maps unconstrained neural network outputs R^14 into bounded [0, 1] stroke parameters."""
         stroke_params = torch.sigmoid(raw_cont)
         if raw_tool_logits is None:
             shape = raw_cont.shape[:-1] + (self.NUM_TOOLS,)
@@ -178,9 +178,19 @@ class DifferentiableCanvasEngine(nn.Module):
     ) -> torch.Tensor:
         """
         Applies a single stroke per batch item onto the transparent RGBA `paint_layer` `(B, 4, H, W)`.
+        
+        Args:
+            paint_layer: (B, 4, H, W) RGBA tensor in [0, 1]
+            stroke_params: (B, 14) tensor in [0, 1]:
+                [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B]
+            tool_weights: (B, 5) weights over tools:
+                [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
         """
         B, C, H, W = paint_layer.shape
         assert C == 4, f"Expected 4-channel RGBA paint_layer (B, 4, H, W), got shape {tuple(paint_layer.shape)}"
+        assert stroke_params.shape[-1] == self.NUM_CONT_PARAMS, (
+            f"Expected {self.NUM_CONT_PARAMS} continuous stroke params, got {stroke_params.shape[-1]}"
+        )
         device = paint_layer.device
         self._update_spatial_buffers(H, W, device)
 
@@ -188,8 +198,8 @@ class DifferentiableCanvasEngine(nn.Module):
             tool_weights = torch.zeros(B, self.NUM_TOOLS, device=device, dtype=paint_layer.dtype)
             tool_weights[:, 0] = 1.0
 
-        # 1. Unpack normalized stroke parameters
-        p = stroke_params.view(B, 13, 1, 1, 1)
+        # 1. Unpack normalized stroke parameters (14 params)
+        p = stroke_params.view(B, self.NUM_CONT_PARAMS, 1, 1, 1)
         x0, y0 = p[:, 0], p[:, 1]
         x1, y1 = p[:, 2], p[:, 3]
         x2, y2 = p[:, 4], p[:, 5]
@@ -200,9 +210,10 @@ class DifferentiableCanvasEngine(nn.Module):
         a0 = 0.05 + 0.95 * p[:, 8]
         a2 = 0.05 + 0.95 * p[:, 9]
 
-        stroke_rgb = stroke_params[:, 10:13].view(B, 3, 1, 1)
+        hardness = p[:, 10]  # Continuous edge hardness in [0, 1] across all tools
+        stroke_rgb = stroke_params[:, 11:14].view(B, 3, 1, 1)
 
-        # 2. Sample Quadratic Bezier curve nodes B(t) and tangent B'(t)
+        # 2. Sample Quadratic Bezier curve nodes B(t)
         t = self.t  # (1, S, 1, 1)
         omt = 1.0 - t
         bx = (omt ** 2) * x0 + 2.0 * omt * t * x1 + (t ** 2) * x2  # (B, S, 1, 1)
@@ -211,48 +222,46 @@ class DifferentiableCanvasEngine(nn.Module):
         rt = omt * r0 + t * r2  # (B, S, 1, 1)
         at = omt * a0 + t * a2  # (B, S, 1, 1)
 
-        # 3. Continuous Line-Segment (Capsule) Distance Field (eliminates discrete circle beading!)
-        # Connect each node i to i+1 into S-1 continuous segments
+        # 3. Continuous Line-Segment (Capsule) Distance Field
         ax, ay = bx[:, :-1], by[:, :-1]          # (B, S-1, 1, 1)
         bx_end, by_end = bx[:, 1:], by[:, 1:]    # (B, S-1, 1, 1)
         abx = bx_end - ax
         aby = by_end - ay
         ab_len_sq = abx * abx + aby * aby + 1e-8
 
-        # Project pixel (grid_x, grid_y) onto each segment i: projection parameter h in [0, 1]
         apx = self.grid_x - ax  # (B, S-1, H, W)
         apy = self.grid_y - ay  # (B, S-1, H, W)
         h = ((apx * abx + apy * aby) / ab_len_sq).clamp(0.0, 1.0)  # (B, S-1, H, W)
 
-        # Closest point on segment i to pixel (x, y)
         closest_x = ax + h * abx
         closest_y = ay + h * aby
         dist_sq = (self.grid_x - closest_x) ** 2 + (self.grid_y - closest_y) ** 2
         dist = torch.sqrt(dist_sq + 1e-8)
 
-        # Linearly interpolate radius r and opacity a at exact projection fraction h along each segment
         r_seg = rt[:, :-1] + h * (rt[:, 1:] - rt[:, :-1])  # (B, S-1, H, W)
         a_seg = at[:, :-1] + h * (at[:, 1:] - at[:, :-1])  # (B, S-1, H, W)
 
-        # 4. Continuous Segment Profiles for Hard, Soft, and Textured brushes
+        # 4. Unified Continuous Hardness Brush Profile
         res_scale = 1.0 if self.training else max(1.0, max(H, W) / float(self.canvas_size))
         edge_sharpness = self.hard_edge_sharpness * res_scale
 
-        hard_seg = torch.sigmoid(edge_sharpness * (r_seg - dist)) * a_seg
-        soft_seg = torch.exp(-2.0 * dist_sq / (r_seg * r_seg + 1e-6)) * a_seg
+        hard_profile = torch.sigmoid(edge_sharpness * (r_seg - dist))
+        soft_profile = torch.exp(-2.0 * dist_sq / (r_seg * r_seg + 1e-6))
 
-        # Taking max across continuous capsule segments produces a 100% smooth tube with zero beading
-        mask_hard, _ = hard_seg.max(dim=1, keepdim=True)  # (B, 1, H, W)
-        mask_soft, _ = soft_seg.max(dim=1, keepdim=True)  # (B, 1, H, W)
-        mask_dry = mask_hard * self.paper_grain           # (B, 1, H, W)
+        seg_profile = ((1.0 - hardness) * soft_profile + hardness * hard_profile) * a_seg
+        brush_mask, _ = seg_profile.max(dim=1, keepdim=True)  # (B, 1, H, W)
 
-        # 5. Tool weights unpacking
+        # Soft segment weights for smooth tangent interpolation
+        soft_seg = soft_profile * a_seg
+
+        # 5. Tool weights unpacking: [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
         w = tool_weights.view(B, self.NUM_TOOLS, 1, 1, 1)
-        w_hard, w_soft, w_dry, w_smudge, w_eraser = w[:, 0], w[:, 1], w[:, 2], w[:, 3], w[:, 4]
+        w_paint, w_dry, w_smudge, w_blur, w_eraser = w[:, 0], w[:, 1], w[:, 2], w[:, 3], w[:, 4]
 
-        paint_mask = (w_hard * mask_hard + w_soft * mask_soft + w_dry * mask_dry).clamp(0.0, 1.0)
-        smudge_mask = (w_smudge * mask_soft).clamp(0.0, 1.0)
-        eraser_mask = (w_eraser * mask_hard).clamp(0.0, 1.0)
+        paint_mask = (w_paint * brush_mask + w_dry * (brush_mask * self.paper_grain)).clamp(0.0, 1.0)
+        smudge_mask = (w_smudge * brush_mask).clamp(0.0, 1.0)
+        blur_mask = (w_blur * brush_mask).clamp(0.0, 1.0)
+        eraser_mask = (w_eraser * brush_mask).clamp(0.0, 1.0)
 
         # 6. STEP A: Paint Deposition via Porter-Duff "Source Over" on RGBA
         c_rgb = paint_layer[:, :3]
@@ -266,48 +275,70 @@ class DifferentiableCanvasEngine(nn.Module):
             c_rgb,
         )
 
-        # 7. STEP B: Premultiplied RGBA Smudge along segment tangents
-        premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)  # (B, 4, H, W)
+        # 7. STEP B: Premultiplied RGBA Pigment Smudge & Transport (with zero-tap dilution fix)
+        premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
         blurred_premult = self._gaussian_blur_rgba(premult_rgba)
 
-        # Segment tangent vectors scaled by number of segments so total curve velocity matches B'(t)
-        seg_tx = abx * (self.num_stamps - 1)  # (B, S-1, 1, 1)
-        seg_ty = aby * (self.num_stamps - 1)  # (B, S-1, 1, 1)
+        seg_tx = abx * (self.num_stamps - 1)
+        seg_ty = aby * (self.num_stamps - 1)
         seg_weights = soft_seg / (soft_seg.sum(dim=1, keepdim=True) + 1e-6)
         local_tx = (seg_weights * seg_tx).sum(dim=1, keepdim=True)
         local_ty = (seg_weights * seg_ty).sum(dim=1, keepdim=True)
 
-        accum_smudge = torch.zeros_like(premult_rgba)
-        total_tap_w = 0.0
-        for tap in range(self.smudge_taps):
-            frac = tap / float(max(1, self.smudge_taps - 1))
+        accum_rgb_premult = torch.zeros_like(rgb_after_paint)
+        accum_a_weight = torch.zeros_like(a_after_paint)
+        carried_a = torch.zeros_like(a_after_paint)
+
+        # Sample strictly upstream (tap = 1 .. smudge_taps) so bare-canvas taps never dilute exiting paint
+        for tap in range(1, self.smudge_taps + 1):
+            frac = tap / float(self.smudge_taps)
             ox = local_tx * (frac * self.smudge_pull_strength)
             oy = local_ty * (frac * self.smudge_pull_strength)
             offset_grid = torch.cat([ox.permute(0, 2, 3, 1), oy.permute(0, 2, 3, 1)], dim=-1)
             sample_grid = (self.base_grid - offset_grid).clamp(-1.0, 1.0)
-            sampled = F.grid_sample(blurred_premult, sample_grid, mode="bilinear", padding_mode="border", align_corners=True)
-            w_tap = 1.0 - 0.4 * frac
-            accum_smudge = accum_smudge + w_tap * sampled
-            total_tap_w += w_tap
+            sampled = F.grid_sample(
+                blurred_premult, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True
+            )
 
-        smudged_premult = accum_smudge / total_tap_w
-        carried_rgb_premult = smudged_premult[:, :3]
-        carried_a = smudged_premult[:, 3:4].clamp(0.0, 1.0)
+            decay = 1.0 - 0.65 * (frac ** 1.5)
+            tap_rgb_premult = sampled[:, :3]
+            tap_a = sampled[:, 3:4]
 
-        # Effective smudge blend weight is gated by how much paint was actually picked up (`carried_a`)
-        # so dragging from bare canvas (carried_a = 0) into wet paint never erases or dilutes existing paint!
-        eff_smudge = smudge_mask * carried_a
-        carried_rgb = carried_rgb_premult / (carried_a + 1e-5)
+            w_rgb = decay * tap_a
+            accum_rgb_premult = accum_rgb_premult + decay * tap_rgb_premult
+            accum_a_weight = accum_a_weight + w_rgb
+            carried_a = torch.maximum(carried_a, decay * tap_a)
 
-        # Weight existing pigment by its actual alpha `a_after_paint` so bare canvas (alpha=0, rgb=0)
-        # never darkens carried paint wisps with black zeros!
-        rem_a = a_after_paint * (1.0 - eff_smudge)
-        rgb_after_smudge = (rem_a * rgb_after_paint + eff_smudge * carried_rgb) / (rem_a + eff_smudge + 1e-6)
-        a_after_smudge = torch.maximum(a_after_paint, eff_smudge).clamp(0.0, 1.0)
+        carried_rgb = torch.where(
+            accum_a_weight > 1e-4,
+            (accum_rgb_premult / (accum_a_weight + 1e-5)).clamp(0.0, 1.0),
+            rgb_after_paint,
+        )
 
-        # 8. STEP C: True Eraser (reduces paint Alpha channel, revealing the background underneath)
-        a_final = a_after_smudge * (1.0 - eraser_mask)
-        rgb_final = torch.where(a_final > 1e-5, rgb_after_smudge, torch.zeros_like(rgb_after_smudge))
+        deposit_a = (smudge_mask * carried_a).clamp(0.0, 1.0)
+        a_after_smudge = a_after_paint + deposit_a * (1.0 - a_after_paint)
+        rgb_num_smudge = deposit_a * carried_rgb + (1.0 - deposit_a) * a_after_paint * rgb_after_paint
+        rgb_after_smudge = torch.where(
+            a_after_smudge > 1e-5,
+            (rgb_num_smudge / (a_after_smudge + 1e-6)).clamp(0.0, 1.0),
+            rgb_after_paint,
+        )
+
+        # 8. STEP C: In-Place Isotropic Blur / Blend Tool
+        post_smudge_premult = torch.cat([rgb_after_smudge * a_after_smudge, a_after_smudge], dim=1)
+        blurred_post_smudge = self._gaussian_blur_rgba(post_smudge_premult)
+        blended_blur_premult = (1.0 - blur_mask) * post_smudge_premult + blur_mask * blurred_post_smudge
+
+        a_after_blur = blended_blur_premult[:, 3:4].clamp(0.0, 1.0)
+        rgb_after_blur = torch.where(
+            a_after_blur > 1e-5,
+            (blended_blur_premult[:, :3] / (a_after_blur + 1e-6)).clamp(0.0, 1.0),
+            rgb_after_smudge,
+        )
+
+        # 9. STEP D: True Subtractive Eraser (supports both soft and hard erasing via `hardness`)
+        a_final = a_after_blur * (1.0 - eraser_mask)
+        rgb_final = torch.where(a_final > 1e-5, rgb_after_blur, torch.zeros_like(rgb_after_blur))
 
         return torch.cat([rgb_final, a_final], dim=1).clamp(0.0, 1.0)
 
@@ -317,9 +348,7 @@ class DifferentiableCanvasEngine(nn.Module):
         stroke_sequence: torch.Tensor,
         tool_weights_sequence: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        Unrolls K sequential strokes onto the RGBA `paint_layer` `(B, 4, H, W)`.
-        """
+        """Unrolls K sequential strokes onto the RGBA `paint_layer` `(B, 4, H, W)`."""
         if stroke_sequence.dim() == 2:
             return self.forward_single_step(paint_layer, stroke_sequence, tool_weights_sequence)
 
@@ -334,11 +363,6 @@ class DifferentiableCanvasEngine(nn.Module):
 def pad_to_square_with_mask(
     img: torch.Tensor, target_size: int = 256, pad_value: float = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int, int, int]]:
-    """
-    Resizes an arbitrary (B, 3, H, W) image so its longest side is `target_size`,
-    pads the shorter side with `pad_value` to form a 1:1 square,
-    and returns a binary `valid_mask` (1 inside artwork, 0 in padding).
-    """
     B, C, H, W = img.shape
     scale = target_size / float(max(H, W))
     new_H, new_W = max(1, int(round(H * scale))), max(1, int(round(W * scale)))
@@ -361,9 +385,6 @@ def masked_reconstruction_loss(
     target_rgb: torch.Tensor,
     valid_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    Computes L1 + L2 loss on the composited RGB canvas inside `valid_mask`.
-    """
     diff = composited_rgb - target_rgb
     pixel_loss = 0.5 * diff.abs() + 0.5 * (diff ** 2)
     if valid_mask is not None:
