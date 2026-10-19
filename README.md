@@ -66,6 +66,17 @@ Fit strokes directly to targets by gradient descent through the renderer (no net
 overpaint-fit --strokes 160 --stages 4 --out runs/fit
 ```
 
+Train the stroke predictor (`overpaint-train --help` lists all options). Supervised pretraining on synthetic paintings with known strokes, then render-loss training over K painting steps, on synthetic data or a folder of images:
+
+```bash
+overpaint-train --mode teacher --epochs 20 --out runs/teacher
+overpaint-train --mode unroll --init-from runs/teacher/best.pt --epochs 20 --out runs/unroll
+overpaint-train --mode unroll --data path/to/images --init-from runs/unroll/best.pt --out runs/real
+overpaint-train --resume runs/real/last.pt --epochs 40   # continue a run
+```
+
+Each run writes `best.pt` (best validation PSNR, EMA weights included), `last.pt`, `epochs.csv` / `steps.csv`, `curve.png` and validation samples per epoch to `--out`.
+
 Launch the interactive real-time mouse painting GUI:
 
 ```bash

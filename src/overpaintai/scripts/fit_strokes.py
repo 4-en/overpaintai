@@ -16,11 +16,12 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.losses import MultiScalePaintLoss, psnr
 from overpaintai.synthetic import radius_to_param, random_strokes, render_targets
+from overpaintai.viz import save_curve, save_frame
 
 TOOLS = {"paint": 0, "dry": 1, "smudge": 2, "blur": 3, "eraser": 4}
 
@@ -105,49 +106,6 @@ def init_strokes(
         dim=-1,
     )
     return logit(torch.cat([params, color], dim=-1))
-
-
-def to_uint8(x: torch.Tensor):
-    return (x.detach().clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-
-
-def save_frame(path: Path, target: torch.Tensor, canvas: torch.Tensor, text: str):
-    """Rows of [target | painting | error] per image, with a caption."""
-    B, _, H, W = target.shape
-    err = (canvas - target).abs().mean(1, keepdim=True).expand(-1, 3, -1, -1).clamp(0, 1) * 2.0
-    rows = [torch.cat([target[i], canvas[i], err[i].clamp(0, 1)], dim=2) for i in range(B)]
-    grid = torch.cat(rows, dim=1)
-    img = Image.fromarray(to_uint8(grid))
-    scale = max(1, 256 // H)
-    img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
-    canvas_img = Image.new("RGB", (img.width, img.height + 18), "white")
-    canvas_img.paste(img, (0, 18))
-    ImageDraw.Draw(canvas_img).text((4, 3), text, fill="black")
-    canvas_img.save(path)
-
-
-def save_curve(path: Path, rows: list, stage_starts: list):
-    """Minimal line plot of loss (log scale) and PSNR over steps, without plotting dependencies."""
-    Wp, Hp, pad = 720, 300, 40
-    img = Image.new("RGB", (Wp, Hp * 2), "white")
-    d = ImageDraw.Draw(img)
-    steps = [r["step"] for r in rows]
-    for panel, (key, log_scale, color) in enumerate((("loss", True, (200, 60, 40)), ("psnr", False, (40, 90, 200)))):
-        vals = [math.log10(r[key]) if log_scale else r[key] for r in rows]
-        lo, hi = min(vals), max(vals)
-        hi = hi if hi > lo else lo + 1.0
-        oy = panel * Hp
-
-        def xy(s, v):
-            return (pad + (Wp - 2 * pad) * s / max(1, steps[-1]), oy + Hp - pad - (Hp - 2 * pad) * (v - lo) / (hi - lo))
-
-        d.rectangle([pad, oy + pad, Wp - pad, oy + Hp - pad], outline=(180, 180, 180))
-        for s in stage_starts:
-            d.line([xy(s, lo), xy(s, hi)], fill=(225, 225, 225))
-        d.line([xy(s, v) for s, v in zip(steps, vals)], fill=color, width=2)
-        label = f"{'log10 ' if log_scale else ''}{key}: {rows[-1][key]:.4g}  (range {lo:.3g} .. {hi:.3g})"
-        d.text((pad, oy + 12), label, fill="black")
-    img.save(path)
 
 
 def main():
@@ -249,7 +207,7 @@ def main():
         final = render(1.0, with_grad=False)
         final_psnr = psnr(final, target)
     save_frame(out / "final.png", target, final, f"final | {args.strokes} strokes | PSNR {final_psnr.mean():.2f} dB")
-    save_curve(out / "curve.png", log_rows, stage_starts)
+    save_curve(out / "curve.png", log_rows, markers=stage_starts)
     with open(out / "log.csv", "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=list(dict.fromkeys(k for r in log_rows for k in r)))
         writer.writeheader()

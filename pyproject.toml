@@ -25,6 +25,8 @@ dependencies = [
 "torchvision>=0.15.0",
 "pillow>=9.5.0",
 "numpy",
+"scipy",
+"tqdm",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +40,7 @@ dev = [
 overpaint-test = "overpaintai.scripts.test_engine:main"
 overpaint-gui = "overpaintai.scripts.gui:main"
 overpaint-fit = "overpaintai.scripts.fit_strokes:main"
+overpaint-train = "overpaintai.train:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
