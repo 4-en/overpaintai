@@ -33,7 +33,7 @@ class DifferentiableCanvasEngine(nn.Module):
         num_stamps: int = 32,
         min_radius: float = 0.005,
         max_radius: float = 0.25,
-        hard_edge_sharpness: float = 300.0,
+        hard_edge_px: float = 1.0,
         smudge_pull_strength: float = 0.325,
         smudge_blur_ratio: float = 0.035,
         smudge_taps: int = 8,
@@ -45,7 +45,7 @@ class DifferentiableCanvasEngine(nn.Module):
         self.num_stamps = max(4, num_stamps)
         self.min_radius = min_radius
         self.max_radius = max_radius
-        self.hard_edge_sharpness = hard_edge_sharpness
+        self.hard_edge_px = hard_edge_px
         self.smudge_pull_strength = smudge_pull_strength
         self.smudge_blur_ratio = smudge_blur_ratio
         self.smudge_taps = smudge_taps
@@ -248,8 +248,9 @@ class DifferentiableCanvasEngine(nn.Module):
         a_seg = at[:, :-1] + h * (at[:, 1:] - at[:, :-1])  # (B, S-1, H, W)
 
         # 4. Unified Continuous Hardness Brush Profile
-        res_scale = 1.0 if self.training else max(1.0, max(H, W) / float(self.canvas_size))
-        edge_sharpness = self.hard_edge_sharpness * res_scale
+        # Hard edge falloff (10%-90% alpha) spans `hard_edge_px` output pixels at any resolution.
+        # sigmoid(k * x) rises from 0.1 to 0.9 over 2*ln(9)/k; one pixel is 1/(N-1) in grid units.
+        edge_sharpness = 2.0 * math.log(9.0) * (max(H, W) - 1) / self.hard_edge_px
 
         hard_profile = torch.sigmoid(edge_sharpness * (r_seg - dist))
         soft_profile = torch.exp(-2.0 * dist_sq / (r_seg * r_seg + 1e-6))

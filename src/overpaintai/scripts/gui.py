@@ -149,7 +149,9 @@ class PaintGUI:
     def _apply_segment(self, x0, y0, x2, y2):
         x1 = (x0 + x2) * 0.5
         y1 = (y0 + y2) * 0.5
-        r = self.radius_val.get()
+        # Slider is the actual normalized radius; the engine expects r in [0, 1] mapped onto [min, max]
+        e = self.engine
+        r = (self.radius_val.get() - e.min_radius) / (e.max_radius - e.min_radius)
         a = self.opacity_val.get()
         h = self.hardness_val.get()
         R, G, B = self.color_rgb
