@@ -19,7 +19,7 @@ class DifferentiableCanvasEngine(nn.Module):
     Discrete Tool Modes (5 tools, all sharing the continuous `hardness` attribute):
       0: Paint Brush (Standard pigment deposition, from soft airbrush at h=0 to hard cel ink at h=1)
       1: Dry / Textured Brush (Pigment deposition modulated by procedural canvas/chalk grain)
-      2: Smudge / Push (Directional pigment transport along the curve tangent without exit-dent dilution)
+      2: Smudge / Push (Brush carries a paint patch along the curve, depositing and picking up as it moves)
       3: Blur / Blend (In-place isotropic softening of colors and edges underneath the brush)
       4: Eraser (Subtractive alpha removal, from soft feathered eraser at h=0 to hard cutout at h=1)
     """
@@ -34,9 +34,10 @@ class DifferentiableCanvasEngine(nn.Module):
         min_radius: float = 0.005,
         max_radius: float = 0.25,
         hard_edge_px: float = 1.0,
-        smudge_pull_strength: float = 0.325,
-        smudge_blur_ratio: float = 0.035,
-        smudge_taps: int = 8,
+        blur_ratio: float = 0.035,
+        smudge_spacing: float = 0.25,
+        smudge_length: float = 12.0,
+        smudge_max_dabs: int = 128,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
     ):
@@ -46,9 +47,10 @@ class DifferentiableCanvasEngine(nn.Module):
         self.min_radius = min_radius
         self.max_radius = max_radius
         self.hard_edge_px = hard_edge_px
-        self.smudge_pull_strength = smudge_pull_strength
-        self.smudge_blur_ratio = smudge_blur_ratio
-        self.smudge_taps = smudge_taps
+        self.blur_ratio = blur_ratio
+        self.smudge_spacing = smudge_spacing
+        self.smudge_length = smudge_length
+        self.smudge_max_dabs = smudge_max_dabs
         self.bg_texture_strength = bg_texture_strength
 
         self.register_buffer("bg_color", torch.tensor(bg_color, dtype=torch.float32).view(1, 3, 1, 1))
@@ -91,8 +93,8 @@ class DifferentiableCanvasEngine(nn.Module):
         default_bg = (self.bg_color.to(device) - self.bg_texture_strength * (0.5 - 0.5 * weave)).clamp(0.0, 1.0)
         self.register_buffer("default_bg", default_bg, persistent=False)
 
-        # Separable 1D Gaussian blur kernel for 4-channel premultiplied RGBA smudge & blur diffusion
-        k_size = max(3, int(round(max(H, W) * self.smudge_blur_ratio)) | 1)
+        # Separable 1D Gaussian blur kernel for the 4-channel premultiplied RGBA Blur / Blend tool
+        k_size = max(3, int(round(max(H, W) * self.blur_ratio)) | 1)
         sigma = k_size / 3.0
         coords = torch.arange(k_size, device=device, dtype=torch.float32) - (k_size - 1) / 2.0
         g1d = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
@@ -102,6 +104,79 @@ class DifferentiableCanvasEngine(nn.Module):
         self._blur_pad = k_size // 2
 
         self._cached_hw = (H, W)
+
+    @staticmethod
+    def _brush_profile(
+        dist_sq: torch.Tensor, radius: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
+    ) -> torch.Tensor:
+        """Blends a soft Gaussian falloff (hardness 0) with a crisp disc edge (hardness 1)."""
+        hard = torch.sigmoid(edge_sharpness * (radius - torch.sqrt(dist_sq + 1e-8)))
+        soft = torch.exp(-2.0 * dist_sq / (radius * radius + 1e-6))
+        return (1.0 - hardness) * soft + hardness * hard
+
+    def _smudge(
+        self,
+        premult: torch.Tensor,
+        bx: torch.Tensor,
+        by: torch.Tensor,
+        rt: torch.Tensor,
+        at: torch.Tensor,
+        hardness: torch.Tensor,
+        w_smudge: torch.Tensor,
+        edge_sharpness: float,
+    ) -> torch.Tensor:
+        """
+        Physically-motivated smear of premultiplied RGBA `(B, 4, H, W)` along the stroke.
+
+        The curve is resampled into closely spaced dabs. At each dab, the paint under the brush is
+        replaced (at the smear rate times the dab profile) by the paint one step behind, translated
+        forward by the dab-to-dab motion in whole pixels (exact copies, so nothing is blurred). Paint
+        inside the footprint therefore travels with the brush:
+          - starting on bare canvas, the brush carries nothing and digs an indent into paint it enters,
+            gradually loading up with that paint and filling the indent as it goes,
+          - starting on paint, it drags that paint along and leaves it as a fading trail.
+
+        Carried paint drifts backwards relative to the brush by (1 - rate) per distance travelled and is
+        left behind once it crosses the footprint (2 radii), so it is dragged about 2 / (1 - rate) radii.
+        The rate is `opacity - (2 / smudge_length) * opacity^2`, which caps the drag distance at full
+        opacity to `smudge_length` radii while barely changing low opacities. Blurring is the Blur / Blend tool's job.
+        """
+        B, _, H, W = premult.shape
+        S = bx.shape[1]
+
+        # Resample the curve into evenly spaced dabs (spacing relative to the smallest radius)
+        with torch.no_grad():
+            seg_len = torch.sqrt((bx[:, 1:] - bx[:, :-1]) ** 2 + (by[:, 1:] - by[:, :-1]) ** 2)
+            length = seg_len.sum(dim=1).flatten()
+            r_min = rt.amin(dim=1).flatten()
+            n_dabs = int((length / (self.smudge_spacing * r_min)).max().ceil().item()) + 1
+            n_dabs = max(2, min(self.smudge_max_dabs, n_dabs))
+
+        def resample(v: torch.Tensor) -> torch.Tensor:  # (B, S, 1, 1) -> (B, n_dabs)
+            return F.interpolate(v.view(B, 1, S), size=n_dabs, mode="linear", align_corners=True).view(B, n_dabs)
+
+        dx, dy, dr, da = resample(bx), resample(by), resample(rt), resample(at)
+
+        # Whole-pixel dab-to-dab motion; rounding absolute positions keeps rounding error from accumulating
+        px = torch.round(dx.detach() * (W - 1))
+        py = torch.round(dy.detach() * (H - 1))
+        shift_x = (px[:, 1:] - px[:, :-1]) * (2.0 / max(W - 1, 1))
+        shift_y = (py[:, 1:] - py[:, :-1]) * (2.0 / max(H - 1, 1))
+
+        rate = (da - (2.0 / self.smudge_length) * da * da).clamp(0.0, 1.0)
+        strength = (w_smudge.view(B, 1) * rate).view(B, n_dabs, 1, 1)
+
+        canvas = premult
+        for i in range(1, n_dabs):
+            offset = torch.stack([shift_x[:, i - 1], shift_y[:, i - 1]], dim=-1).view(B, 1, 1, 2)
+            dragged = F.grid_sample(
+                canvas, self.base_grid - offset, mode="nearest", padding_mode="zeros", align_corners=True
+            )
+            d_sq = (self.grid_x - dx[:, i].view(B, 1, 1, 1)) ** 2 + (self.grid_y - dy[:, i].view(B, 1, 1, 1)) ** 2
+            dab = self._brush_profile(d_sq, dr[:, i].view(B, 1, 1, 1), hardness.view(B, 1, 1, 1), edge_sharpness)
+            canvas = canvas + dab * strength[:, i : i + 1] * (dragged - canvas)
+
+        return canvas
 
     def _gaussian_blur_rgba(self, x_rgba: torch.Tensor) -> torch.Tensor:
         """Applies fast separable Gaussian smoothing across 4 premultiplied RGBA channels."""
@@ -242,7 +317,6 @@ class DifferentiableCanvasEngine(nn.Module):
         closest_x = ax + h * abx
         closest_y = ay + h * aby
         dist_sq = (self.grid_x - closest_x) ** 2 + (self.grid_y - closest_y) ** 2
-        dist = torch.sqrt(dist_sq + 1e-8)
 
         r_seg = rt[:, :-1] + h * (rt[:, 1:] - rt[:, :-1])  # (B, S-1, H, W)
         a_seg = at[:, :-1] + h * (at[:, 1:] - at[:, :-1])  # (B, S-1, H, W)
@@ -252,21 +326,14 @@ class DifferentiableCanvasEngine(nn.Module):
         # sigmoid(k * x) rises from 0.1 to 0.9 over 2*ln(9)/k; one pixel is 1/(N-1) in grid units.
         edge_sharpness = 2.0 * math.log(9.0) * (max(H, W) - 1) / self.hard_edge_px
 
-        hard_profile = torch.sigmoid(edge_sharpness * (r_seg - dist))
-        soft_profile = torch.exp(-2.0 * dist_sq / (r_seg * r_seg + 1e-6))
-
-        seg_profile = ((1.0 - hardness) * soft_profile + hardness * hard_profile) * a_seg
+        seg_profile = self._brush_profile(dist_sq, r_seg, hardness, edge_sharpness) * a_seg
         brush_mask, _ = seg_profile.max(dim=1, keepdim=True)  # (B, 1, H, W)
-
-        # Soft segment weights for smooth tangent interpolation
-        soft_seg = soft_profile * a_seg
 
         # 5. Tool weights unpacking: [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
         w = tool_weights.view(B, self.NUM_TOOLS, 1, 1, 1)
         w_paint, w_dry, w_smudge, w_blur, w_eraser = w[:, 0], w[:, 1], w[:, 2], w[:, 3], w[:, 4]
 
         paint_mask = (w_paint * brush_mask + w_dry * (brush_mask * self.paper_grain)).clamp(0.0, 1.0)
-        smudge_mask = (w_smudge * brush_mask).clamp(0.0, 1.0)
         blur_mask = (w_blur * brush_mask).clamp(0.0, 1.0)
         eraser_mask = (w_eraser * brush_mask).clamp(0.0, 1.0)
 
@@ -282,53 +349,14 @@ class DifferentiableCanvasEngine(nn.Module):
             c_rgb,
         )
 
-        # 7. STEP B: Premultiplied RGBA Pigment Smudge & Transport (with zero-tap dilution fix)
+        # 7. STEP B: Smudge / Push — dab-sequential paint transport in premultiplied RGBA
         premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
-        blurred_premult = self._gaussian_blur_rgba(premult_rgba)
-
-        seg_tx = abx * (self.num_stamps - 1)
-        seg_ty = aby * (self.num_stamps - 1)
-        seg_weights = soft_seg / (soft_seg.sum(dim=1, keepdim=True) + 1e-6)
-        local_tx = (seg_weights * seg_tx).sum(dim=1, keepdim=True)
-        local_ty = (seg_weights * seg_ty).sum(dim=1, keepdim=True)
-
-        accum_rgb_premult = torch.zeros_like(rgb_after_paint)
-        accum_a_weight = torch.zeros_like(a_after_paint)
-        carried_a = torch.zeros_like(a_after_paint)
-
-        # Sample strictly upstream (tap = 1 .. smudge_taps) so bare-canvas taps never dilute exiting paint
-        for tap in range(1, self.smudge_taps + 1):
-            frac = tap / float(self.smudge_taps)
-            # Tangents are in [0, 1] canvas units; grid_sample coordinates span [-1, 1] (x2)
-            ox = local_tx * (2.0 * frac * self.smudge_pull_strength)
-            oy = local_ty * (2.0 * frac * self.smudge_pull_strength)
-            offset_grid = torch.cat([ox.permute(0, 2, 3, 1), oy.permute(0, 2, 3, 1)], dim=-1)
-            sample_grid = (self.base_grid - offset_grid).clamp(-1.0, 1.0)
-            sampled = F.grid_sample(
-                blurred_premult, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True
-            )
-
-            decay = 1.0 - 0.65 * (frac ** 1.5)
-            tap_rgb_premult = sampled[:, :3]
-            tap_a = sampled[:, 3:4]
-
-            w_rgb = decay * tap_a
-            accum_rgb_premult = accum_rgb_premult + decay * tap_rgb_premult
-            accum_a_weight = accum_a_weight + w_rgb
-            carried_a = torch.maximum(carried_a, decay * tap_a)
-
-        carried_rgb = torch.where(
-            accum_a_weight > 1e-4,
-            (accum_rgb_premult / (accum_a_weight + 1e-5)).clamp(0.0, 1.0),
-            rgb_after_paint,
-        )
-
-        deposit_a = (smudge_mask * carried_a).clamp(0.0, 1.0)
-        a_after_smudge = a_after_paint + deposit_a * (1.0 - a_after_paint)
-        rgb_num_smudge = deposit_a * carried_rgb + (1.0 - deposit_a) * a_after_paint * rgb_after_paint
+        if tool_weights.requires_grad or bool((w_smudge > 0).any()):
+            premult_rgba = self._smudge(premult_rgba, bx, by, rt, at, hardness, w_smudge, edge_sharpness)
+        a_after_smudge = premult_rgba[:, 3:4].clamp(0.0, 1.0)
         rgb_after_smudge = torch.where(
             a_after_smudge > 1e-5,
-            (rgb_num_smudge / (a_after_smudge + 1e-6)).clamp(0.0, 1.0),
+            (premult_rgba[:, :3] / (a_after_smudge + 1e-6)).clamp(0.0, 1.0),
             rgb_after_paint,
         )
 

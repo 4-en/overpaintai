@@ -28,7 +28,7 @@ Every stroke is defined by a vector in `[0, 1]^14`:
 All 5 tools utilize the continuous capsule distance field and respect the stroke's `hardness` parameter:
 - `0: Paint Brush` - Porter-Duff "Source Over" pigment deposition (transitions continuously from soft airbrush to hard round brush via `hardness`).
 - `1: Dry / Textured Brush` - Pigment deposition modulated by procedural paper and bristle grain.
-- `2: Smudge / Push` - Multi-tap tangent advection in premultiplied RGBA space. Transports existing pigment along the curve tangent without diluting exiting paint or carving holes on bare canvas.
+- `2: Smudge / Push` - Dab-sequential smear in premultiplied RGBA space. At each dab along the curve, the paint under the brush is replaced by the paint one step behind, moved forward by whole pixels, so pigment travels with the brush without blurring. Dragging in from bare canvas pushes paint away (an indent); dragging out of paint carries it along and deposits it. Stroke opacity controls how long paint is carried (lower = shorter, fading smear trail); `smudge_length` caps the drag distance at full opacity (default 12 brush radii), so the brush gradually loads up with paint it pushes into and runs out of paint it drags.
 - `3: Blur / Blend` - In-place isotropic Gaussian softening of color and alpha boundaries underneath the brush footprint without directional pigment displacement.
 - `4: Eraser` - Subtractive alpha removal (`A_next = A * (1 - eraser_mask)`), supporting both feathered soft erasing and razor-sharp cutouts to reveal the underlying background.
 
@@ -64,7 +64,7 @@ overpaint-gui
 
 1. **Phase 1: Differentiable Canvas Engine (Completed)**
    - Continuous capsule Bezier distance field (zero circle-stamp beading).
-   - 4-channel RGBA paint layer with Porter-Duff compositing and premultiplied tangent smudge.
+   - 4-channel RGBA paint layer with Porter-Duff compositing and premultiplied dab-sequential smudge.
    - Unified continuous `hardness` attribute and in-place `Blur / Blend` tool.
    - Interactive Tkinter GUI and CLI test suite.
 2. **Phase 2: Hybrid Stroke Predictor & Unrolled Training Loop**

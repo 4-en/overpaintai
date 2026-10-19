@@ -36,17 +36,68 @@ def test_training_tool_weights_are_one_hot_with_gradients():
     assert logits.grad is not None and logits.grad.abs().sum() > 0
 
 
-def test_smudge_pull_is_in_canvas_units():
-    """With pull strength 1.0, a horizontal smudge drags paint by ~the stroke's tangent length."""
-    engine = DifferentiableCanvasEngine(canvas_size=SIZE, smudge_pull_strength=1.0, smudge_taps=1).eval()
+def _bar(engine, layer, x0, x1, rgb):
+    """Hard horizontal bar of paint across y=0.5 from x0 to x1."""
+    stroke = torch.tensor([[x0, 0.5, (x0 + x1) / 2, 0.5, x1, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, *rgb]])
+    return engine.forward_single_step(layer, stroke, one_hot_tool(0))
+
+
+def _smudge(engine, layer, x0, x1, requires_grad=False):
+    stroke = torch.tensor([[x0, 0.5, (x0 + x1) / 2, 0.5, x1, 0.5, 0.2, 0.2, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]])
+    stroke.requires_grad_(requires_grad)
+    return engine.forward_single_step(layer, stroke, one_hot_tool(2)), stroke
+
+
+def _px(x: float) -> int:
+    return round(x * (SIZE - 1))
+
+
+def test_smudge_from_bare_canvas_digs_indent():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE).eval()
+    layer = _bar(engine, engine.create_blank_paint_layer(1, SIZE, SIZE), 0.5, 0.8, (0.9, 0.2, 0.1))
+    out, _ = _smudge(engine, layer, 0.1, 0.6)
+    row = _px(0.5)
+    # Paint the brush passed through (inside the bar, behind the final dab) is pushed away
+    assert layer[0, 3, row, _px(0.45)] > 0.99
+    assert out[0, 3, row, _px(0.45)] < 0.05
+    # Paint well outside the brush footprint is untouched (compared premultiplied: RGB of nearly
+    # transparent pixels is numerically unstable through the premultiply round trip)
+    def premult(x):
+        return torch.cat([x[:, :3] * x[:, 3:], x[:, 3:]], dim=1)[..., _px(0.9) :]
+
+    assert torch.allclose(premult(out), premult(layer), atol=1e-5)
+
+
+def test_smudge_carries_paint_along_the_stroke():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE).eval()
     layer = engine.create_blank_paint_layer(1, SIZE, SIZE)
-    # Hard vertical bar of paint at x ~= 0.3
-    bar = torch.tensor([[0.3, 0.0, 0.3, 0.5, 0.3, 1.0, 0.05, 0.05, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0]])
-    layer = engine.forward_single_step(layer, bar)
-    # Smudge rightwards along y=0.5; tangent length |B'(t)| = 0.2 everywhere
-    smudge = torch.tensor([[0.2, 0.5, 0.3, 0.5, 0.4, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0]])
-    out = engine.forward_single_step(layer, smudge, one_hot_tool(2))
-    new_alpha = (out - layer)[0, 3, SIZE // 2]
-    xs = torch.linspace(0.0, 1.0, SIZE)
-    peak_x = xs[new_alpha.argmax()].item()
-    assert abs(peak_x - (0.3 + 0.2)) < 2.0 / SIZE
+    layer = _bar(engine, layer, 0.15, 0.35, (0.1, 0.4, 0.9))  # blue
+    layer = _bar(engine, layer, 0.6, 0.85, (0.9, 0.2, 0.1))   # red
+    out, _ = _smudge(engine, layer, 0.25, 0.75)
+    blue = torch.tensor([0.1, 0.4, 0.9])
+    # Blue dragged from the start reaches the red bar undiluted (no blur), then mixes in gradually
+    assert torch.allclose(out[0, :3, _px(0.5), _px(0.6)], blue, atol=0.02)
+    assert out[0, 3, _px(0.5), _px(0.6)] > 0.99
+    assert out[0, 2, _px(0.5), _px(0.7)] > 0.5  # still mostly blue inside the red
+
+
+def test_smudge_drag_distance_is_finite_at_full_opacity():
+    def drag(smudge_length):
+        engine = DifferentiableCanvasEngine(canvas_size=SIZE, smudge_length=smudge_length).eval()
+        layer = _bar(engine, engine.create_blank_paint_layer(1, SIZE, SIZE), 0.05, 0.2, (0.1, 0.4, 0.9))
+        out, _ = _smudge(engine, layer, 0.15, 0.95)
+        return out[0, 3, _px(0.5)]
+
+    unlimited, default = drag(float("inf")), drag(12.0)
+    assert unlimited[_px(0.9)] > 0.95  # without a limit, paint rides along the whole stroke
+    assert default[_px(0.45)] > 0.95  # with it, a trail is still left near the source...
+    assert default[_px(0.9)] < 0.5 * unlimited[_px(0.9)]  # ...but the load runs out with distance
+
+
+def test_smudge_is_differentiable():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE).train()
+    layer = _bar(engine, engine.create_blank_paint_layer(1, SIZE, SIZE), 0.5, 0.8, (0.9, 0.2, 0.1))
+    out, stroke = _smudge(engine, layer, 0.1, 0.6, requires_grad=True)
+    out[:, 3].sum().backward()
+    assert stroke.grad[0, :6].abs().sum() > 0  # curve geometry
+    assert stroke.grad[0, 8:11].abs().sum() > 0  # opacity and hardness
