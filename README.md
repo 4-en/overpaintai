@@ -104,3 +104,23 @@ Once the base model and unrolled training loop are validated, the following exte
 - **Custom Brush Shapes & Bristle Tip Footprints**: Expanding beyond an isotropic circular cross-section to support anisotropic flat/chisel brushes, bristle mark footprints, and irregular blocking-in stamps oriented along the curve tangent $B'(t)$.
 - **Dynamic Brush Bank & Learnable Brush Embeddings**: Providing the model with a library of specialized digital art brushes (e.g., rake/bristle brushes, palette knives, stipple/sponge stamps, foliage/cloud blockers) conditioned via learnable **brush embeddings**, allowing the predictor to dynamically select and modulate custom brush tips per stroke.
 - **Wet-on-Wet Impasto Mixing**: Simultaneous pigment deposition and tangent advection within a single stroke to simulate loaded bristle brushes mixing directly with wet canvas paint.
+
+## Planned: High-Resolution Inference Harness
+
+Inference-only scheduling for large canvases (e.g. 2048×2048). The model only ever sees a view box `(x, y, s)` resampled to its working resolution, so how boxes are chosen is free; none of this requires retraining.
+
+- **Coarse-to-fine schedule**: whole-image views first (blocking in), then tiles of decreasing size until one view pixel ≈ one target pixel. Every tile gets the global tokens of the whole image, so it knows the overall composition.
+- **Error-guided tile selection**: instead of a fixed grid, blur the error map `|target − canvas|` at the current tile scale, pick the windows with the highest summed error, suppress heavily overlapping candidates (non-maximum suppression), paint them as one batch, re-measure, repeat. Regions that are already good get no more strokes; difficult regions get several passes.
+- **Importance weighting**: multiply the error map by an importance map before selecting, e.g. from a face detector (including illustration/anime face detectors), subject segmentation (rembg, SAM), a saliency model, or a user-painted mask. The subject gets more and smaller tiles while the background stays looser.
+- **Adaptive stopping**: stop when no (importance-weighted) region's error is above a threshold, so simple images finish early and detailed ones get more strokes.
+
+### Tile edges: don't paint blind, don't clip
+A tile's strokes must not reach (far) past what the model can see: outside the view it can't judge what it would paint over, and could destroy finished work. Hard-clipping strokes at the tile border is not an option either, since it leaves visible hard edges and seams.
+- **Context margin**: the model sees the tile plus a margin of surrounding canvas, but stroke anchors are restricted to the inner core (e.g. by masking the placement logits outside it).
+- **Soft fade instead of clipping**: attenuate each stroke's opacity smoothly with how far its footprint (endpoints + radius) extends beyond the core, so strokes near the border fade out rather than being cut. In training this also gives a gradient that pulls strokes inward.
+- **Train with the same rule**: apply the margin and fade to tile steps during training, so the model learns to keep its strokes inside the safe area instead of having them suppressed only at inference.
+- **Overlapping tiles**: neighbouring tiles overlap, so seam regions are painted from both sides; tiles that overlap heavily go into different rounds, so they don't paint the same spot from the same stale canvas.
+
+### Requirements before this is practical
+- **Smaller tiles in training**: unroll currently trains tile views at 0.3–0.6 of the image (`--tile-size`); 2048 px inference needs tiles down to ~1/16, and the model's view-scale input should not leave its trained range.
+- **Bounding-box rendering**: the engine renders every stroke over the full canvas; with many small tiles on a 2048 canvas, strokes must be rendered only inside their own bounding box.

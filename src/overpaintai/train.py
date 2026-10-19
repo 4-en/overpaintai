@@ -64,7 +64,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--num-workers", type=int, default=4, help="Folder: DataLoader workers")
 
     g = p.add_argument_group("augmentation (folder data)")
-    g.add_argument("--crop-scale", default="0.35,1.0", help="Random square crop area range (zoom)")
+    g.add_argument("--crop-scale", default="0.1,1.0", help="Random square crop area range (zoom)")
     g.add_argument("--hflip", type=float, default=0.5)
     g.add_argument("--vflip", type=float, default=0.0)
     g.add_argument("--color-jitter", type=float, default=0.1)
@@ -81,6 +81,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--val-tile-steps", type=int, default=0, help="Validation: extra 2x2-tile steps")
     g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
     g.add_argument("--detach-canvas", action="store_true", help="Unroll: no gradient through earlier steps")
+    g.add_argument("--grad-through-inputs", action="store_true",
+                   help="Unroll: also backprop through the canvas the model looks at (unstable: explodes "
+                        "over several steps); by default earlier steps get gradients via the renderer only")
     g.add_argument("--detail-weight", type=float, default=1.0)
     g.add_argument("--scales", default="4,16")
     g.add_argument("--scale-weights", default="1,1")
@@ -198,7 +201,8 @@ class Trainer:
 
         amp = torch.bfloat16 if args.amp == "bf16" else None
         ckpt_strokes = not args.no_checkpoint_strokes
-        self.painter = Painter(self.model, self.engine, args.view_res, self.tools, amp, ckpt_strokes)
+        self.painter = Painter(self.model, self.engine, args.view_res, self.tools, amp, ckpt_strokes,
+                               grad_through_inputs=args.grad_through_inputs)
         eval_model = self.ema.model if self.ema else self.model
         self.eval_painter = Painter(eval_model, self.engine, args.view_res, self.tools, amp, checkpoint_strokes=False)
 

@@ -33,6 +33,10 @@ class Painter:
             in eval.
         autocast: dtype for the network (e.g. torch.bfloat16) or None. The renderer always runs in fp32.
         checkpoint_strokes: recompute strokes in backward (see `DifferentiableCanvasEngine.forward`).
+        grad_through_inputs: let gradients flow into the canvas the model *looks at*. Off by default: over a
+            multi-step unroll this chains the network's input Jacobian once per step (like an RNN) and
+            explodes. Earlier strokes still get gradients through the renderer, where later strokes are
+            composited on top of them.
     """
 
     def __init__(
@@ -44,6 +48,7 @@ class Painter:
         autocast: Optional[torch.dtype] = None,
         checkpoint_strokes: bool = True,
         gumbel_tau: float = 1.0,
+        grad_through_inputs: bool = False,
     ):
         self.model = model
         self.engine = engine
@@ -52,6 +57,7 @@ class Painter:
         self.autocast = autocast
         self.checkpoint_strokes = checkpoint_strokes
         self.gumbel_tau = gumbel_tau
+        self.grad_through_inputs = grad_through_inputs
         self._background = {}
 
     def background(self, B: int, S: int, device: torch.device) -> torch.Tensor:
@@ -82,6 +88,8 @@ class Painter:
 
     def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
         B = target.shape[0]
+        if not self.grad_through_inputs:
+            layer = layer.detach()
         boxes = views.whole_image_boxes(B, target.device)
         x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.view_res)
         with self._autocast(target.device):
@@ -96,6 +104,8 @@ class Painter:
         global_tokens: Optional[torch.Tensor] = None,
     ) -> StrokeOutput:
         """Model output for one view per image (`boxes` (B, 3))."""
+        if not self.grad_through_inputs:
+            layer = layer.detach()
         x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.view_res)
         with self._autocast(target.device):
             return self.model(x, boxes, progress, global_tokens=global_tokens)
