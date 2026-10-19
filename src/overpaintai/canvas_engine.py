@@ -34,7 +34,7 @@ class DifferentiableCanvasEngine(nn.Module):
         min_radius: float = 0.005,
         max_radius: float = 0.25,
         hard_edge_sharpness: float = 300.0,
-        smudge_pull_strength: float = 0.65,
+        smudge_pull_strength: float = 0.325,
         smudge_blur_ratio: float = 0.035,
         smudge_taps: int = 8,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
@@ -155,8 +155,14 @@ class DifferentiableCanvasEngine(nn.Module):
         raw_cont: torch.Tensor,
         raw_tool_logits: Optional[torch.Tensor] = None,
         gumbel_tau: float = 1.0,
+        gumbel_hard: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Maps unconstrained neural network outputs R^14 into bounded [0, 1] stroke parameters."""
+        """
+        Maps unconstrained neural network outputs R^14 into bounded [0, 1] stroke parameters.
+
+        In training mode, tools are sampled with Gumbel-Softmax. With `gumbel_hard=True` the forward
+        pass uses a one-hot tool (matching inference) while gradients flow through the soft relaxation.
+        """
         stroke_params = torch.sigmoid(raw_cont)
         if raw_tool_logits is None:
             shape = raw_cont.shape[:-1] + (self.NUM_TOOLS,)
@@ -164,7 +170,7 @@ class DifferentiableCanvasEngine(nn.Module):
             tool_weights[..., 0] = 1.0
         else:
             if self.training:
-                tool_weights = F.softmax(raw_tool_logits / gumbel_tau, dim=-1)
+                tool_weights = F.gumbel_softmax(raw_tool_logits, tau=gumbel_tau, hard=gumbel_hard, dim=-1)
             else:
                 idx = raw_tool_logits.argmax(dim=-1)
                 tool_weights = F.one_hot(idx, num_classes=self.NUM_TOOLS).to(raw_cont.dtype)
@@ -292,8 +298,9 @@ class DifferentiableCanvasEngine(nn.Module):
         # Sample strictly upstream (tap = 1 .. smudge_taps) so bare-canvas taps never dilute exiting paint
         for tap in range(1, self.smudge_taps + 1):
             frac = tap / float(self.smudge_taps)
-            ox = local_tx * (frac * self.smudge_pull_strength)
-            oy = local_ty * (frac * self.smudge_pull_strength)
+            # Tangents are in [0, 1] canvas units; grid_sample coordinates span [-1, 1] (x2)
+            ox = local_tx * (2.0 * frac * self.smudge_pull_strength)
+            oy = local_ty * (2.0 * frac * self.smudge_pull_strength)
             offset_grid = torch.cat([ox.permute(0, 2, 3, 1), oy.permute(0, 2, 3, 1)], dim=-1)
             sample_grid = (self.base_grid - offset_grid).clamp(-1.0, 1.0)
             sampled = F.grid_sample(
@@ -358,6 +365,16 @@ class DifferentiableCanvasEngine(nn.Module):
             tw_k = tool_weights_sequence[:, k] if tool_weights_sequence is not None else None
             curr_layer = self.forward_single_step(curr_layer, stroke_sequence[:, k], tw_k)
         return curr_layer
+
+
+def reverse_strokes(stroke_params: torch.Tensor) -> torch.Tensor:
+    """
+    Returns the reversed-direction encoding of `(..., 14)` strokes: endpoints swapped, radius and
+    opacity tapers swapped. For every tool except Smudge the reversed stroke renders identically, so
+    parameter-space losses should take the minimum over both orderings.
+    """
+    idx = [4, 5, 2, 3, 0, 1, 7, 6, 9, 8, 10, 11, 12, 13]
+    return stroke_params[..., idx]
 
 
 def pad_to_square_with_mask(

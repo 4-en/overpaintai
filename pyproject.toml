@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 overpaint-test = "overpaintai.scripts.test_engine:main"
+overpaint-gui = "overpaintai.scripts.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
