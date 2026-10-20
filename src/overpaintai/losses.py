@@ -46,6 +46,14 @@ def local_sharpness(x: torch.Tensor, window: int = 5) -> torch.Tensor:
     return F.max_pool2d(mag, window, stride=1, padding=window // 2)
 
 
+def local_std(x: torch.Tensor, window: int = 5) -> torch.Tensor:
+    """Per-channel standard deviation within `window` x `window` px of each pixel, `(B, C, H, W)`."""
+    pad = window // 2
+    mean = F.avg_pool2d(F.pad(x, (pad,) * 4, mode="replicate"), window, stride=1)
+    mean_sq = F.avg_pool2d(F.pad(x * x, (pad,) * 4, mode="replicate"), window, stride=1)
+    return torch.sqrt((mean_sq - mean * mean).clamp(min=0.0) + 1e-6)
+
+
 def _coarse(x: torch.Tensor, factor: int, mode: str) -> torch.Tensor:
     """
     Low-resolution view of `x` at `factor`. "blur" pools by factor/4 and then Gaussian-blurs, so the
@@ -79,6 +87,9 @@ class MultiScalePaintLoss(nn.Module):
                       pixel L1), hence:
             "sharp" - L1 between the local maximum gradient magnitudes (5 px window): a sharp edge slightly
                       off position matches the target's local sharpness, a smeared edge does not.
+        flat_weight: weight of an L1 term between the local standard deviations (5 px windows) of
+            prediction and target ("flat"). Several strokes that don't quite match in color / opacity leave
+            a flat target area mottled: small in pixel L1, very visible. 0 disables it.
         extra_terms: optional named terms added on top (e.g. a perceptual or adversarial loss later),
             as `name -> (weight, fn(pred, target, mask))`.
     """
@@ -90,6 +101,7 @@ class MultiScalePaintLoss(nn.Module):
         scale_weights: Optional[Sequence[float]] = None,
         coarse_mode: str = "blur",
         edge_weight: float = 0.0,
+        flat_weight: float = 0.0,
         extra_terms: Optional[Dict[str, Tuple[float, LossTerm]]] = None,
     ):
         super().__init__()
@@ -100,6 +112,7 @@ class MultiScalePaintLoss(nn.Module):
         assert coarse_mode in ("blur", "pool")
         self.coarse_mode = coarse_mode
         self.edge_weight = edge_weight
+        self.flat_weight = flat_weight
         self.extra_terms = dict(extra_terms or {})
 
     def forward(
@@ -115,6 +128,10 @@ class MultiScalePaintLoss(nn.Module):
             terms["edge"] = 0.5 * self.edge_weight * _masked_mean(diff, valid_mask)
             sharp = (local_sharpness(pred) - local_sharpness(target)).abs()
             terms["sharp"] = self.edge_weight * _masked_mean(sharp, valid_mask)
+
+        if self.flat_weight > 0:
+            flat = (local_std(pred) - local_std(target)).abs()
+            terms["flat"] = self.flat_weight * _masked_mean(flat, valid_mask)
 
         for factor, weight in zip(self.scales, self.scale_weights):
             if weight <= 0:

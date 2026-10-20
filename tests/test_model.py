@@ -88,3 +88,63 @@ def test_gradients_reach_every_parameter_through_the_renderer():
 
     missing = [n for n, p in model.named_parameters() if p.grad is None or p.grad.abs().sum() == 0]
     assert not missing, missing
+
+
+def test_new_model_features_shapes_and_ranges():
+    torch.manual_seed(5)
+    model = _small_model(paintable_mask=True, stroke_gate=True, error_progress=True)
+    assert model.in_channels == 13
+    boxes = views.whole_image_boxes(2)
+    out = model(torch.randn(2, 13, R, R), boxes, torch.zeros(2), error_progress=torch.tensor([0.1, 0.8]))
+    assert out.gate.shape == (2, 4) and (out.gate > 0).all() and (out.gate < 1).all()
+    assert out.gate.mean() > 0.9  # strokes start switched on
+    plain = _small_model()
+    assert torch.equal(plain(torch.randn(1, 12, R, R), views.whole_image_boxes(1), torch.zeros(1)).gate,
+                       torch.ones(1, 4))
+
+
+def test_old_weights_load_into_grown_model_and_behave_the_same(tmp_path):
+    from overpaintai.train import Trainer
+
+    torch.manual_seed(6)
+    old = _small_model()
+    cfg = dict(num_strokes=4, widths=(8, 16, 32, 64), token_dim=64, heads=4)
+    path = tmp_path / "old.pt"
+    torch.save({"model": old.state_dict(), "ema": None, "model_config": cfg}, path)
+
+    trainer = Trainer.__new__(Trainer)  # only the weight loading is under test
+    trainer.model = _small_model(paintable_mask=True, stroke_gate=True, error_progress=True)
+    trainer.ema = None
+    trainer._init_from(str(path))
+    new = trainer.model.eval()
+    old.eval()
+
+    x = torch.randn(2, 12, R, R)
+    boxes = views.whole_image_boxes(2)
+    a = old(x, boxes, torch.full((2,), 0.3))
+    b = new(torch.cat([x, torch.ones(2, 1, R, R)], 1), boxes, torch.full((2,), 0.3),
+            error_progress=torch.tensor([0.4, 0.9]))  # new inputs start with zero weight: ignored
+    for f in ("points", "radii", "opacity", "hardness", "color"):
+        assert torch.allclose(getattr(a.strokes, f), getattr(b.strokes, f), atol=1e-5), f
+    assert torch.allclose(b.gate, torch.full_like(b.gate, torch.sigmoid(torch.tensor(3.0)).item()), atol=1e-5)
+
+
+def test_old_checkpoints_still_load_for_painting(tmp_path):
+    from overpaintai.highres import load_checkpoint_model
+
+    cfg = dict(num_strokes=4, widths=(8, 16, 32, 64), token_dim=64, heads=4)  # no feature switches: old run
+    torch.save({"model": _small_model().state_dict(), "ema": None, "model_config": cfg}, tmp_path / "c.pt")
+    model, _ = load_checkpoint_model(str(tmp_path / "c.pt"), torch.device("cpu"))
+    assert model.in_channels == 12 and not model.stroke_gate
+
+
+def test_gate_keeps_a_gradient_when_switched_off():
+    from overpaintai.model import GATE_LEAK
+
+    model = _small_model(stroke_gate=True).train()
+    with torch.no_grad():
+        model.attr_mlp[-1].bias[-1] = -20.0  # saturated: sigmoid'(-17) ~ 4e-8
+    out = model(torch.randn(1, 12, R, R), views.whole_image_boxes(1), torch.zeros(1))
+    assert out.gate.max() < 1e-6  # forward: off
+    grad, = torch.autograd.grad(out.gate.sum(), model.attr_mlp[-1].bias)
+    assert grad[-1] >= GATE_LEAK * out.gate.numel() * 0.99  # backward: still a usable signal

@@ -27,6 +27,7 @@ from PIL import Image
 
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
+from overpaintai.metrics import ACTIVE_OPACITY
 from overpaintai.model import StrokePredictor
 
 
@@ -114,11 +115,6 @@ def load_checkpoint_model(path: str, device: torch.device) -> Tuple[StrokePredic
     return model.to(device).eval(), ckpt
 
 
-def _smoothstep(x: torch.Tensor) -> torch.Tensor:
-    x = x.clamp(0.0, 1.0)
-    return x * x * (3.0 - 2.0 * x)
-
-
 class CropRenderer:
     """
     Renders image-space strokes onto a square paint layer of `size` px, each batch of strokes only inside a
@@ -153,7 +149,7 @@ class CropRenderer:
     def _engine(self, n: int, scale: float) -> DifferentiableCanvasEngine:
         """Engine for an n-px canvas covering `scale` of the image side (radii in its own units)."""
         return DifferentiableCanvasEngine(
-            canvas_size=n, num_stamps=self.num_stamps,
+            canvas_size=n, num_stamps=self.num_stamps, min_opacity=0.0,  # gated strokes may be (near) zero
             min_radius=self.min_radius / scale, max_radius=self.max_radius / scale,
         ).to(self.device).eval()
 
@@ -328,24 +324,43 @@ class HighResPainter:
         return torch.autocast(self.device.type, dtype=self.autocast or torch.bfloat16, enabled=enabled)
 
     @torch.no_grad()
+    def _inputs(self, target: torch.Tensor, layer: torch.Tensor, boxes: torch.Tensor,
+                cores: Optional[torch.Tensor] = None):
+        """View inputs (one image, T views; paintable mask = the tile cores, if the model takes one) and
+        the error-based progress (if the model uses it)."""
+        paintable = None
+        if self.model.paintable_mask:
+            paintable = (views.core_mask(boxes, cores, self.R) if cores is not None
+                         else torch.ones(boxes.shape[0], 1, self.R, self.R, device=self.device))
+        x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.R, paintable)
+        e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.error_progress else None
+        return x, e
+
+    @torch.no_grad()
     def predict(
         self, target: torch.Tensor, layer: torch.Tensor, boxes: torch.Tensor, progress: float,
-        global_tokens: Optional[torch.Tensor] = None,
+        global_tokens: Optional[torch.Tensor] = None, cores: Optional[torch.Tensor] = None,
     ):
         T = boxes.shape[0]
-        canvas = self.composite(layer)
-        x = views.view_inputs(target, canvas, layer[:, 3:], boxes, self.R)  # one image, T views
+        x, e = self._inputs(target, layer, boxes, cores)
         lo, hi = self.cfg.scale_clamp
         prog = torch.full((T,), progress, device=self.device)
         with self._autocast():
-            return self.model(x, boxes, prog, global_tokens=global_tokens, view_size=boxes[:, 2].clamp(lo, hi))
+            return self.model(x, boxes, prog, global_tokens=global_tokens, view_size=boxes[:, 2].clamp(lo, hi),
+                              error_progress=e)
 
     @torch.no_grad()
     def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: float) -> torch.Tensor:
-        boxes = views.whole_image_boxes(1, self.device)
-        x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.R)
+        x, e = self._inputs(target, layer, views.whole_image_boxes(1, self.device))
         with self._autocast():
-            return self.model.encode_global(x, torch.full((1,), progress, device=self.device))
+            return self.model.encode_global(x, torch.full((1,), progress, device=self.device), e)
+
+    @staticmethod
+    def _visible(strokes: views.Strokes, opacity: torch.Tensor, keep: torch.Tensor, t: int) -> views.Strokes:
+        """Strokes of view `t` with rendered `opacity` (T, N, 2), only those in `keep` (T, N)."""
+        k = keep[t]
+        return views.Strokes(strokes.points[t : t + 1, k], strokes.radii[t : t + 1, k], opacity[t : t + 1, k],
+                             strokes.hardness[t : t + 1, k], strokes.color[t : t + 1, k])
 
     # --- tiles ------------------------------------------------------------------------------------
     def error_map(self, target_a: torch.Tensor, layer: torch.Tensor, weight_a: torch.Tensor) -> torch.Tensor:
@@ -385,10 +400,7 @@ class HighResPainter:
 
     def view_boxes(self, cores: torch.Tensor) -> torch.Tensor:
         """Core boxes enlarged by the context margin on each side, shifted (not shrunk) into the image."""
-        v = (cores[:, 2] * (1.0 + 2.0 * self.cfg.margin)).clamp(max=1.0)
-        xy = cores[:, :2] - 0.5 * (v - cores[:, 2]).unsqueeze(-1)
-        xy = torch.minimum(xy.clamp(min=0.0), (1.0 - v).unsqueeze(-1))
-        return torch.cat([xy, v.unsqueeze(-1)], dim=-1)
+        return views.expand_cores(cores, self.cfg.margin)
 
     def fade(self, strokes: views.Strokes, anchors: torch.Tensor, cores: torch.Tensor, boxes: torch.Tensor):
         """
@@ -400,15 +412,7 @@ class HighResPainter:
         core_lo = (cores[:, :2] - boxes[:, :2]) / s  # core in view coords, (T, 2)
         core_hi = core_lo + cores[:, 2:3] / s
         width = (self.cfg.margin * cores[:, 2:3] / s).clamp(min=1e-3)  # margin in view units, (T, 1)
-
-        out_core = torch.maximum(core_lo.unsqueeze(1) - anchors, anchors - core_hi.unsqueeze(1)).clamp(min=0)
-        f_anchor = 1.0 - _smoothstep(out_core.amax(-1) / width)
-
-        r = strokes.radii.amax(-1, keepdim=True)  # (T, N, 1)
-        reach_lo = (strokes.points.amin(dim=2) - r).clamp(max=0).neg()  # beyond the view's 0 edge
-        reach_hi = (strokes.points.amax(dim=2) + r - 1.0).clamp(min=0)
-        f_reach = 1.0 - _smoothstep(torch.maximum(reach_lo, reach_hi).amax(-1) / width)
-        return f_anchor * f_reach
+        return views.edge_fade(strokes, anchors, core_lo, core_hi, width)
 
     # --- full schedule --------------------------------------------------------------------------------
     def core_sizes(self, source_side: int) -> List[float]:
@@ -499,7 +503,9 @@ class HighResPainter:
         whole_total = max(1, whole_done + cfg.whole_steps)
         for k in range(cfg.whole_steps):
             out = self.predict(target, result.layer, whole, (whole_done + k) / whole_total)
-            strokes = views.view_to_image(out.strokes, whole)
+            img = views.view_to_image(out.strokes, whole)
+            opacity = img.opacity * out.gate.unsqueeze(-1)
+            strokes = self._visible(img, opacity, opacity.amax(-1) > ACTIVE_OPACITY, 0)  # gated-off: skip
             result.layer = self.render(result.layer, strokes)
             result.strokes.append(pack_strokes(strokes).cpu())
             n_strokes += strokes.radii.shape[1]
@@ -517,19 +523,17 @@ class HighResPainter:
                     break
                 boxes = self.view_boxes(cores)
                 g = self.global_tokens(target, result.layer, cfg.tile_progress).expand(cores.shape[0], -1, -1)
-                out = self.predict(target, result.layer, boxes, cfg.tile_progress, global_tokens=g)
-                fade = self.fade(out.strokes, out.anchors, cores, boxes) if cfg.fade else None
+                out = self.predict(target, result.layer, boxes, cfg.tile_progress, global_tokens=g, cores=cores)
                 img = views.view_to_image(out.strokes, boxes)
+                factor = out.gate  # stroke gate x edge fade
+                keep = torch.ones_like(factor, dtype=torch.bool)
+                if cfg.fade:
+                    fade = self.fade(out.strokes, out.anchors, cores, boxes)
+                    factor, keep = factor * fade, fade > 0.1
+                opacity = img.opacity * factor.unsqueeze(-1)
+                keep = keep & (opacity.amax(-1) > ACTIVE_OPACITY)  # invisible strokes are not rendered at all
                 for t in range(cores.shape[0]):  # highest-error tile first
-                    keep = slice(None) if fade is None else fade[t] > 0.1
-                    tile = views.Strokes(
-                        points=img.points[t : t + 1, keep],
-                        radii=img.radii[t : t + 1, keep],
-                        opacity=(img.opacity[t : t + 1, keep] * (1.0 if fade is None else fade[t, keep, None]))
-                        .clamp(0.05, 1.0),
-                        hardness=img.hardness[t : t + 1, keep],
-                        color=img.color[t : t + 1, keep],
-                    )
+                    tile = self._visible(img, opacity, keep, t)
                     result.layer = self.render(result.layer, tile)
                     result.strokes.append(pack_strokes(tile).cpu())
                     n_strokes += tile.radii.shape[1]

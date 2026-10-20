@@ -131,3 +131,15 @@ def test_render_strokes_reproduces_and_upscales_a_painting():
     assert big.shape == (1, 3, 192, 256)
     down = torch.nn.functional.interpolate(big, size=(48, 64), mode="area")
     assert (down - same).abs().mean() < 0.03  # the same picture, just at 4x the resolution
+
+
+def test_harness_with_gated_masked_model_skips_invisible_strokes():
+    torch.manual_seed(7)
+    model = StrokePredictor(num_strokes=4, widths=(8, 16, 32, 64), token_dim=64, heads=4,
+                            paintable_mask=True, stroke_gate=True, error_progress=True).eval()
+    with torch.no_grad():  # switch half the strokes off via the gate output bias
+        model.attr_mlp[-1].bias[-1] = -10.0
+    cfg = HighResConfig(whole_steps=2, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.25)
+    painter = HighResPainter(model, size=64, view_res=16, config=cfg, autocast=None)
+    result = painter.paint(torch.rand(1, 3, 64, 64), 64, log=lambda *_: None)
+    assert result.stats[-1]["strokes"] == 0  # all gated off -> nothing rendered

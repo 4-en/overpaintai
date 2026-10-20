@@ -19,6 +19,10 @@ import torch.nn.functional as F
 from overpaintai.views import Strokes, view_grid
 
 
+GATE_LEAK = 0.02  # minimum gradient of the stroke gate w.r.t. its logit in training
+GATE_LOGIT_RANGE = 6.0  # logits beyond +-this are pulled back (sigmoid(-6) = 0.0025: off, but recoverable)
+
+
 def _groups(channels: int) -> int:
     return min(32, channels // 4)
 
@@ -94,6 +98,8 @@ class StrokeOutput:
     anchors: torch.Tensor  # (B, N, 2) curve midpoints in view coordinates
     anchor_entropy: torch.Tensor  # (B, N) entropy of each query's placement map (nats)
     placement_logits: torch.Tensor  # (B, N, R*R) pre-softmax placement maps (for heatmap supervision)
+    gate: torch.Tensor  # (B, N) in [0, 1]: how much of each stroke to paint (1 for models without a gate)
+    gate_logit: Optional[torch.Tensor] = None  # (B, N) pre-sigmoid gate (for the range penalty in training)
 
 
 class StrokePredictor(nn.Module):
@@ -107,9 +113,16 @@ class StrokePredictor(nn.Module):
         radius_range: (min, max) stroke radius in view units; predicted on a log scale so fine and
             canvas-filling strokes are equally easy to hit.
         num_tools: size of the tool logits (all engine tools; unused ones can be masked).
+        paintable_mask: expect a 13th input channel marking where the view may be painted (1) and what is
+            context only (0), see `views.view_inputs(..., paintable=...)`.
+        stroke_gate: predict a gate per stroke that scales its opacity, so a step can leave strokes out
+            (trained with a per-stroke cost).
+        error_progress: condition on a second progress value derived from the canvas error, in addition
+            to the step-based progress (see `views.error_progress`).
+        The three switches default to off so that checkpoints from before they existed load unchanged.
     """
 
-    IN_CHANNELS = 12  # see views.view_inputs
+    IN_CHANNELS = 12  # see views.view_inputs (13 with paintable_mask)
 
     def __init__(
         self,
@@ -123,20 +136,28 @@ class StrokePredictor(nn.Module):
         max_offset: float = 0.35,
         radius_range: tuple = (0.004, 0.75),
         num_tools: int = 5,
+        paintable_mask: bool = False,
+        stroke_gate: bool = False,
+        error_progress: bool = False,
     ):
         super().__init__()
         self.num_strokes = num_strokes
+        self.paintable_mask = paintable_mask
+        self.stroke_gate = stroke_gate
+        self.error_progress = error_progress
+        self.in_channels = self.IN_CHANNELS + int(paintable_mask)
         self.token_grid = token_grid
         self.max_offset = max_offset
         self.radius_range = radius_range
         w0, w1, w2, w3 = widths
         cond_dim = token_dim
 
-        # Conditioning: painting progress in [0, 1] and log2 of the view size
-        self.cond_mlp = nn.Sequential(nn.Linear(2, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
+        # Conditioning: step progress in [0, 1], log2 of the view size (and the error-based progress)
+        n_cond = 2 + int(error_progress)
+        self.cond_mlp = nn.Sequential(nn.Linear(n_cond, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
 
         # Local path: residual U-Net, three downsamples
-        self.stem = nn.Conv2d(self.IN_CHANNELS, w0, 3, padding=1)
+        self.stem = nn.Conv2d(self.in_channels, w0, 3, padding=1)
         self.enc0 = Stage(w0, w0, cond_dim)
         self.down1 = nn.Conv2d(w0, w1, 3, stride=2, padding=1)
         self.enc1 = Stage(w1, w1, cond_dim)
@@ -188,16 +209,20 @@ class StrokePredictor(nn.Module):
         self.attr_mlp = nn.Sequential(
             nn.Linear(feat_dim, 2 * token_dim), nn.SiLU(),
             nn.Linear(2 * token_dim, token_dim), nn.SiLU(),
-            nn.Linear(token_dim, 4 + 2 + 2 + 1 + 3 + num_tools),
+            nn.Linear(token_dim, 4 + 2 + 2 + 1 + 3 + num_tools + int(stroke_gate)),  # gate last (see forward)
         )
         last = self.attr_mlp[-1]
         nn.init.normal_(last.weight, std=1e-3)
         nn.init.zeros_(last.bias)
 
     # ------------------------------------------------------------------------------------------------
-    def _cond(self, progress: torch.Tensor, view_size: torch.Tensor) -> torch.Tensor:
-        c = torch.stack([progress, torch.log2(view_size.clamp(min=1e-4))], dim=-1)
-        return self.cond_mlp(c)
+    def _cond(
+        self, progress: torch.Tensor, view_size: torch.Tensor, error_progress: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        parts = [progress, torch.log2(view_size.clamp(min=1e-4))]
+        if self.error_progress:
+            parts.append(torch.zeros_like(progress) if error_progress is None else error_progress)
+        return self.cond_mlp(torch.stack(parts, dim=-1))
 
     def _token_positions(self, boxes: torch.Tensor) -> torch.Tensor:
         """Image-space centers of the token grid cells of each view, `(B, G*G, 2)`."""
@@ -218,13 +243,15 @@ class StrokePredictor(nn.Module):
         pooled = F.adaptive_avg_pool2d(h3, self.token_grid).flatten(2).transpose(1, 2)  # (B, G*G, C)
         return self.to_tokens(pooled) + self.token_pos(self._token_positions(boxes)) + self.token_type[kind]
 
-    def encode_global(self, whole_inputs: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
+    def encode_global(
+        self, whole_inputs: torch.Tensor, progress: torch.Tensor, error_progress: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Global tokens `(B, G*G, D)` from the whole-image view (inputs built with box (0, 0, 1)); share them
         with all tile views of the same image and step via `forward(..., global_tokens=...)`.
         """
         boxes = whole_inputs.new_tensor([0.0, 0.0, 1.0]).expand(whole_inputs.shape[0], 3)
-        cond = self._cond(progress, boxes[:, 2])
+        cond = self._cond(progress, boxes[:, 2], error_progress)
         return self._tokens(self._encode(whole_inputs, cond)[3], boxes, kind=0)
 
     # ------------------------------------------------------------------------------------------------
@@ -235,19 +262,21 @@ class StrokePredictor(nn.Module):
         progress: torch.Tensor,
         global_tokens: Optional[torch.Tensor] = None,
         view_size: Optional[torch.Tensor] = None,
+        error_progress: Optional[torch.Tensor] = None,
     ) -> StrokeOutput:
         """
         Args:
-            inputs: (B, 12, R, R) view inputs from `views.view_inputs` (any R; trained at a fixed R).
+            inputs: (B, 12 or 13, R, R) view inputs from `views.view_inputs` (any R; trained at a fixed R).
             boxes: (B, 3) view boxes (x, y, s) in image coordinates.
             progress: (B,) painting progress in [0, 1] (e.g. step / num_steps).
             global_tokens: (B, G*G, D) from `encode_global`; if omitted, this view's own tokens are used
                 as global context (correct for whole-image views).
             view_size: (B,) view size fed to the conditioning instead of `boxes[:, 2]`, e.g. clamped to
                 the range seen in training when painting smaller tiles (token positions still use `boxes`).
+            error_progress: (B,) error-based progress (`views.error_progress`), for `error_progress` models.
         """
         B, _, R, _ = inputs.shape
-        cond = self._cond(progress, boxes[:, 2] if view_size is None else view_size)
+        cond = self._cond(progress, boxes[:, 2] if view_size is None else view_size, error_progress)
         h0, h1, h2, h3 = self._encode(inputs, cond)
 
         view_tok = self._tokens(h3, boxes, kind=1)
@@ -300,6 +329,16 @@ class StrokePredictor(nn.Module):
         feats = torch.cat([q, sample(pixel), sample(d2), sample(m), target_color], dim=-1)
         out = self.attr_mlp(feats)
 
+        gate_logit = None
+        if self.stroke_gate:  # start with every stroke on (sigmoid(3) = 0.95)
+            gate_logit, out = out[..., -1].float() + 3.0, out[..., :-1]
+            gate = torch.sigmoid(gate_logit)
+            if self.training:
+                # Leaky gradient (forward value unchanged): a saturated, switched-off gate still gets a
+                # learning signal and can come back, instead of dying
+                gate = gate + GATE_LEAK * (gate_logit - gate_logit.detach())
+        else:
+            gate = torch.ones(out.shape[:-1], device=out.device)
         offsets, out = out[..., 0:4], out[..., 4:]
         r_raw, a_raw, h_raw, c_raw, tool_logits = out.split([2, 2, 1, 3, out.shape[-1] - 8], dim=-1)
 
@@ -324,5 +363,5 @@ class StrokePredictor(nn.Module):
         )
         return StrokeOutput(
             strokes=strokes, tool_logits=tool_logits.float(), anchors=anchors.float(),
-            anchor_entropy=entropy, placement_logits=logits,
+            anchor_entropy=entropy, placement_logits=logits, gate=gate, gate_logit=gate_logit,
         )

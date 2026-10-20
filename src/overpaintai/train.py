@@ -35,9 +35,10 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas
-from overpaintai.losses import MultiScalePaintLoss, image_gradients, psnr
+from overpaintai.losses import MultiScalePaintLoss, psnr
 from overpaintai.matching import matched_stroke_loss
-from overpaintai.model import StrokePredictor
+from overpaintai.metrics import painting_metrics
+from overpaintai.model import GATE_LOGIT_RANGE, StrokePredictor
 from overpaintai.painting import Painter
 from overpaintai.viz import save_curve, save_frame, save_progress
 
@@ -76,12 +77,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g = p.add_argument_group("model")
     g.add_argument("--model-size", choices=sorted(MODEL_PRESETS), default="small")
     g.add_argument("--strokes-per-step", type=int, default=16, help="N strokes predicted per view and step")
+    g.add_argument("--no-stroke-gate", action="store_true", help="New models: no per-stroke gate output")
+    g.add_argument("--no-paintable-mask", action="store_true", help="New models: no paintable-mask input")
+    g.add_argument("--no-error-progress", action="store_true", help="New models: no error-based progress input")
 
     g = p.add_argument_group("painting / loss")
     g.add_argument("--steps", type=int, default=6, help="K whole-image painting steps (unroll + validation)")
     g.add_argument("--tile-prob", type=float, default=0.25, help="Unroll: chance a batch adds a zoomed tile step")
-    g.add_argument("--tile-size", default="0.3,0.6", help="Unroll: tile side range (fraction of the image)")
-    g.add_argument("--val-tile-steps", type=int, default=0, help="Validation: extra 2x2-tile steps")
+    g.add_argument("--tile-size", default="0.3,0.6", help="Unroll: tile core side range (fraction of the image)")
+    g.add_argument("--tile-margin", type=float, default=0.25,
+                   help="Unroll: context margin around tile cores (fraction of the core, per side); strokes "
+                        "outside the core are faded as in the high-res harness (with a paintable-mask model)")
+    g.add_argument("--outside-penalty", type=float, default=0.0,
+                   help="Unroll: extra cost for stroke footprint reaching past the paintable core (tile steps). "
+                        "Experimental: the edge fade already pulls strokes inward, and at 0.1 the model learned "
+                        "to shrink all tile strokes to the minimum radius instead")
+    g.add_argument("--val-tile-steps", type=int, default=1,
+                   help="Validation: extra 2x2-tile steps (with context margin for paintable-mask models)")
     g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
     g.add_argument("--start-mix", default="blank:1",
                    help="Unroll: start canvases per batch, as kind:weight pairs. 'blank' = empty canvas, "
@@ -99,6 +111,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--edge-loss", action="store_true",
                    help="Add an L1 loss on image gradients (Sobel) that rewards sharp, correctly placed edges")
     g.add_argument("--edge-weight", type=float, default=1.0, help="Weight of the edge loss (with --edge-loss)")
+    g.add_argument("--flat-loss", action="store_true",
+                   help="Add a loss matching local variation (std) so flat target areas stay flat, not mottled")
+    g.add_argument("--flat-weight", type=float, default=1.0, help="Weight of the flatness loss (with --flat-loss)")
+    g.add_argument("--stroke-cost", type=float, default=0.01,
+                   help="Cost per active stroke (mean stroke gate) so steps leave out strokes they don't need")
     g.add_argument("--scales", default="4,16")
     g.add_argument("--scale-weights", default="1,1")
     g.add_argument("--teacher-tail", type=int, default=2,
@@ -205,10 +222,15 @@ class Trainer:
         if args.mode == "teacher" and args.data != "synthetic":
             raise SystemExit("--mode teacher needs ground-truth strokes, i.e. --data synthetic")
 
-        self.engine = DifferentiableCanvasEngine(canvas_size=self.S, num_stamps=args.num_stamps).to(self.device).train()
-        self.model_config = (
-            resume["model_config"] if resume else dict(num_strokes=self.N, **MODEL_PRESETS[args.model_size])
+        self.model_config = resume["model_config"] if resume else dict(
+            num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
+            paintable_mask=not args.no_paintable_mask, error_progress=not args.no_error_progress,
         )
+        # Gated strokes must be able to vanish completely: no opacity floor in the engine then
+        min_opacity = 0.0 if self.model_config.get("stroke_gate") else 0.05
+        self.engine = DifferentiableCanvasEngine(
+            canvas_size=self.S, num_stamps=args.num_stamps, min_opacity=min_opacity
+        ).to(self.device).train()
         self.model = StrokePredictor(**self.model_config).to(self.device)
         self.N = self.model.num_strokes
         self.ema = EMA(self.model, args.ema) if args.ema > 0 else None
@@ -223,7 +245,8 @@ class Trainer:
         scales = [int(s) for s in args.scales.split(",") if s]
         weights = [float(w) for w in args.scale_weights.split(",") if w]
         self.loss_fn = MultiScalePaintLoss(
-            args.detail_weight, scales, weights, edge_weight=args.edge_weight if args.edge_loss else 0.0
+            args.detail_weight, scales, weights, edge_weight=args.edge_weight if args.edge_loss else 0.0,
+            flat_weight=args.flat_weight if args.flat_loss else 0.0,
         )
 
         decay, no_decay = [], []
@@ -327,13 +350,18 @@ class Trainer:
         gt = views.from_engine_params(gt_params, self.engine)  # whole-image view: view = image coords
         match_loss, assign = matched_stroke_loss(out.strokes, gt)
 
-        params = views.to_engine_params(views.view_to_image(out.strokes, boxes), self.engine)
+        gated = views.Strokes(out.strokes.points, out.strokes.radii, out.strokes.opacity * out.gate.unsqueeze(-1),
+                              out.strokes.hardness, out.strokes.color)
+        params = views.to_engine_params(views.view_to_image(gated, boxes), self.engine)
         canvas = self.painter.composite(self.painter.render(layer, params, self.painter.tool_weights(out.tool_logits)))
         render_loss, terms = self.loss_fn(canvas, gt_canvas)
         heat_loss = self.heatmap_loss(out.placement_logits, gt, assign)
-        loss = a.match_weight * match_loss + a.render_weight * render_loss + a.heatmap_weight * heat_loss
+        gate_loss = (1.0 - out.gate).mean()  # every ground-truth stroke is real: matched strokes stay on
+        loss = (a.match_weight * match_loss + a.render_weight * render_loss + a.heatmap_weight * heat_loss
+                + 0.1 * gate_loss)
 
-        metrics = {"match": match_loss.detach(), "render": render_loss.detach(), "heatmap": heat_loss.detach()}
+        metrics = {"match": match_loss.detach(), "render": render_loss.detach(), "heatmap": heat_loss.detach(),
+                   "gate": out.gate.mean().detach()}
         if len(self.tools) > 1:  # supervise tool choice on matched pairs
             b = torch.arange(B, device=self.device).unsqueeze(1)
             logits = out.tool_logits[b, assign[0]]
@@ -396,22 +424,39 @@ class Trainer:
         window = a.steps + int(tile)
         layer, done, _ = self.start_canvas(target, window)
         total = done + window  # this batch's painting length: `done` steps are already on the canvas
-        loss, weight_sum, entropy, hardness = 0.0, 0.0, [], []
+        loss, weight_sum, entropy, hardness, gates, outside, gate_range = 0.0, 0.0, [], [], [], [], []
         with torch.no_grad():
             start_psnr = psnr(self.painter.composite(layer), target).mean()
 
         for k in range(window):
             progress = torch.full((B,), (done + k) / total, device=self.device)
-            boxes = None
-            if tile and k == window - 1:
+            boxes = cores = None
+            if tile and k == window - 1:  # one zoomed tile per image: a core plus context margin around it
                 lo, hi = _pair(a.tile_size)
-                s = lo + (hi - lo) * torch.rand(B, 1, generator=self.gen, device=self.device)
-                xy = (1.0 - s) * torch.rand(B, 2, generator=self.gen, device=self.device)
-                boxes = torch.cat([xy, s], dim=1).unsqueeze(1)  # (B, 1, 3): one tile per image
-            res = self.painter.step(target, layer, progress, boxes)
+                c = lo + (hi - lo) * torch.rand(B, 1, generator=self.gen, device=self.device)
+                xy = (1.0 - c) * torch.rand(B, 2, generator=self.gen, device=self.device)
+                cores = torch.cat([xy, c], dim=1)
+                if self.model.paintable_mask:
+                    v = (c * (1.0 + 2.0 * a.tile_margin)).clamp(max=1.0)
+                    vxy = torch.minimum((xy - 0.5 * (v - c)).clamp(min=0.0), 1.0 - v)
+                    boxes = torch.cat([vxy, v], dim=1).unsqueeze(1)
+                else:  # models without a mask input: the tile view is the core itself, as before
+                    boxes = cores.unsqueeze(1)
+                    cores = None
+            res = self.painter.step(target, layer, progress, boxes,
+                                    None if cores is None else cores.unsqueeze(1), margin=a.tile_margin)
             layer = res.layer
             entropy.append(res.output.anchor_entropy.mean().detach())
             hardness.append(res.output.strokes.hardness.mean().detach())
+            gates.append(res.gate.mean())
+            if res.output.gate_logit is not None:  # keep gate logits in range so off-gates can come back
+                over = (res.output.gate_logit.abs() - GATE_LOGIT_RANGE).clamp(min=0.0)
+                gate_range.append((over * over).mean())
+            if res.reach is not None:  # footprint past the core, in margin widths
+                width = a.tile_margin * cores[:, 2:3] / boxes[:, 0, 2:3]
+                # Not weighted by the gate: switching strokes off must not be a way around it (that made
+                # tile steps collapse to all-off); only keeping strokes inside the core avoids it
+                outside.append((res.reach / width.clamp(min=1e-3)).clamp(max=2.0).mean())
 
             last = k == window - 1
             w = 1.0 if last else a.intermediate_weight
@@ -419,7 +464,8 @@ class Trainer:
                 canvas = self.painter.composite(layer)
                 step_loss, terms = self.loss_fn(canvas, target)
                 if boxes is not None:  # emphasize the zoomed region the tile step painted
-                    tile_loss, _ = self.loss_fn(canvas, target, box_mask(boxes[:, 0], S))
+                    region = boxes[:, 0] if cores is None else cores
+                    tile_loss, _ = self.loss_fn(canvas, target, box_mask(region, S))
                     step_loss = 0.5 * (step_loss + tile_loss)
                 loss = loss + w * step_loss
                 weight_sum += w
@@ -427,10 +473,20 @@ class Trainer:
                 layer = layer.detach()
 
         loss = loss / weight_sum
+        mean_gate = torch.stack(gates).mean()
+        if self.model.stroke_gate and a.stroke_cost > 0:
+            loss = loss + a.stroke_cost * mean_gate
+        if outside and a.outside_penalty > 0:
+            loss = loss + a.outside_penalty * torch.stack(outside).mean()
+        if gate_range:
+            loss = loss + 0.01 * torch.stack(gate_range).mean()
         with torch.no_grad():
             final = self.painter.composite(layer)
             metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean(),
-                       "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr}
+                       "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr,
+                       "gate": mean_gate.detach()}
+            if outside:
+                metrics["outside"] = torch.stack(outside).mean().detach()
             metrics["gain"] = metrics["psnr"] - start_psnr  # improvement of this window over its start
             metrics.update({k: torch.tensor(v) for k, v in terms.items()})
         return {"loss": loss, **metrics}
@@ -458,18 +514,29 @@ class Trainer:
         a = self.args
         model = self.eval_painter.model
         model.eval()
-        per_step, losses, finals, edge_err = [], [], [], []
+        per_step, losses, finals, quality = [], [], [], []
         for chunk in self.val_targets.split(16):
-            layers = self.eval_painter.paint(chunk, a.steps, tile_steps=a.val_tile_steps)
+            layers, steps = self.eval_painter.paint(chunk, a.steps, tile_steps=a.val_tile_steps, return_steps=True)
             canvases = [self.eval_painter.composite(lay) for lay in layers]
             per_step.append(torch.stack([psnr(c, chunk) for c in canvases]))  # (steps, b)
             losses.append(self.loss_fn(canvases[-1], chunk)[0] * chunk.shape[0])
-            edge_err.append((image_gradients(canvases[-1]) - image_gradients(chunk)).abs().mean() * chunk.shape[0])
             finals.append(canvases[-1])
+            strokes = views.from_engine_params(torch.cat([r.params for r in steps], dim=1), self.engine)
+            b, _, h, w = chunk.shape
+            blank = self.eval_painter.composite(self.engine.create_blank_paint_layer(b, h, w, self.device))
+            q = painting_metrics(canvases[-1], chunk, blank, strokes.opacity.mean(-1),
+                                 strokes.radii.mean(-1) * (chunk.shape[-1] - 1))
+            tile_steps = steps[a.steps:]
+            if tile_steps:  # catches tile views that stop painting (e.g. collapsed stroke gates)
+                q["tile_gate"] = torch.stack([r.gate.mean() for r in tile_steps]).mean().item()
+            quality.append({k: v * chunk.shape[0] for k, v in q.items()})
         per_step = torch.cat(per_step, dim=1).mean(dim=1)
         n = self.val_targets.shape[0]
-        metrics = {"val_psnr": per_step[-1].item(), "val_loss": (sum(losses) / n).item(),
-                   "val_edge_err": (sum(edge_err) / n).item()}  # sharpness check, logged even without --edge-loss
+        metrics = {"val_psnr": per_step[-1].item(), "val_loss": (sum(losses) / n).item()}
+        # Quality / efficiency measures (always logged, whatever the losses): sharpness, line art, strokes
+        for key in quality[0]:
+            if key != "psnr":
+                metrics[f"val_{key}"] = sum(q[key] for q in quality) / n
         metrics.update({f"val_psnr_step{k + 1}": v.item() for k, v in enumerate(per_step)})
         save_frame(
             self.out / "samples" / f"epoch_{self.epoch:03d}.png", self.val_targets[:4], torch.cat(finals)[:4],
@@ -532,7 +599,21 @@ class Trainer:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         state = ckpt.get("ema") or ckpt["model"]  # EMA weights are the better starting point
         own = self.model.state_dict()
-        compatible = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+        compatible, grown = {}, []
+        for k, v in state.items():
+            if k not in own:
+                continue
+            if own[k].shape == v.shape:
+                compatible[k] = v
+            elif own[k].dim() == v.dim() and all(n >= o for n, o in zip(own[k].shape, v.shape)):
+                # Layer got bigger (new input channel / conditioning value / gate output): old weights in
+                # place, new parts zero, so the model starts out behaving exactly like the old one
+                t = torch.zeros_like(own[k])
+                t[tuple(slice(0, o) for o in v.shape)] = v
+                compatible[k] = t
+                grown.append(k)
+        if grown:
+            print(f"grown layers (old weights copied, new parts zero): {', '.join(grown)}")
         skipped = sorted(set(own) - set(compatible))
         self.model.load_state_dict(compatible, strict=False)
         if self.ema:

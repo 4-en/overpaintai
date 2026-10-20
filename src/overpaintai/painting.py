@@ -4,7 +4,7 @@ render them onto the full-resolution paint layer. Shared by training, validation
 """
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,8 @@ class StepResult:
     output: StrokeOutput  # raw model output (view coordinates), batch = B * views per image
     params: torch.Tensor  # (B, N_total, 14) engine params that were rendered
     tool_weights: torch.Tensor  # (B, N_total, 5)
+    gate: torch.Tensor  # (B * views, N) stroke gates (ones for models without a gate)
+    reach: Optional[torch.Tensor] = None  # (B * views, N) footprint past the paintable core (view units)
 
 
 class Painter:
@@ -86,14 +88,24 @@ class Painter:
             return F.gumbel_softmax(masked, tau=self.gumbel_tau, hard=True, dim=-1)
         return F.one_hot(masked.argmax(-1), n_tools).to(logits.dtype)
 
-    def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
-        B = target.shape[0]
+    def inputs(self, target: torch.Tensor, layer: torch.Tensor, boxes: torch.Tensor,
+               paintable: Optional[torch.Tensor] = None):
+        """View inputs for the model (with the paintable mask if it uses one) and the error progress."""
         if not self.grad_through_inputs:
             layer = layer.detach()
-        boxes = views.whole_image_boxes(B, target.device)
-        x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.view_res)
+        R = self.view_res
+        if self.model.paintable_mask and paintable is None:
+            paintable = torch.ones(boxes.shape[0], 1, R, R, device=target.device)
+        if not self.model.paintable_mask:
+            paintable = None
+        x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, R, paintable)
+        e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.error_progress else None
+        return x, e
+
+    def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
+        x, e = self.inputs(target, layer, views.whole_image_boxes(target.shape[0], target.device))
         with self._autocast(target.device):
-            return self.model.encode_global(x, progress)
+            return self.model.encode_global(x, progress, e)
 
     def predict(
         self,
@@ -102,13 +114,12 @@ class Painter:
         boxes: torch.Tensor,
         progress: torch.Tensor,
         global_tokens: Optional[torch.Tensor] = None,
+        paintable: Optional[torch.Tensor] = None,
     ) -> StrokeOutput:
         """Model output for one view per image (`boxes` (B, 3))."""
-        if not self.grad_through_inputs:
-            layer = layer.detach()
-        x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.view_res)
+        x, e = self.inputs(target, layer, boxes, paintable)
         with self._autocast(target.device):
-            return self.model(x, boxes, progress, global_tokens=global_tokens)
+            return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e)
 
     def render(self, layer: torch.Tensor, params: torch.Tensor, tool_w: torch.Tensor) -> torch.Tensor:
         return self.engine(layer, params, tool_w, checkpoint_strokes=self.checkpoint_strokes)
@@ -119,33 +130,53 @@ class Painter:
         layer: torch.Tensor,
         progress: torch.Tensor,
         boxes: Optional[torch.Tensor] = None,
+        cores: Optional[torch.Tensor] = None,
+        margin: float = 0.25,
     ) -> StepResult:
         """
         One painting step. `boxes` is (B, 3) for one view per image (default: whole image), or (B, T, 3)
         for T tile views per image; tiles get the global tokens of the whole image and their strokes are
         rendered in tile order onto the same canvas.
+
+        `cores` (same shape as `boxes`) restricts painting to a core inside each view, with the rest as
+        context: the model gets it as its paintable mask, and strokes anchored outside the core or reaching
+        past the view are faded over `margin` x core size, exactly as in the high-res harness.
+        Rendered opacity = predicted opacity x stroke gate (x fade).
         """
         B = target.shape[0]
         if boxes is None:
             boxes = views.whole_image_boxes(B, target.device)
-        if boxes.dim() == 2:
-            out = self.predict(target, layer, boxes, progress)
-            flat_boxes, T = boxes, 1
+        T = 1 if boxes.dim() == 2 else boxes.shape[1]
+        flat_boxes = boxes.reshape(B * T, 3)
+        flat_cores = None if cores is None else cores.reshape(B * T, 3)
+        paintable = None if flat_cores is None else views.core_mask(flat_boxes, flat_cores, self.view_res)
+        if T == 1:
+            out = self.predict(target, layer, flat_boxes, progress, paintable=paintable)
         else:
-            T = boxes.shape[1]
             g = self.global_tokens(target, layer, progress).repeat_interleave(T, dim=0)
-            flat_boxes = boxes.reshape(B * T, 3)
             out = self.predict(
                 target.repeat_interleave(T, 0), layer.repeat_interleave(T, 0), flat_boxes,
-                progress.repeat_interleave(T, 0), global_tokens=g,
+                progress.repeat_interleave(T, 0), global_tokens=g, paintable=paintable,
             )
-        strokes = views.view_to_image(out.strokes, flat_boxes)
+        opacity = out.strokes.opacity * out.gate.unsqueeze(-1)
+        reach = None
+        if flat_cores is not None:
+            s = flat_boxes[:, 2:3]
+            core_lo = (flat_cores[:, :2] - flat_boxes[:, :2]) / s
+            core_hi = core_lo + flat_cores[:, 2:3] / s
+            width = (margin * flat_cores[:, 2:3] / s).clamp(min=1e-3)
+            opacity = opacity * views.edge_fade(out.strokes, out.anchors, core_lo, core_hi, width).unsqueeze(-1)
+            reach = views.outside_reach(out.strokes, core_lo, core_hi)
+        view_strokes = views.Strokes(out.strokes.points, out.strokes.radii, opacity, out.strokes.hardness,
+                                     out.strokes.color)
+        strokes = views.view_to_image(view_strokes, flat_boxes)
         params = views.to_engine_params(strokes, self.engine)
         tool_w = self.tool_weights(out.tool_logits)
         N = params.shape[1]
         params = params.reshape(B, T * N, -1)
         tool_w = tool_w.reshape(B, T * N, -1)
-        return StepResult(layer=self.render(layer, params, tool_w), output=out, params=params, tool_weights=tool_w)
+        return StepResult(layer=self.render(layer, params, tool_w), output=out, params=params, tool_weights=tool_w,
+                          gate=out.gate, reach=reach)
 
     @torch.no_grad()
     def paint(
@@ -155,19 +186,30 @@ class Painter:
         tile_steps: int = 0,
         tiles_per_side: int = 2,
         layer: Optional[torch.Tensor] = None,
-    ) -> List[torch.Tensor]:
+        return_steps: bool = False,
+        margin: float = 0.25,
+    ):
         """
         Inference: `num_steps` whole-image steps, then `tile_steps` steps on a grid of tiles. Returns the
-        paint layer after every step (the last one is the result).
+        paint layer after every step (the last one is the result), and with `return_steps` also the
+        `StepResult` of every step.
         """
         B, _, S, _ = target.shape
         layer = self.engine.create_blank_paint_layer(B, S, S, target.device) if layer is None else layer
         total = num_steps + tile_steps
-        tiles = views.tile_boxes(tiles_per_side, device=target.device).unsqueeze(0).expand(B, -1, -1)
-        layers = []
+        if self.model.paintable_mask:  # tiles as in the high-res harness: grid cores plus context margin
+            cores = views.tile_boxes(tiles_per_side, overlap=0.0, device=target.device)
+            tiles = views.expand_cores(cores, margin).unsqueeze(0).expand(B, -1, -1)
+            cores = cores.unsqueeze(0).expand(B, -1, -1)
+        else:
+            tiles = views.tile_boxes(tiles_per_side, device=target.device).unsqueeze(0).expand(B, -1, -1)
+            cores = None
+        layers, results = [], []
         for k in range(total):
             progress = torch.full((B,), k / total, device=target.device)
-            boxes = None if k < num_steps else tiles
-            layer = self.step(target, layer, progress, boxes).layer
+            tile = k >= num_steps
+            res = self.step(target, layer, progress, tiles if tile else None, cores if tile else None, margin)
+            layer = res.layer
             layers.append(layer)
-        return layers
+            results.append(res)
+        return (layers, results) if return_steps else layers

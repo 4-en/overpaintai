@@ -172,6 +172,7 @@ class DifferentiableCanvasEngine(nn.Module):
         smudge_max_dabs: int = 128,
         compile_smudge: bool = True,
         compile_masks: bool = True,
+        min_opacity: float = 0.05,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
     ):
@@ -187,6 +188,9 @@ class DifferentiableCanvasEngine(nn.Module):
         self.smudge_max_dabs = smudge_max_dabs
         self.compile_smudge = compile_smudge
         self.compile_masks = compile_masks
+        # Opacity param p maps to min_opacity + (1 - min_opacity) * p; the 0.05 floor keeps gradients alive
+        # for strokes that would otherwise vanish, 0 lets gated-off strokes disappear completely
+        self.min_opacity = min_opacity
         self.bg_texture_strength = bg_texture_strength
 
         self.register_buffer("bg_color", torch.tensor(bg_color, dtype=torch.float32).view(1, 3, 1, 1))
@@ -563,8 +567,8 @@ class DifferentiableCanvasEngine(nn.Module):
         r0 = self.min_radius + p[:, 6] * (self.max_radius - self.min_radius)
         r2 = self.min_radius + p[:, 7] * (self.max_radius - self.min_radius)
 
-        a0 = 0.05 + 0.95 * p[:, 8]
-        a2 = 0.05 + 0.95 * p[:, 9]
+        a0 = self.min_opacity + (1.0 - self.min_opacity) * p[:, 8]
+        a2 = self.min_opacity + (1.0 - self.min_opacity) * p[:, 9]
 
         hardness = p[:, 10]  # Continuous edge hardness in [0, 1] across all tools
         stroke_rgb = stroke_params[:, 11:14].view(B, 3, 1, 1)

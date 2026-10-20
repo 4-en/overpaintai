@@ -131,3 +131,27 @@ def test_training_modes_checkpoints_and_resume(tmp_path, image_folder):
 
     with pytest.raises(SystemExit):
         main(TINY + ["--mode", "teacher", "--data", str(image_folder), "--out", str(tmp_path / "bad")])
+
+
+def test_new_losses_tile_cores_and_quality_metrics(tmp_path):
+    out = tmp_path / "features"
+    main(TINY + ["--mode", "unroll", "--tile-prob", "1", "--flat-loss", "--edge-loss", "--stroke-cost", "0.05",
+                 "--outside-penalty", "0.2", "--epochs", "1", "--out", str(out)])
+    hist = torch.load(out / "last.pt", weights_only=False)["history"][-1]
+    for key in ("train_flat", "train_edge", "train_gate", "train_outside", "val_sharpness", "val_strokes",
+                "val_faint_share", "val_gain_per_100", "val_lineart_edge_err", "val_tile_gate"):
+        assert key in hist, key
+    cfg = torch.load(out / "last.pt", weights_only=False)["model_config"]
+    assert cfg["stroke_gate"] and cfg["paintable_mask"] and cfg["error_progress"]
+
+
+def test_painting_metrics_sanity():
+    from overpaintai.metrics import painting_metrics
+
+    t = torch.rand(2, 3, 32, 32)
+    blank = torch.ones_like(t)
+    m = painting_metrics(t.clone(), t, blank, torch.tensor([[0.5, 0.01, 0.1], [0.9, 0.9, 0.9]]),
+                         torch.tensor([[3.0, 3.0, 0.5], [4.0, 4.0, 4.0]]))
+    assert m["psnr"] > 90 and abs(m["sharpness"] - 1) < 1e-4 and m["edge_err"] < 1e-6
+    assert m["strokes"] == 2.5  # (2 active + 3 active) / 2: the 0.01-opacity stroke does not count
+    assert abs(m["faint_share"] - 0.25) < 1e-6  # image 1: 1 of 2 active strokes is faint (thin); image 2: none
