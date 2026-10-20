@@ -64,7 +64,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--num-workers", type=int, default=4, help="Folder: DataLoader workers")
 
     g = p.add_argument_group("augmentation (folder data)")
-    g.add_argument("--crop-scale", default="0.1,1.0",
+    g.add_argument("--crop-scale", default="0.01,1.0",
                    help="Random square crop range as area fractions (0.01 = 10%% of the side); the side is "
                         "sampled log-uniformly, so all zoom levels are equally likely")
     g.add_argument("--hflip", type=float, default=0.5)
