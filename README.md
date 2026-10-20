@@ -105,9 +105,17 @@ Once the base model and unrolled training loop are validated, the following exte
 - **Dynamic Brush Bank & Learnable Brush Embeddings**: Providing the model with a library of specialized digital art brushes (e.g., rake/bristle brushes, palette knives, stipple/sponge stamps, foliage/cloud blockers) conditioned via learnable **brush embeddings**, allowing the predictor to dynamically select and modulate custom brush tips per stroke.
 - **Wet-on-Wet Impasto Mixing**: Simultaneous pigment deposition and tangent advection within a single stroke to simulate loaded bristle brushes mixing directly with wet canvas paint.
 
-## Planned: High-Resolution Inference Harness
+## High-Resolution Inference Harness
 
-Inference-only scheduling for large canvases (e.g. 2048×2048). The model only ever sees a view box `(x, y, s)` resampled to its working resolution, so how boxes are chosen is free; none of this requires retraining.
+Inference-only scheduling for large canvases (e.g. 2048×2048), implemented in `overpaintai/highres.py`. The model only ever sees a view box `(x, y, s)` resampled to its working resolution, so how boxes are chosen is free; none of this requires retraining.
+
+```bash
+overpaint-paint --checkpoint runs/unroll/best.pt --image picture.png --size 2048
+overpaint-paint ... --min-tile 0.0625            # tile finer than the source's own detail
+overpaint-paint ... --importance face_mask.png  # spend more tiles where the mask is bright
+```
+
+Writes `final.png`, `target.png`, `progress.png` (target + canvas after each stage), `stats.json` (strokes / PSNR / time per stage) and `strokes.pt` (all strokes in image coordinates, re-renderable at any size) to `runs/paint/<image>_<size>/`. Tiling stops by default once a view would hold fewer source pixels than the model's working resolution. Implemented so far: whole-image steps, tile levels with error-guided selection and NMS, importance masks, context margins with soft fading at tile edges, and crop rendering (each stroke is drawn only into a square crop around its footprint). Non-square images are padded (edge-replicated, excluded from selection and PSNR) and cropped back; transparent images are composited onto white.
 
 - **Coarse-to-fine schedule**: whole-image views first (blocking in), then tiles of decreasing size until one view pixel ≈ one target pixel. Every tile gets the global tokens of the whole image, so it knows the overall composition.
 - **Error-guided tile selection**: instead of a fixed grid, blur the error map `|target − canvas|` at the current tile scale, pick the windows with the highest summed error, suppress heavily overlapping candidates (non-maximum suppression), paint them as one batch, re-measure, repeat. Regions that are already good get no more strokes; difficult regions get several passes.
@@ -121,6 +129,7 @@ A tile's strokes must not reach (far) past what the model can see: outside the v
 - **Train with the same rule**: apply the margin and fade to tile steps during training, so the model learns to keep its strokes inside the safe area instead of having them suppressed only at inference.
 - **Overlapping tiles**: neighbouring tiles overlap, so seam regions are painted from both sides; tiles that overlap heavily go into different rounds, so they don't paint the same spot from the same stale canvas.
 
-### Requirements before this is practical
-- **Smaller tiles in training**: unroll currently trains tile views at 0.3–0.6 of the image (`--tile-size`); 2048 px inference needs tiles down to ~1/16, and the model's view-scale input should not leave its trained range.
-- **Bounding-box rendering**: the engine renders every stroke over the full canvas; with many small tiles on a 2048 canvas, strokes must be rendered only inside their own bounding box.
+### Still open
+- **Smaller tiles in training**: unroll trains tile views at 0.3–0.6 of the image (`--tile-size`), while 2048 px inference uses tiles down to ~1/16. The harness clamps the view size fed to the model to the trained range (the content still comes from the true, smaller box); training on smaller tiles would remove that mismatch.
+- **Edge rule in training**: the margin + fade rule is only applied at inference so far.
+- **Adaptive stopping per region** and automatic importance maps (face / subject detection) are not implemented yet; masks can be passed with `--importance`.

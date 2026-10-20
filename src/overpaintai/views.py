@@ -88,16 +88,21 @@ def resample_views(image: torch.Tensor, boxes: torch.Tensor, R: int) -> torch.Te
     When the view is smaller than its box (downsampling), the image is Gaussian-prefiltered with
     sigma = 0.5 * (image pixels per view pixel) before bilinear sampling. That avoids aliasing and makes
     the view content (nearly) independent of the source resolution. Items are grouped by box size so
-    each group is blurred once.
+    each group is blurred once. A single image `(1, C, H, W)` can be shared by any number of boxes; it is
+    then blurred once per box size and never copied per view.
     """
-    B, C, H, W = image.shape
+    B, C, H, W = boxes.shape[0], *image.shape[1:]
+    shared = image.shape[0] == 1 and B > 1
     out = image.new_empty((B, C, R, R))
     grid = view_grid(boxes, R) * 2.0 - 1.0  # grid_sample coordinates (align_corners=True)
     sizes = boxes[:, 2]
     for s in torch.unique(sizes):
         idx = torch.nonzero(sizes == s).flatten()
         step = float(s) * (max(H, W) - 1) / max(R - 1, 1)  # image pixels per view pixel
-        src = _gaussian_blur(image[idx], 0.5 * step) if step > 1.0 else image[idx]
+        src = image if shared else image[idx]
+        src = _gaussian_blur(src, 0.5 * step) if step > 1.0 else src
+        if shared:
+            src = src.expand(idx.numel(), -1, -1, -1)
         out[idx] = F.grid_sample(src, grid[idx], mode="bilinear", padding_mode="border", align_corners=True)
     return out
 
@@ -112,6 +117,7 @@ def view_inputs(
     """
     Network input for each view, `(B, 12, R, R)`: target RGB, canvas RGB, signed error (target - canvas),
     paint-layer alpha, and the image-space (x, y) coordinates of each view pixel (mapped to [-1, 1]).
+    Images may have batch 1 and be shared by all B boxes (e.g. many tiles of one image).
     """
     tgt = resample_views(target, boxes, R)
     cvs = resample_views(canvas_rgb, boxes, R)

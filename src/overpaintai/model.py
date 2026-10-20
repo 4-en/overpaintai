@@ -234,6 +234,7 @@ class StrokePredictor(nn.Module):
         boxes: torch.Tensor,
         progress: torch.Tensor,
         global_tokens: Optional[torch.Tensor] = None,
+        view_size: Optional[torch.Tensor] = None,
     ) -> StrokeOutput:
         """
         Args:
@@ -242,9 +243,11 @@ class StrokePredictor(nn.Module):
             progress: (B,) painting progress in [0, 1] (e.g. step / num_steps).
             global_tokens: (B, G*G, D) from `encode_global`; if omitted, this view's own tokens are used
                 as global context (correct for whole-image views).
+            view_size: (B,) view size fed to the conditioning instead of `boxes[:, 2]`, e.g. clamped to
+                the range seen in training when painting smaller tiles (token positions still use `boxes`).
         """
         B, _, R, _ = inputs.shape
-        cond = self._cond(progress, boxes[:, 2])
+        cond = self._cond(progress, boxes[:, 2] if view_size is None else view_size)
         h0, h1, h2, h3 = self._encode(inputs, cond)
 
         view_tok = self._tokens(h3, boxes, kind=1)

@@ -41,6 +41,7 @@ overpaint-test = "overpaintai.scripts.test_engine:main"
 overpaint-gui = "overpaintai.scripts.gui:main"
 overpaint-fit = "overpaintai.scripts.fit_strokes:main"
 overpaint-train = "overpaintai.train:main"
+overpaint-paint = "overpaintai.scripts.paint:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
