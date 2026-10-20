@@ -34,6 +34,12 @@ dev = [
 "pytest>=7.0.0",
 "ruff",
 "black",
+"httpx",
+]
+web = [
+"fastapi",
+"uvicorn",
+"python-multipart",
 ]
 
 [project.scripts]
@@ -42,9 +48,13 @@ overpaint-gui = "overpaintai.scripts.gui:main"
 overpaint-fit = "overpaintai.scripts.fit_strokes:main"
 overpaint-train = "overpaintai.train:main"
 overpaint-paint = "overpaintai.scripts.paint:main"
+overpaint-web = "overpaintai.web.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"overpaintai.web" = ["static/*"]
 
 [tool.ruff]
 line-length = 100

@@ -9,12 +9,11 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
-from overpaintai.highres import HighResConfig, HighResPainter, load_checkpoint_model
+from overpaintai.highres import HighResPainter, config_from_checkpoint, load_checkpoint_model, load_padded
 from overpaintai.viz import to_uint8
 
 
@@ -41,31 +40,6 @@ def parse_args():
     return p.parse_args()
 
 
-def load_padded(path: str, size: int, device, mode: str = "RGB"):
-    """
-    Loads an image with its longer side resized to `size` and pads it to a square (edge-replicated, so the
-    model sees plausible content there). Transparent images are composited onto white.
-    Returns (image (1, C, S, S), valid mask (1, 1, S, S), (w, h) of the content, longer source side).
-    """
-    img = Image.open(path)
-    if mode == "RGB" and img.mode in ("RGBA", "LA", "P"):
-        img = img.convert("RGBA")
-        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
-        img = Image.alpha_composite(white, img)
-    img = img.convert(mode)
-    src_side = max(img.size)
-    scale = size / src_side
-    w, h = max(1, round(img.width * scale)), max(1, round(img.height * scale))
-    img = img.resize((w, h), Image.LANCZOS if scale < 1 else Image.BICUBIC)
-    x = torch.from_numpy(np.asarray(img, dtype="float32") / 255.0)
-    x = x.view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
-    pad = (0, size - w, 0, size - h)
-    x = F.pad(x, pad, mode="replicate")
-    valid = torch.zeros(1, 1, size, size)
-    valid[..., :h, :w] = 1.0
-    return x.to(device), valid.to(device), (w, h), src_side
-
-
 def save_progress(path: Path, snapshots, target, wh, tile: int = 384):
     w, h = wh
     frames = [("target", target)] + list(snapshots)
@@ -83,24 +57,18 @@ def main():
     args = parse_args()
     device = torch.device(args.device)
     model, ckpt = load_checkpoint_model(args.checkpoint, device)
-    train_args = ckpt.get("args", {})
-    steps = train_args.get("steps", 6)
-    tile_lo = float(str(train_args.get("tile_size", "0.3,0.6")).split(",")[0])
-
-    cfg = HighResConfig(
-        whole_steps=args.whole_steps or steps,
-        tile_progress=steps / (steps + 1),
+    cfg, view_res, tool = config_from_checkpoint(
+        ckpt,
+        whole_steps=args.whole_steps,
         rounds_per_level=0 if args.no_tiles else args.rounds,
         max_tiles=args.max_tiles,
         margin=args.margin,
         error_threshold=args.threshold,
         min_core=args.min_tile,
-        scale_clamp=(tile_lo, 1.0),
         fade=not args.no_fade,
         importance_gain=args.importance_gain,
     )
-    tool = (ckpt.get("tools") or [0])[0]
-    painter = HighResPainter(model, args.size, ckpt.get("view_res", 128), tool, args.num_stamps, cfg, device=device)
+    painter = HighResPainter(model, args.size, view_res, tool, args.num_stamps, cfg, device=device)
 
     target, valid, wh, src_side = load_padded(args.image, args.size, device)
     importance = None

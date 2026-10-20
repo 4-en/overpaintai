@@ -114,6 +114,12 @@ def test_training_modes_checkpoints_and_resume(tmp_path, image_folder):
     assert ckpt["epoch"] == 1 and ckpt["global_step"] == 6 and len(ckpt["history"]) == 2
     assert "val_psnr" in ckpt["history"][-1]
 
+    mixed = tmp_path / "mixed"
+    main(TINY + ["--mode", "unroll", "--start-mix", "blank:1,warmup:1,degraded:1", "--rollout-max", "2",
+                 "--epochs", "1", "--steps-per-epoch", "6", "--out", str(mixed)])
+    hist = torch.load(mixed / "last.pt", weights_only=False)["history"][-1]
+    assert "train_start_psnr" in hist and "train_gain" in hist
+
     folder = tmp_path / "folder"
     preview = next(image_folder.rglob("*.png"))
     main(TINY + ["--mode", "unroll", "--data", str(image_folder), "--val-fraction", "0.3", "--epochs", "1",

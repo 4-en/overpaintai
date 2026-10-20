@@ -34,6 +34,7 @@ from tqdm import tqdm
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
+from overpaintai.degrade import degraded_canvas
 from overpaintai.losses import MultiScalePaintLoss, image_gradients, psnr
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.model import StrokePredictor
@@ -82,6 +83,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--tile-size", default="0.3,0.6", help="Unroll: tile side range (fraction of the image)")
     g.add_argument("--val-tile-steps", type=int, default=0, help="Validation: extra 2x2-tile steps")
     g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
+    g.add_argument("--start-mix", default="blank:1",
+                   help="Unroll: start canvases per batch, as kind:weight pairs. 'blank' = empty canvas, "
+                        "'warmup' = the model first paints 1..--rollout-max steps without gradients, "
+                        "'degraded' = the target with synthetic painting mistakes (see degrade.py). "
+                        "E.g. blank:0.4,warmup:0.3,degraded:0.3")
+    g.add_argument("--rollout-max", type=int, default=12,
+                   help="Unroll: max warm-up steps (and steps a degraded start counts as already painted)")
+    g.add_argument("--degrade-strength", type=float, default=1.0, help="Unroll: how much degraded starts deviate")
     g.add_argument("--detach-canvas", action="store_true", help="Unroll: no gradient through earlier steps")
     g.add_argument("--grad-through-inputs", action="store_true",
                    help="Unroll: also backprop through the canvas the model looks at (unstable: explodes "
@@ -226,6 +235,14 @@ class Trainer:
         )
 
         self._setup_data()
+        self.start_kinds, weights = [], []
+        for part in args.start_mix.split(","):
+            kind, _, w = part.partition(":")
+            if kind.strip() not in ("blank", "warmup", "degraded"):
+                raise SystemExit(f"--start-mix: unknown start kind {kind!r}")
+            self.start_kinds.append(kind.strip())
+            weights.append(float(w or 1.0))
+        self.start_weights = torch.tensor(weights, device=self.device)
         self.preview_targets = None
         if args.preview_image:
             self.preview_targets = torch.cat([load_image(p, self.S, self.device) for p in args.preview_image])
@@ -349,19 +366,44 @@ class Trainer:
         log_p = logits[b, assign[0]].log_softmax(dim=-1)
         return -(t * log_p).sum(-1).mean()
 
+    @torch.no_grad()
+    def start_canvas(self, target: torch.Tensor, window: int):
+        """
+        Start paint layer for an unroll batch, per --start-mix: returns (layer, steps already "done", kind).
+        Progress then runs from done / (done + window), so warm-up and degraded starts train later phases
+        of a painting while keeping progress = fraction of the painting completed (as at inference).
+        """
+        a = self.args
+        B, S = target.shape[0], target.shape[-1]
+        blank = self.engine.create_blank_paint_layer(B, S, S, self.device)
+        kind = self.start_kinds[int(torch.multinomial(self.start_weights, 1, generator=self.gen).item())]
+        if kind == "blank" or a.rollout_max < 1:
+            return blank, 0, kind
+        done = int(torch.randint(1, a.rollout_max + 1, (1,), generator=self.gen, device=self.device).item())
+        if kind == "degraded":
+            return degraded_canvas(target, self.engine, self.gen, strength=a.degrade_strength), done, kind
+        layer = blank  # warmup: the current model paints `done` steps on its own
+        for i in range(done):
+            progress = torch.full((B,), i / (done + window), device=self.device)
+            layer = self.painter.step(target, layer, progress).layer
+        return layer, done, kind
+
     def unroll_batch(self) -> Dict[str, torch.Tensor]:
         a = self.args
         target = self.next_targets()
         B, S = target.shape[0], target.shape[-1]
         tile = torch.rand((), generator=self.gen, device=self.device).item() < a.tile_prob
-        total = a.steps + int(tile)
-        layer = self.engine.create_blank_paint_layer(B, S, S, self.device)
+        window = a.steps + int(tile)
+        layer, done, _ = self.start_canvas(target, window)
+        total = done + window  # this batch's painting length: `done` steps are already on the canvas
         loss, weight_sum, entropy, hardness = 0.0, 0.0, [], []
+        with torch.no_grad():
+            start_psnr = psnr(self.painter.composite(layer), target).mean()
 
-        for k in range(total):
-            progress = torch.full((B,), k / total, device=self.device)
+        for k in range(window):
+            progress = torch.full((B,), (done + k) / total, device=self.device)
             boxes = None
-            if tile and k == total - 1:
+            if tile and k == window - 1:
                 lo, hi = _pair(a.tile_size)
                 s = lo + (hi - lo) * torch.rand(B, 1, generator=self.gen, device=self.device)
                 xy = (1.0 - s) * torch.rand(B, 2, generator=self.gen, device=self.device)
@@ -371,7 +413,7 @@ class Trainer:
             entropy.append(res.output.anchor_entropy.mean().detach())
             hardness.append(res.output.strokes.hardness.mean().detach())
 
-            last = k == total - 1
+            last = k == window - 1
             w = 1.0 if last else a.intermediate_weight
             if w > 0:
                 canvas = self.painter.composite(layer)
@@ -388,7 +430,8 @@ class Trainer:
         with torch.no_grad():
             final = self.painter.composite(layer)
             metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean(),
-                       "hardness": torch.stack(hardness).mean()}
+                       "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr}
+            metrics["gain"] = metrics["psnr"] - start_psnr  # improvement of this window over its start
             metrics.update({k: torch.tensor(v) for k, v in terms.items()})
         return {"loss": loss, **metrics}
 

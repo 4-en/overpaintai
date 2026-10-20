@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Overpaint AI</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">Overpaint <span>AI</span></div>
+  <div id="device" class="muted"></div>
+</header>
+
+<main>
+  <aside class="panel settings">
+    <h2>Model</h2>
+    <label>Checkpoint
+      <select id="checkpoint"></select>
+    </label>
+    <p id="ckpt-info" class="hint"></p>
+
+    <h2>Output</h2>
+    <label>Resolution (longer side)
+      <div class="row">
+        <select id="size-preset">
+          <option value="512">512</option>
+          <option value="1024" selected>1024</option>
+          <option value="2048">2048</option>
+          <option value="3072">3072</option>
+          <option value="4096">4096</option>
+          <option value="custom">custom</option>
+        </select>
+        <input id="size-custom" type="number" min="128" max="4096" step="64" value="1024" hidden>
+      </div>
+    </label>
+
+    <h2>Whole-image steps</h2>
+    <label>Steps <span class="hint" id="steps-hint"></span>
+      <input id="whole-steps" type="number" min="1" max="256" placeholder="as trained">
+    </label>
+
+    <h2>Tile steps</h2>
+    <label class="check"><input id="tiles" type="checkbox" checked> Refine with tiles</label>
+    <div id="tile-settings">
+      <label>Rounds per level <input id="rounds" type="number" min="1" max="8" value="2"></label>
+      <label>Max tiles per round <input id="max-tiles" type="number" min="1" max="256" value="32"></label>
+      <label>Smallest tile
+        <select id="min-tile">
+          <option value="">auto (source detail)</option>
+          <option value="0.125">1/8 of the image</option>
+          <option value="0.0625">1/16 of the image</option>
+          <option value="0.03125">1/32 of the image</option>
+        </select>
+      </label>
+      <label>Error threshold <input id="threshold" type="number" min="0" max="1" step="0.005" value="0.015"></label>
+      <label>Context margin <input id="margin" type="number" min="0" max="1" step="0.05" value="0.25"></label>
+      <label class="check"><input id="fade" type="checkbox" checked> Fade strokes at tile edges</label>
+    </div>
+
+    <h2>Importance mask</h2>
+    <label>Importance gain <input id="importance-gain" type="number" min="0" max="20" step="0.5" value="2"></label>
+
+    <h2>Rendering</h2>
+    <label>Curve quality
+      <select id="num-stamps">
+        <option value="16">fast (16)</option>
+        <option value="32" selected>normal (32)</option>
+        <option value="64">smooth (64)</option>
+      </select>
+    </label>
+
+    <div class="actions">
+      <button id="paint" class="primary" disabled>Paint</button>
+      <button id="cancel" class="ghost" hidden>Cancel</button>
+    </div>
+    <p id="message" class="hint"></p>
+  </aside>
+
+  <section class="workspace">
+    <div class="panels">
+      <div class="panel view">
+        <div class="view-head">
+          <h2>Target &amp; importance mask</h2>
+          <label class="file-btn">Open image<input id="image-file" type="file" accept="image/*" hidden></label>
+        </div>
+        <div id="target-stage" class="stage empty">
+          <div class="drop-hint">Drop an image here or click “Open image”</div>
+          <div class="stack" id="target-stack" hidden>
+            <img id="target-img" alt="target">
+            <canvas id="mask-overlay"></canvas>
+          </div>
+        </div>
+        <div class="toolbar" id="mask-tools">
+          <div class="seg">
+            <button data-mode="paint" class="active">Paint</button>
+            <button data-mode="erase">Erase</button>
+          </div>
+          <label class="inline">Brush <input id="brush-size" type="range" min="1" max="30" value="8"></label>
+          <label class="inline">Overlay <input id="mask-opacity" type="range" min="0" max="100" value="45"></label>
+          <button id="mask-clear" class="ghost">Clear</button>
+          <label class="file-btn ghost">Upload mask<input id="mask-file" type="file" accept="image/*" hidden></label>
+          <div class="seg">
+            <button id="gen-subject" title="Placeholder: soft centered ellipse">Subject*</button>
+            <button id="gen-face" title="Placeholder: soft ellipse in the upper middle">Face*</button>
+          </div>
+        </div>
+        <p class="hint">Bright mask areas get more and finer tiles. *Subject/face generation is a placeholder for now.</p>
+      </div>
+
+      <div class="panel view">
+        <div class="view-head">
+          <h2>Painting</h2>
+          <div class="downloads" id="downloads" hidden>
+            <a id="dl-png" class="button ghost" download>PNG</a>
+            <a id="dl-strokes" class="button ghost" download>strokes.pt</a>
+            <a id="dl-stats" class="button ghost" download>stats.json</a>
+          </div>
+        </div>
+        <div id="paint-stage" class="stage empty">
+          <div class="drop-hint">The painting appears here while it is being made</div>
+          <div class="stack compare" id="paint-stack" hidden>
+            <img id="compare-target" alt="target">
+            <img id="preview-img" alt="painting">
+          </div>
+        </div>
+        <div class="toolbar">
+          <label class="inline grow">Compare with target <input id="compare" type="range" min="0" max="100" value="100"></label>
+        </div>
+        <div class="progress"><div id="progress-bar"></div></div>
+        <div class="status-line">
+          <span id="stage-label">idle</span>
+          <span id="stats-label" class="muted"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Stages</h2>
+      <table id="stages">
+        <thead><tr><th>Stage</th><th>Strokes</th><th>Tiles</th><th>PSNR</th><th>Time</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

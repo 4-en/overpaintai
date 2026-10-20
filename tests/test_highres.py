@@ -73,3 +73,29 @@ def test_paint_runs_whole_and_tile_levels():
     assert [s["stage"] for s in result.stats] == ["whole image", "tiles 1/2", "tiles 1/4"]
     assert result.canvas.shape == (1, 3, 64, 64)
     assert sum(r.shape[0] for r in result.strokes) == result.stats[-1]["strokes"] > 8
+
+
+def test_paint_reports_progress_stages_and_can_be_cancelled():
+    import pytest
+
+    from overpaintai.highres import PaintCancelled
+
+    cfg = HighResConfig(whole_steps=3, rounds_per_level=2, max_tiles=2, error_threshold=0.0, min_core=0.25)
+    painter = HighResPainter(_model(), size=64, view_res=16, config=cfg, autocast=None)
+    target = torch.rand(1, 3, 64, 64)
+    events, stages = [], []
+
+    def on_progress(event, get_canvas):
+        events.append(dict(event))
+        assert get_canvas().shape == (1, 3, 64, 64)
+
+    painter.paint(target, 64, log=lambda *_: None, on_progress=on_progress, on_stage=stages.append)
+    assert [e["kind"] for e in events[:3]] == ["whole"] * 3 and events[3]["kind"] == "tiles"
+    fractions = [e["fraction"] for e in events]
+    assert fractions == sorted(fractions) and fractions[-1] == 1.0
+    assert [s["stage"] for s in stages] == ["whole image", "tiles 1/2", "tiles 1/4"]
+
+    calls = []
+    with pytest.raises(PaintCancelled):
+        painter.paint(target, 64, log=lambda *_: None, should_stop=lambda: calls.append(1) or len(calls) >= 2)
+    assert len(calls) == 2  # stopped right at the second check

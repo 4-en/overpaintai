@@ -75,6 +75,8 @@ overpaint-train --mode unroll --data path/to/images --init-from runs/unroll/best
 overpaint-train --resume runs/real/last.pt --epochs 40   # continue a run
 ```
 
+To train later painting phases too, unroll batches can start from other canvases than a blank one: `--start-mix blank:0.4,warmup:0.3,degraded:0.3` mixes empty canvases, canvases the model first painted itself for up to `--rollout-max` steps (no gradients), and the target with synthetic painting mistakes (`overpaintai/degrade.py`: local blur, rough stroke repaints in local colors, color shifts, flattened or unpainted regions, lower detail). Progress conditioning always means "fraction of the painting done", so these starts count as steps already painted.
+
 Each run writes `best.pt` (best validation PSNR, EMA weights included), `last.pt`, `epochs.csv` / `steps.csv`, `curve.png` and validation samples per epoch to `--out`.
 
 Launch the interactive real-time mouse painting GUI:
@@ -121,6 +123,9 @@ Writes `final.png`, `target.png`, `progress.png` (target + canvas after each sta
 - **Error-guided tile selection**: instead of a fixed grid, blur the error map `|target − canvas|` at the current tile scale, pick the windows with the highest summed error, suppress heavily overlapping candidates (non-maximum suppression), paint them as one batch, re-measure, repeat. Regions that are already good get no more strokes; difficult regions get several passes.
 - **Importance weighting**: multiply the error map by an importance map before selecting, e.g. from a face detector (including illustration/anime face detectors), subject segmentation (rembg, SAM), a saliency model, or a user-painted mask. The subject gets more and smaller tiles while the background stays looser.
 - **Adaptive stopping**: stop when no (importance-weighted) region's error is above a threshold, so simple images finish early and detailed ones get more strokes.
+
+### Web interface
+`pip install -e ".[web]"`, then `overpaint-web` (open http://127.0.0.1:8000; `--host 0.0.0.0` for other machines, `--runs` for the checkpoint folder). Pick a checkpoint from `runs/`, open an image, set resolution, whole-image steps and tile settings, and optionally paint an importance mask over the image (brush / erase, upload a grayscale mask, or generate one for the subject / face, which is currently a placeholder ellipse). The painting updates live about once per second and after each stage; the result PNG, `strokes.pt` and `stats.json` can be downloaded and are also kept in `runs/web/<job id>/`. Jobs run one at a time on the GPU.
 
 ### Tile edges: don't paint blind, don't clip
 A tile's strokes must not reach (far) past what the model can see: outside the view it can't judge what it would paint over, and could destroy finished work. Hard-clipping strokes at the tile border is not an option either, since it leaves visible hard edges and seams.

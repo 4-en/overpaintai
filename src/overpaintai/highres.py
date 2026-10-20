@@ -13,13 +13,17 @@ way the README's "High-Resolution Inference Harness" describes:
 Nothing here is trained; it only schedules the views a trained model paints.
 """
 
+import io
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
@@ -50,6 +54,56 @@ class PaintResult:
     snapshots: List[Tuple[str, torch.Tensor]] = field(default_factory=list)  # (label, canvas)
     stats: List[Dict] = field(default_factory=list)
     strokes: List[torch.Tensor] = field(default_factory=list)  # engine-independent stroke records
+
+
+class PaintCancelled(Exception):
+    """Raised by `HighResPainter.paint` when its `should_stop` callback returns True."""
+
+
+def load_padded(source: Union[str, Path, bytes, Image.Image], size: int, device, mode: str = "RGB"):
+    """
+    Loads an image (path, encoded bytes or PIL image) with its longer side resized to `size` and pads it
+    to a square (edge-replicated, so the model sees plausible content there). Transparent images are
+    composited onto white. Returns (image (1, C, S, S), valid mask (1, 1, S, S), (w, h) of the content,
+    longer source side in pixels).
+    """
+    if isinstance(source, Image.Image):
+        img = source
+    else:
+        img = Image.open(io.BytesIO(source) if isinstance(source, (bytes, bytearray)) else source)
+    if mode == "RGB" and img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGBA")
+        white = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(white, img)
+    img = img.convert(mode)
+    src_side = max(img.size)
+    scale = size / src_side
+    w, h = max(1, round(img.width * scale)), max(1, round(img.height * scale))
+    img = img.resize((w, h), Image.LANCZOS if scale < 1 else Image.BICUBIC)
+    x = torch.from_numpy(np.asarray(img, dtype="float32") / 255.0)
+    x = x.view(h, w, -1).permute(2, 0, 1).unsqueeze(0)
+    x = F.pad(x, (0, size - w, 0, size - h), mode="replicate")
+    valid = torch.zeros(1, 1, size, size)
+    valid[..., :h, :w] = 1.0
+    return x.to(device), valid.to(device), (w, h), src_side
+
+
+def config_from_checkpoint(ckpt: Dict, **overrides) -> Tuple[HighResConfig, int, int]:
+    """
+    Harness settings matching how a checkpoint was trained (whole-image steps, tile-step progress, trained
+    tile-size range), with `overrides` applied (any `HighResConfig` field; None values are ignored).
+    Returns (config, view resolution, tool index).
+    """
+    train_args = ckpt.get("args", {})
+    steps = int(train_args.get("steps", 6))
+    tile_lo = float(str(train_args.get("tile_size", "0.3,0.6")).split(",")[0])
+    cfg = HighResConfig(whole_steps=steps, tile_progress=steps / (steps + 1), scale_clamp=(tile_lo, 1.0))
+    for key, value in overrides.items():
+        if value is not None:
+            if not hasattr(cfg, key):
+                raise TypeError(f"unknown HighResConfig field {key!r}")
+            setattr(cfg, key, value)
+    return cfg, int(ckpt.get("view_res", 128)), int((ckpt.get("tools") or [0])[0])
 
 
 def load_checkpoint_model(path: str, device: torch.device) -> Tuple[StrokePredictor, Dict]:
@@ -257,6 +311,9 @@ class HighResPainter:
         valid: Optional[torch.Tensor] = None,
         importance: Optional[torch.Tensor] = None,
         log=print,
+        on_progress: Optional[Callable[[Dict, Callable[[], torch.Tensor]], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
+        on_stage: Optional[Callable[[Dict], None]] = None,
     ) -> PaintResult:
         """
         Args:
@@ -264,6 +321,12 @@ class HighResPainter:
             source_side: longer side of the original image in pixels (limits how fine tiles go).
             valid: optional (1, 1, S, S) mask of real image pixels (padding = 0); excluded from selection.
             importance: optional (1, 1, S, S) map in [0, 1]; high values attract more / smaller tiles.
+            on_progress: called after every whole-image step and every tile round as
+                `on_progress(event, get_canvas)`; `event` holds the stage, step / round, strokes so far,
+                elapsed seconds and an approximate overall `fraction`; `get_canvas()` composites the current
+                canvas `(1, 3, S, S)` on demand (so callers can throttle previews cheaply).
+            should_stop: checked at the same points; returning True raises `PaintCancelled`.
+            on_stage: called with each stage's stats (stage, strokes, tiles, psnr, seconds) when it ends.
         """
         cfg, S, A = self.cfg, self.S, min(self.cfg.analysis_res, self.S)
         t0 = time.time()
@@ -276,6 +339,19 @@ class HighResPainter:
         if importance is not None:
             weight_a = weight_a * (1.0 + cfg.importance_gain * F.interpolate(importance, size=(A, A), mode="area"))
         n_strokes = 0
+        cores_plan = self.core_sizes(source_side) if cfg.rounds_per_level > 0 else []
+        total_units = max(1, cfg.whole_steps + len(cores_plan) * cfg.rounds_per_level)
+        units_done = 0
+
+        def progress(event: Dict, units: int):
+            nonlocal units_done
+            units_done = units
+            if on_progress is not None:
+                event.update(strokes=n_strokes, seconds=time.time() - t0,
+                             fraction=min(1.0, units_done / total_units))
+                on_progress(event, lambda: self.composite(result.layer))
+            if should_stop is not None and should_stop():
+                raise PaintCancelled()
 
         def record(label: str, tiles: int = 0):
             canvas = self.composite(result.layer)
@@ -286,6 +362,8 @@ class HighResPainter:
             result.stats.append(stat)
             result.snapshots.append((label, canvas))
             log(f"{label:>18s}: {n_strokes:5d} strokes, PSNR {stat['psnr']:.2f} dB, {stat['seconds']:.1f}s")
+            if on_stage is not None:
+                on_stage(stat)
 
         # 1. Whole-image steps
         whole = views.whole_image_boxes(1, self.device)
@@ -295,11 +373,13 @@ class HighResPainter:
             result.layer = self.render(result.layer, strokes)
             result.strokes.append(self._pack(strokes))
             n_strokes += strokes.radii.shape[1]
+            progress({"stage": "whole image", "kind": "whole", "step": k + 1, "steps": cfg.whole_steps}, k + 1)
         record("whole image")
 
         # 2. Tile levels
-        for core in self.core_sizes(source_side):
+        for level, core in enumerate(cores_plan):
             level_tiles = 0
+            label = f"tiles 1/{round(1 / core)}"
             for rnd in range(cfg.rounds_per_level):
                 cores, scores = self.select_tiles(self.error_map(target_a, result.layer, weight_a), core)
                 if cores.shape[0] == 0:
@@ -323,7 +403,9 @@ class HighResPainter:
                     result.strokes.append(self._pack(tile))
                     n_strokes += tile.radii.shape[1]
                 level_tiles += cores.shape[0]
-            record(f"tiles 1/{round(1 / core)}", level_tiles)
+                progress({"stage": label, "kind": "tiles", "round": rnd + 1, "rounds": cfg.rounds_per_level,
+                          "tiles": int(cores.shape[0])}, cfg.whole_steps + level * cfg.rounds_per_level + rnd + 1)
+            record(label, level_tiles)
 
         result.canvas = self.composite(result.layer)
         return result

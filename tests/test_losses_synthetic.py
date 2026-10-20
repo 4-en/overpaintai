@@ -85,3 +85,21 @@ def test_radius_to_param_inverts_engine_mapping():
     r = torch.tensor([0.01, 0.05, 0.2])
     p = radius_to_param(engine, r)
     assert torch.allclose(engine.min_radius + p * (engine.max_radius - engine.min_radius), r)
+
+
+def test_degraded_canvas_is_a_partial_painting_of_the_target():
+    from overpaintai.degrade import DEGRADATIONS, degraded_canvas
+
+    engine = DifferentiableCanvasEngine(canvas_size=32).eval()
+    gen = torch.Generator().manual_seed(0)
+    params, tools = random_strokes(engine, 3, 20, generator=gen)
+    target = render_targets(engine, params, tools, 32)
+    background = engine.create_background(3, 32, 32)
+    for kind in DEGRADATIONS:
+        layer = degraded_canvas(target, engine, gen, kinds=(kind,))
+        assert layer.shape == (3, 4, 32, 32) and layer.min() >= 0 and layer.max() <= 1
+        canvas = engine.composite(layer, background)
+        start = psnr(canvas, target)
+        assert (start > 12).all(), kind  # close to the target overall ...
+    layer = degraded_canvas(target, engine, gen, kinds=("missing",))
+    assert (layer[:, 3] < 0.5).any()  # ... and "missing" leaves unpainted (transparent) areas
