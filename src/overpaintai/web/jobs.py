@@ -24,6 +24,7 @@ from overpaintai.highres import (
     config_from_checkpoint,
     load_checkpoint_model,
     load_padded,
+    render_strokes,
 )
 from overpaintai.timelapse import render_timelapse
 from overpaintai.viz import to_uint8
@@ -73,11 +74,12 @@ class Job:
     cancel_requested: bool = False
     image_bytes: bytes = b""
     mask_bytes: Optional[bytes] = None
-    kind: str = "paint"  # paint | video
+    kind: str = "paint"  # paint | video | export
     parent: Optional[str] = None  # paint job this one continues (paint) or replays (video)
     whole_done: int = 0  # whole-image steps painted so far, including all parents
     video_duration: float = 15.0
     video_max_side: int = 1080
+    export_side: int = 4096
     total_strokes: int = 0  # strokes in the painting so far, including all parents
 
     def push(self, event: Dict):
@@ -205,6 +207,14 @@ class JobManager:
                   parent=parent)
         return self._enqueue(job)
 
+    def submit_export(self, paint_job: str, side: int) -> Job:
+        """Queues a re-render of a finished painting's strokes at another resolution (longer side `side`)."""
+        source = self._finished_paint_job(paint_job)
+        side = int(min(8192, max(256, side)))
+        job = Job(uuid.uuid4().hex[:12], source.settings, source.out_dir, kind="export", parent=paint_job,
+                  export_side=side)
+        return self._enqueue(job)
+
     def submit_video(self, paint_job: str, duration: float, max_side: int = 1080) -> Job:
         """Queues a speed-painting video of a finished painting (including everything it continued)."""
         source = self._finished_paint_job(paint_job)
@@ -229,7 +239,7 @@ class JobManager:
             job.status = "running"
             job.push({"type": "status", "status": "running"})
             try:
-                self._run_video(job) if job.kind == "video" else self._run(job)
+                {"video": self._run_video, "export": self._run_export}.get(job.kind, self._run)(job)
                 job.status = "done"
                 job.push({"type": "status", "status": "done", "stats": job.stats, "total_strokes": job.total_strokes})
             except (PaintCancelled, InterruptedError):
@@ -346,3 +356,24 @@ class JobManager:
             min_radius=data.get("min_radius", 1e-4), max_radius=data.get("max_radius", 0.75), device=self.device,
             on_progress=on_progress, should_stop=lambda: job.cancel_requested,
         )
+
+    @torch.no_grad()
+    def _run_export(self, job: Job):
+        data = torch.load(job.out_dir / "strokes.pt", weights_only=False)
+        n = data["strokes"].shape[0]
+        job.push({"type": "plan", "export": True, "strokes": n, "side": job.export_side})
+        start = time.time()
+
+        def on_progress(fraction: float):
+            job.push({"type": "progress", "kind": "export", "stage": f"rendering {job.export_side}px",
+                      "fraction": fraction, "strokes": n, "seconds": time.time() - start})
+
+        img = render_strokes(
+            data["strokes"], data["size"], tuple(data["content_wh"]), job.export_side,
+            num_stamps=data.get("num_stamps", 32), min_radius=data.get("min_radius", 1e-4),
+            max_radius=data.get("max_radius", 0.75), device=self.device,
+            on_progress=on_progress, should_stop=lambda: job.cancel_requested,
+        )
+        arr = to_uint8(img[0])
+        del img
+        Image.fromarray(arr).save(job.out_dir / f"export_{job.export_side}.png", compress_level=3)

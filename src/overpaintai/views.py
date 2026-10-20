@@ -152,17 +152,19 @@ def image_to_view(strokes: Strokes, boxes: torch.Tensor) -> Strokes:
     )
 
 
-def to_engine_params(strokes: Strokes, engine: DifferentiableCanvasEngine) -> torch.Tensor:
+def to_engine_params(strokes: Strokes, engine: DifferentiableCanvasEngine, clamp_points: bool = True) -> torch.Tensor:
     """
     Encodes image-space strokes as the engine's `(B, N, 14)` parameters in [0, 1]. Radii are clamped to the
     engine's [min_radius, max_radius]; engines meant for high resolutions can use a smaller `min_radius`.
+    With `clamp_points=False`, points may lie outside the canvas (e.g. when rendering a stroke piecewise
+    into a crop that only covers part of it).
     """
     B, N = strokes.radii.shape[:2]
     r = (strokes.radii - engine.min_radius) / (engine.max_radius - engine.min_radius)
     a = (strokes.opacity - 0.05) / 0.95
     return torch.cat(
         [
-            strokes.points.reshape(B, N, 6).clamp(0.0, 1.0),
+            strokes.points.reshape(B, N, 6).clamp(0.0, 1.0) if clamp_points else strokes.points.reshape(B, N, 6),
             r.clamp(0.0, 1.0),
             a.clamp(0.0, 1.0),
             strokes.hardness,

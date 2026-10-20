@@ -163,3 +163,15 @@ def test_stroke_schedule_is_slow_first_and_complete():
     s = stroke_schedule(1000, 100)
     assert s[-1] == 1000 and s == sorted(s)
     assert s[49] < 300  # half the time shows well under half the strokes (big early strokes get more time)
+
+
+def test_export_at_higher_resolution(client):
+    c, ckpt = client
+    painting = _paint(c, ckpt)
+    job = c.post(f"/api/jobs/{painting}/export", data={"side": 300}).json()
+    assert job["kind"] == "export"
+    assert _wait(c, job["id"])["status"] == "done"
+    png = Image.open(io.BytesIO(c.get(f"/api/jobs/{job['id']}/export.png").content))
+    assert png.size[0] == 300 and abs(png.size[1] - 300 * 40 / 48) <= 1  # longer side as requested, aspect kept
+    assert c.get(f"/api/jobs/{painting}/export.png").status_code == 404  # only export jobs have one
+    assert c.post("/api/jobs/nope/export", data={"side": 4096}).status_code == 400

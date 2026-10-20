@@ -132,6 +132,21 @@ def create_app(runs_dir: str = "runs", device: str = None, out_dir: str = None) 
         except ValueError as exc:
             raise HTTPException(400, str(exc))
 
+    @app.post("/api/jobs/{job_id}/export")
+    def export(job_id: str, side: int = Form(4096)):
+        """Queues a re-render of a finished painting at a higher (or any) resolution; returns the export job."""
+        try:
+            return manager.submit_export(job_id, side).summary()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/jobs/{job_id}/export.png")
+    def export_file(job_id: str):
+        job = get_job(job_id)
+        if job.kind != "export":
+            raise HTTPException(404, "not an export job")
+        return result_file(job_id, f"export_{job.export_side}.png", "image/png")
+
     @app.get("/api/jobs/{job_id}/video.mp4")
     def video_file(job_id: str):
         return result_file(job_id, "timelapse.mp4", "video/mp4")

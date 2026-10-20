@@ -99,3 +99,35 @@ def test_paint_reports_progress_stages_and_can_be_cancelled():
     with pytest.raises(PaintCancelled):
         painter.paint(target, 64, log=lambda *_: None, should_stop=lambda: calls.append(1) or len(calls) >= 2)
     assert len(calls) == 2  # stopped right at the second check
+
+
+def test_split_rendering_matches_single_crop():
+    from overpaintai.highres import CropRenderer
+
+    torch.manual_seed(0)
+    s = views.Strokes(points=torch.rand(1, 6, 3, 2) * 1.2 - 0.1, radii=0.05 + 0.3 * torch.rand(1, 6, 2),
+                      opacity=0.5 + 0.5 * torch.rand(1, 6, 2), hardness=torch.rand(1, 6, 1), color=torch.rand(1, 6, 3))
+    whole = CropRenderer(120, 32, 1e-3, 0.75, "cpu", max_crop=4096)
+    split = CropRenderer(120, 32, 1e-3, 0.75, "cpu", max_crop=32)  # squares reach past the canvas edge
+    a, b = whole.render(whole.blank(), s), split.render(split.blank(), s)
+    # Compare what is visible (RGB of near-transparent pixels is numerically unstable either way)
+    assert (whole.composite(a) - split.composite(b)).abs().max() < 1e-4
+    assert (a[:, 3] - b[:, 3]).abs().max() < 1e-4
+
+
+def test_render_strokes_reproduces_and_upscales_a_painting():
+    from overpaintai.highres import render_strokes
+
+    cfg = HighResConfig(whole_steps=3, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.25)
+    painter = HighResPainter(_model(), size=64, view_res=16, config=cfg, autocast=None)
+    target = torch.rand(1, 3, 64, 64)
+    result = painter.paint(target, 64, log=lambda *_: None)
+    strokes = torch.cat(result.strokes)
+    kw = dict(num_stamps=32, min_radius=painter.min_radius, max_radius=painter.max_radius)
+    same = render_strokes(strokes, 64, (64, 48), 64, **kw)
+    assert same.shape == (1, 3, 48, 64)
+    assert (same - result.canvas[..., :48, :]).abs().mean() < 0.01  # same painting (adaptive curve samples)
+    big = render_strokes(strokes, 64, (64, 48), 256, **kw)
+    assert big.shape == (1, 3, 192, 256)
+    down = torch.nn.functional.interpolate(big, size=(48, 64), mode="area")
+    assert (down - same).abs().mean() < 0.03  # the same picture, just at 4x the resolution

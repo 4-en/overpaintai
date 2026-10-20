@@ -146,6 +146,18 @@
           <span id="stage-label">idle</span>
           <span id="stats-label" class="muted"></span>
         </div>
+        <div class="video-bar" id="export-bar" hidden>
+          <span class="bar-title">Export at resolution</span>
+          <select id="export-side">
+            <option value="2048">2048 px</option>
+            <option value="4096" selected>4096 px</option>
+            <option value="6144">6144 px</option>
+            <option value="8192">8192 px</option>
+          </select>
+          <button id="export-png">Export PNG</button>
+          <span id="export-status" class="muted"></span>
+          <a id="dl-export" class="button ghost" download hidden>PNG</a>
+        </div>
         <div class="video-bar" id="video-bar" hidden>
           <span class="bar-title">Speed-painting video</span>
           <select id="video-duration">

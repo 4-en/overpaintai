@@ -15,6 +15,7 @@ const state = {
   events: null,
   lastDone: null, // last finished painting job (continue / video export start from it)
   videoEvents: null,
+  exportEvents: null,
   plan: null,
   startTime: 0,
   timer: null,
@@ -294,6 +295,7 @@ function setRunning(running) {
   $("cancel").hidden = !running;
   $("continue").disabled = running;
   $("export-video").disabled = running;
+  $("export-png").disabled = running;
 }
 
 function stageKey(name) {
@@ -394,8 +396,11 @@ function finishJob(ev) {
     state.lastDone = state.job;
     $("continue-bar").hidden = false;
     $("video-bar").hidden = false;
+    $("export-bar").hidden = false;
     $("dl-video").hidden = true;
+    $("dl-export").hidden = true;
     $("video-status").textContent = "";
+    $("export-status").textContent = "";
     setMessage("");
   } else if (ev.status === "cancelled") {
     $("stage-label").textContent = "cancelled";
@@ -423,6 +428,7 @@ async function startJob(parent = null) {
     form.append("image", state.imageFile);
     $("continue-bar").hidden = true;
     $("video-bar").hidden = true;
+    $("export-bar").hidden = true;
   }
   form.append("settings", JSON.stringify(settings));
   const mask = await maskBlob();
@@ -456,38 +462,52 @@ async function cancelJob() {
   await fetch(`/api/jobs/${state.job}/cancel`, { method: "POST" });
 }
 
-async function exportVideo() {
+// Exports (video, high-res PNG): a job derived from the last painting, with its own progress line
+async function runExport({ endpoint, fields, button, status, link, file, eventsKey }) {
   if (!state.lastDone) return;
   const form = new FormData();
-  form.append("duration", $("video-duration").value);
-  const res = await fetch(`/api/jobs/${state.lastDone}/video`, { method: "POST", body: form });
-  if (!res.ok) return setMessage(`Video export failed: ${await res.text()}`, true);
+  for (const [k, v] of Object.entries(fields)) form.append(k, v);
+  const res = await fetch(`/api/jobs/${state.lastDone}/${endpoint}`, { method: "POST", body: form });
+  if (!res.ok) return setMessage(`Export failed: ${await res.text()}`, true);
   const job = await res.json();
-  $("export-video").disabled = true;
-  $("dl-video").hidden = true;
-  $("video-status").textContent = "queued…";
-  if (state.videoEvents) state.videoEvents.close();
-  state.videoEvents = new EventSource(`/api/jobs/${job.id}/events`);
-  state.videoEvents.onmessage = (msg) => {
+  $(button).disabled = true;
+  $(link).hidden = true;
+  $(status).textContent = "queued…";
+  if (state[eventsKey]) state[eventsKey].close();
+  const events = new EventSource(`/api/jobs/${job.id}/events`);
+  state[eventsKey] = events;
+  events.onmessage = (msg) => {
     const ev = JSON.parse(msg.data);
     if (ev.type === "plan") {
-      $("video-status").textContent = `rendering ${ev.strokes} strokes…`;
+      $(status).textContent = `rendering ${ev.strokes} strokes…`;
     } else if (ev.type === "progress") {
-      $("video-status").textContent = `rendering ${Math.round(100 * ev.fraction)}%`;
+      $(status).textContent = `rendering ${Math.round(100 * ev.fraction)}% · ${formatTime(ev.seconds)}`;
+    } else if (ev.type === "status" && ev.status === "running") {
+      $(status).textContent = "starting…";
     } else if (ev.type === "status" && ["done", "error", "cancelled"].includes(ev.status)) {
-      state.videoEvents.close();
-      state.videoEvents = null;
-      $("export-video").disabled = false;
+      events.close();
+      state[eventsKey] = null;
+      $(button).disabled = false;
       if (ev.status === "done") {
-        $("video-status").textContent = "ready";
-        $("dl-video").href = `/api/jobs/${job.id}/video.mp4`;
-        $("dl-video").hidden = false;
+        $(status).textContent = "ready";
+        $(link).href = `/api/jobs/${job.id}/${file}`;
+        $(link).hidden = false;
       } else {
-        $("video-status").textContent = ev.status === "error" ? "failed" : "cancelled";
+        $(status).textContent = ev.status === "error" ? "failed" : "cancelled";
         if (ev.error) setMessage(ev.error, true);
       }
     }
   };
+}
+
+function exportVideo() {
+  return runExport({ endpoint: "video", fields: { duration: $("video-duration").value }, button: "export-video",
+    status: "video-status", link: "dl-video", file: "video.mp4", eventsKey: "videoEvents" });
+}
+
+function exportPng() {
+  return runExport({ endpoint: "export", fields: { side: $("export-side").value }, button: "export-png",
+    status: "export-status", link: "dl-export", file: "export.png", eventsKey: "exportEvents" });
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -508,6 +528,7 @@ async function init() {
   $("paint").addEventListener("click", () => startJob());
   $("continue").addEventListener("click", () => startJob(state.lastDone));
   $("export-video").addEventListener("click", exportVideo);
+  $("export-png").addEventListener("click", exportPng);
   $("cancel").addEventListener("click", cancelJob);
   setupDropZone();
   setupMaskEditor();

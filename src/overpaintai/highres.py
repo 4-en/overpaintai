@@ -123,11 +123,24 @@ class CropRenderer:
     """
     Renders image-space strokes onto a square paint layer of `size` px, each batch of strokes only inside a
     square crop of the canvas that contains their footprint (identical to a full-canvas render, since the
-    renderer is resolution-independent, at a fraction of the cost). Shared by painting and video replay.
+    renderer is resolution-independent, at a fraction of the cost). Shared by painting, video replay and
+    high-resolution export. Footprints larger than `max_crop` px are rendered in squares of at most that
+    size, which bounds memory on very large canvases (exact for the paint tool, whose result per pixel only
+    depends on that pixel).
     """
 
-    def __init__(self, size: int, num_stamps: int, min_radius: float, max_radius: float, device, tool: int = 0):
+    def __init__(
+        self, size: int, num_stamps: int, min_radius: float, max_radius: float, device, tool: int = 0,
+        max_crop: int = 2048, adaptive_stamps: bool = False,
+    ):
+        """
+        adaptive_stamps: choose the curve samples per call from the strokes' length in pixels (about one
+            segment per 16 px, between 8 and `num_stamps`) instead of always `num_stamps`; much cheaper for
+            the many small detail strokes, visually the same (used for replay / export).
+        """
         self.S = size
+        self.max_crop = max_crop
+        self.adaptive_stamps = adaptive_stamps
         self.num_stamps = num_stamps
         self.min_radius = min_radius
         self.max_radius = max_radius
@@ -144,6 +157,14 @@ class CropRenderer:
             min_radius=self.min_radius / scale, max_radius=self.max_radius / scale,
         ).to(self.device).eval()
 
+    def _stamps_for(self, strokes: views.Strokes) -> int:
+        if not self.adaptive_stamps:
+            return self.num_stamps
+        p = strokes.points[0]  # (N, 3, 2): control polygon length bounds the curve length
+        length = ((p[:, 1] - p[:, 0]).norm(dim=-1) + (p[:, 2] - p[:, 1]).norm(dim=-1)).max().item() * (self.S - 1)
+        stamps = 8 * math.ceil((length / 16.0 + 1) / 8)
+        return int(min(self.num_stamps, max(8, stamps)))  # multiples of 8: few distinct shapes to compile
+
     def blank(self) -> torch.Tensor:
         return self.engine.create_blank_paint_layer(1, self.S, self.S, self.device)
 
@@ -156,6 +177,10 @@ class CropRenderer:
         if strokes.radii.shape[1] == 0:
             return layer
         S = self.S
+        # Points are kept on the canvas once, here; crops then take them as they are (unclamped), so a
+        # stroke split over several crops keeps its exact shape
+        strokes = views.Strokes(strokes.points.clamp(0.0, 1.0), strokes.radii, strokes.opacity,
+                                strokes.hardness, strokes.color)
         r = strokes.radii.amax(-1)  # (1, N)
         soft = (strokes.hardness[..., 0] < 0.999).float()
         ext = r * (1.0 + 1.15 * soft) + 3.0 / (S - 1)  # soft profile reaches ~2.15 r
@@ -165,18 +190,36 @@ class CropRenderer:
         x0, y0 = math.floor(lo[0].item() * (S - 1)), math.floor(lo[1].item() * (S - 1))
         x1, y1 = math.ceil(hi[0].item() * (S - 1)), math.ceil(hi[1].item() * (S - 1))
         n = min(S, max(x1 - x0, y1 - y0) + 1)
-        x0, y0 = min(x0, S - n), min(y0, S - n)
-        box = torch.tensor([[x0 / (S - 1), y0 / (S - 1), (n - 1) / (S - 1)]], device=self.device)
+        stamps = self._stamps_for(strokes)
+        if n <= self.max_crop:
+            self._render_square(layer, strokes, min(x0, S - n), min(y0, S - n), n, stamps)
+        else:  # split huge footprints into squares (the last ones may reach past the canvas: padded)
+            m = self.max_crop
+            for py in range(y0, y1 + 1, m):
+                for px in range(x0, x1 + 1, m):
+                    self._render_square(layer, strokes, px, py, m, stamps)
+        return layer
 
+    def _render_square(self, layer: torch.Tensor, strokes: views.Strokes, x0: int, y0: int, n: int, stamps: int):
+        """Renders `strokes` into the n x n square at pixel (x0, y0); parts outside the canvas are padding."""
+        S = self.S
+        box = torch.tensor([[x0 / (S - 1), y0 / (S - 1), (n - 1) / (S - 1)]], device=self.device)
         if n not in self._crop_engines:
-            self._crop_engines[n] = self._engine(n, (n - 1) / (S - 1)) if n < S else self.engine
+            self._crop_engines[n] = self._engine(n, (n - 1) / (S - 1)) if n != S else self.engine
         eng = self._crop_engines[n]
-        params = views.to_engine_params(views.image_to_view(strokes, box), eng)
+        if eng.num_stamps != stamps:  # one engine per crop size; only its curve sampling changes
+            eng.num_stamps = stamps
+            eng.t = torch.linspace(0.0, 1.0, stamps, device=self.device).view(1, stamps, 1, 1)
+        params = views.to_engine_params(views.image_to_view(strokes, box), eng, clamp_points=False)
         tools = torch.zeros(1, params.shape[1], eng.NUM_TOOLS, device=self.device)
         tools[..., self.tool] = 1.0
-        crop = layer[:, :, y0 : y0 + n, x0 : x0 + n].contiguous()
-        layer[:, :, y0 : y0 + n, x0 : x0 + n] = eng(crop, params, tools)  # in place (no autograd here)
-        return layer
+        h, w = min(n, S - y0), min(n, S - x0)
+        if h == n and w == n:
+            crop = layer[:, :, y0 : y0 + n, x0 : x0 + n].contiguous()
+        else:
+            crop = layer.new_zeros((1, 4, n, n))
+            crop[:, :, :h, :w] = layer[:, :, y0 : y0 + h, x0 : x0 + w]
+        layer[:, :, y0 : y0 + h, x0 : x0 + w] = eng(crop, params, tools)[:, :, :h, :w]  # in place (no autograd)
 
 
 def pack_strokes(s: views.Strokes) -> torch.Tensor:
@@ -191,6 +234,44 @@ def unpack_strokes(t: torch.Tensor) -> views.Strokes:
     N = t.shape[1]
     return views.Strokes(points=t[..., 0:6].reshape(1, N, 3, 2), radii=t[..., 6:8], opacity=t[..., 8:10],
                          hardness=t[..., 10:11], color=t[..., 11:14])
+
+
+def render_strokes(
+    strokes: torch.Tensor,
+    canvas_size: int,
+    content_wh: Tuple[int, int],
+    output_side: int,
+    num_stamps: int = 32,
+    min_radius: float = 1e-4,
+    max_radius: float = 0.75,
+    device="cpu",
+    chunk: int = 16,
+    on_progress: Optional[Callable[[float], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> torch.Tensor:
+    """
+    Re-renders recorded strokes (`pack_strokes` format, coordinates of the square `canvas_size` canvas with
+    `content_wh` content) so that the content's longer side is `output_side` px. Strokes are
+    resolution-independent, so this is a real upscale: hard edges stay one pixel wide at the new size.
+    Curve samples grow with the resolution so long strokes stay smooth. Returns the content `(1, 3, h, w)`.
+    """
+    w, h = content_wh
+    S = max(16, round(canvas_size * output_side / max(w, h)))
+    # Max curve samples grow with sqrt(resolution) (flattening error ~ segment length^2); per chunk the
+    # renderer picks fewer for short strokes
+    stamps = int(min(128, max(num_stamps, round(num_stamps * math.sqrt(S / max(canvas_size, 1))))))
+    renderer = CropRenderer(S, stamps, min_radius, max_radius, device, adaptive_stamps=True)
+    strokes = strokes.to(renderer.device).float()
+    layer = renderer.blank()
+    N = strokes.shape[0]
+    for i in range(0, N, chunk):  # chunks follow the recording (<= 16 strokes per tile), keeping crops local
+        renderer.render(layer, unpack_strokes(strokes[i : i + chunk]))
+        if should_stop is not None and should_stop():
+            raise PaintCancelled()
+        if on_progress is not None and (i // chunk) % 20 == 0:
+            on_progress(min(1.0, (i + chunk) / max(N, 1)))
+    out_w, out_h = round(w * S / canvas_size), round(h * S / canvas_size)
+    return renderer.composite(layer)[:, :, :out_h, :out_w]
 
 
 def radius_limits(model: StrokePredictor, size: int) -> Tuple[float, float]:

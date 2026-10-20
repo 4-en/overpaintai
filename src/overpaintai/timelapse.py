@@ -54,7 +54,7 @@ def render_timelapse(
     V = max(16, round(canvas_size * max_side / max(w, h)))
     vw, vh = round(w * V / canvas_size) // 2 * 2, round(h * V / canvas_size) // 2 * 2  # even for yuv420p
 
-    renderer = CropRenderer(V, num_stamps, min_radius, max_radius, device)
+    renderer = CropRenderer(V, num_stamps, min_radius, max_radius, device, adaptive_stamps=True)
     strokes = strokes.to(renderer.device).float()
     N = strokes.shape[0]
     hold_frames = max(1, round(hold * fps))
