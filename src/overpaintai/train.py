@@ -34,7 +34,7 @@ from tqdm import tqdm
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
-from overpaintai.losses import MultiScalePaintLoss, psnr
+from overpaintai.losses import MultiScalePaintLoss, image_gradients, psnr
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.model import StrokePredictor
 from overpaintai.painting import Painter
@@ -64,7 +64,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--num-workers", type=int, default=4, help="Folder: DataLoader workers")
 
     g = p.add_argument_group("augmentation (folder data)")
-    g.add_argument("--crop-scale", default="0.1,1.0", help="Random square crop area range (zoom)")
+    g.add_argument("--crop-scale", default="0.1,1.0",
+                   help="Random square crop range as area fractions (0.01 = 10%% of the side); the side is "
+                        "sampled log-uniformly, so all zoom levels are equally likely")
     g.add_argument("--hflip", type=float, default=0.5)
     g.add_argument("--vflip", type=float, default=0.0)
     g.add_argument("--color-jitter", type=float, default=0.1)
@@ -85,6 +87,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Unroll: also backprop through the canvas the model looks at (unstable: explodes "
                         "over several steps); by default earlier steps get gradients via the renderer only")
     g.add_argument("--detail-weight", type=float, default=1.0)
+    g.add_argument("--edge-loss", action="store_true",
+                   help="Add an L1 loss on image gradients (Sobel) that rewards sharp, correctly placed edges")
+    g.add_argument("--edge-weight", type=float, default=1.0, help="Weight of the edge loss (with --edge-loss)")
     g.add_argument("--scales", default="4,16")
     g.add_argument("--scale-weights", default="1,1")
     g.add_argument("--teacher-tail", type=int, default=2,
@@ -208,7 +213,9 @@ class Trainer:
 
         scales = [int(s) for s in args.scales.split(",") if s]
         weights = [float(w) for w in args.scale_weights.split(",") if w]
-        self.loss_fn = MultiScalePaintLoss(args.detail_weight, scales, weights)
+        self.loss_fn = MultiScalePaintLoss(
+            args.detail_weight, scales, weights, edge_weight=args.edge_weight if args.edge_loss else 0.0
+        )
 
         decay, no_decay = [], []
         for n, prm in self.model.named_parameters():
@@ -320,6 +327,7 @@ class Trainer:
         with torch.no_grad():
             metrics["psnr"] = psnr(canvas, gt_canvas).mean()
             metrics["entropy"] = out.anchor_entropy.mean()
+            metrics["hardness"] = out.strokes.hardness.mean()
         return {"loss": loss, **metrics}
 
     def heatmap_loss(self, logits: torch.Tensor, gt: "views.Strokes", assign: torch.Tensor) -> torch.Tensor:
@@ -348,7 +356,7 @@ class Trainer:
         tile = torch.rand((), generator=self.gen, device=self.device).item() < a.tile_prob
         total = a.steps + int(tile)
         layer = self.engine.create_blank_paint_layer(B, S, S, self.device)
-        loss, weight_sum, entropy = 0.0, 0.0, []
+        loss, weight_sum, entropy, hardness = 0.0, 0.0, [], []
 
         for k in range(total):
             progress = torch.full((B,), k / total, device=self.device)
@@ -361,6 +369,7 @@ class Trainer:
             res = self.painter.step(target, layer, progress, boxes)
             layer = res.layer
             entropy.append(res.output.anchor_entropy.mean().detach())
+            hardness.append(res.output.strokes.hardness.mean().detach())
 
             last = k == total - 1
             w = 1.0 if last else a.intermediate_weight
@@ -378,7 +387,8 @@ class Trainer:
         loss = loss / weight_sum
         with torch.no_grad():
             final = self.painter.composite(layer)
-            metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean()}
+            metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean(),
+                       "hardness": torch.stack(hardness).mean()}
             metrics.update({k: torch.tensor(v) for k, v in terms.items()})
         return {"loss": loss, **metrics}
 
@@ -405,16 +415,18 @@ class Trainer:
         a = self.args
         model = self.eval_painter.model
         model.eval()
-        per_step, losses, finals = [], [], []
+        per_step, losses, finals, edge_err = [], [], [], []
         for chunk in self.val_targets.split(16):
             layers = self.eval_painter.paint(chunk, a.steps, tile_steps=a.val_tile_steps)
             canvases = [self.eval_painter.composite(lay) for lay in layers]
             per_step.append(torch.stack([psnr(c, chunk) for c in canvases]))  # (steps, b)
             losses.append(self.loss_fn(canvases[-1], chunk)[0] * chunk.shape[0])
+            edge_err.append((image_gradients(canvases[-1]) - image_gradients(chunk)).abs().mean() * chunk.shape[0])
             finals.append(canvases[-1])
         per_step = torch.cat(per_step, dim=1).mean(dim=1)
         n = self.val_targets.shape[0]
-        metrics = {"val_psnr": per_step[-1].item(), "val_loss": (sum(losses) / n).item()}
+        metrics = {"val_psnr": per_step[-1].item(), "val_loss": (sum(losses) / n).item(),
+                   "val_edge_err": (sum(edge_err) / n).item()}  # sharpness check, logged even without --edge-loss
         metrics.update({f"val_psnr_step{k + 1}": v.item() for k, v in enumerate(per_step)})
         save_frame(
             self.out / "samples" / f"epoch_{self.epoch:03d}.png", self.val_targets[:4], torch.cat(finals)[:4],
@@ -527,11 +539,12 @@ class Trainer:
                 panels=(("train_loss", True), ("train_psnr", False), ("val_psnr", False), ("train_entropy", False)),
                 x_key="epoch",
             )
-            val_txt = (f" | val PSNR {row['val_psnr']:.2f} dB (loss {row['val_loss']:.4f})"
+            val_txt = (f" | val PSNR {row['val_psnr']:.2f} dB (loss {row['val_loss']:.4f}, edge err {row['val_edge_err']:.4f})"
                        f"{' * best' if is_best else ''}") if "val_psnr" in row else ""
             preview_txt = f" | preview {row['preview_psnr']:.2f} dB" if "preview_psnr" in row else ""
             tqdm.write(f"epoch {epoch + 1}: train loss {row['train_loss']:.4f}, PSNR {row['train_psnr']:.2f} dB, "
-                       f"entropy {row['train_entropy']:.2f}{val_txt}{preview_txt} | {row['time']:.0f}s")
+                       f"entropy {row['train_entropy']:.2f}, hardness {row['train_hardness']:.2f}"
+                       f"{val_txt}{preview_txt} | {row['time']:.0f}s")
         print(f"done: best val PSNR {self.best_psnr:.2f} dB -> {self.out / 'best.pt'}")
 
     @staticmethod

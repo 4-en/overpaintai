@@ -32,6 +32,26 @@ def test_coarse_terms_see_misplaced_strokes_that_detail_barely_does():
     assert pooled(near, target)[0] == pooled(far, target)[0]
 
 
+def test_edge_loss_prefers_sharp_edges_over_blur():
+    def edge_at(c):
+        x = torch.zeros(1, 3, 32, 32)
+        x[..., c:] = 1.0  # one hard vertical edge
+        return x
+
+    def blur(x, k):
+        return torch.nn.functional.avg_pool2d(x, k, stride=1, padding=k // 2, count_include_pad=False)
+
+    target = edge_at(16)
+    edge = MultiScalePaintLoss(detail_weight=0.0, scales=(), edge_weight=1.0)
+    assert edge(target, target)[0] < 1e-6
+    assert edge(blur(target, 3), target)[1].keys() == {"edge", "sharp"}
+    # A sharp edge slightly off position beats a smeared edge (plain gradient L1 alone would not)
+    assert edge(edge_at(17), target)[0] < edge(blur(target, 3), target)[0]
+    assert edge(edge_at(18), target)[0] < edge(blur(target, 7), target)[0]
+    assert edge(edge_at(20), target)[0] > edge(edge_at(18), target)[0]  # larger misplacement still costs
+    assert MultiScalePaintLoss(edge_weight=0.0)(blur(target, 3), target)[1].keys() == {"detail", "x4", "x16"}
+
+
 def test_masked_loss_ignores_padding():
     loss_fn = MultiScalePaintLoss(scales=(4,))
     pred, target = torch.rand(1, 3, 16, 16), torch.rand(1, 3, 16, 16)

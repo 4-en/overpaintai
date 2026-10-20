@@ -1,12 +1,14 @@
 """Training data: synthetic stroke paintings (with ground-truth strokes) and image folders."""
 
 import hashlib
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 import torch
 from PIL import Image
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from torchvision.transforms import v2 as T
 
@@ -85,6 +87,31 @@ def load_image(path: str, size: int, device: Optional[torch.device] = None) -> t
     return x.unsqueeze(0).to(device)
 
 
+class LogUniformSquareCrop(torch.nn.Module):
+    """
+    Random square crop resized to `size`. The crop's side is sampled log-uniformly between sqrt(lo) and
+    sqrt(hi) of the image's shorter side (`area_range` = (lo, hi) as fractions of that square's area), so
+    every zoom level is equally likely: from native-detail crops (one source pixel per output pixel) to
+    the whole image. Uniform-in-area sampling (torchvision's RandomResizedCrop) makes small crops rare.
+    """
+
+    def __init__(self, size: int, area_range: Tuple[float, float] = (0.01, 1.0)):
+        super().__init__()
+        self.size = size
+        self.side_range = (math.sqrt(area_range[0]), math.sqrt(area_range[1]))
+
+    def forward(self, img: torch.Tensor) -> torch.Tensor:  # (C, H, W)
+        _, H, W = img.shape
+        lo, hi = (math.log(v) for v in self.side_range)
+        frac = math.exp(lo + (hi - lo) * torch.rand(()).item())
+        side = max(1, min(H, W, round(frac * min(H, W))))
+        y = int(torch.randint(0, H - side + 1, ()).item())
+        x = int(torch.randint(0, W - side + 1, ()).item())
+        crop = img[:, y : y + side, x : x + side].unsqueeze(0)
+        return F.interpolate(crop, size=(self.size, self.size), mode="bilinear", antialias=True,
+                             align_corners=False)[0]
+
+
 def list_images(root: str) -> list:
     files = sorted(p for p in Path(root).rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS and p.is_file())
     if not files:
@@ -102,8 +129,9 @@ class ImageFolderDataset(Dataset):
     """
     Square training crops from all images under `root` (recursive).
 
-    Augmentation (train split): random square crops covering a `crop_scale` fraction of the image area
-    (zoom), horizontal / vertical flips, and color jitter. The validation split uses a fixed center
+    Augmentation (train split): random square crops whose side is log-uniform within `crop_scale` (fractions
+    of the area of the shorter side's square, so 0.01 = 10% of the side; see `LogUniformSquareCrop`),
+    horizontal / vertical flips, and color jitter. The validation split uses a fixed center
     crop. Images are padded to square only implicitly: crops are always square, cut from the image.
     """
 
@@ -135,7 +163,7 @@ class ImageFolderDataset(Dataset):
         to_tensor = [T.ToImage(), T.ToDtype(torch.float32, scale=True)]
         if augment and split == "train":
             ops = [
-                T.RandomResizedCrop(image_size, scale=crop_scale, ratio=(1.0, 1.0), antialias=True),
+                LogUniformSquareCrop(image_size, crop_scale),
                 T.RandomHorizontalFlip(hflip),
                 T.RandomVerticalFlip(vflip),
             ]

@@ -30,6 +30,22 @@ def _gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return F.conv2d(x, k.view(1, 1, -1, 1).expand(C, 1, -1, 1), groups=C)
 
 
+def image_gradients(x: torch.Tensor) -> torch.Tensor:
+    """Sobel gradients per channel, `(B, C, H, W)` -> `(B, 2C, H, W)` (x then y), scaled so a unit step is 1."""
+    C = x.shape[1]
+    k = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], device=x.device, dtype=x.dtype) / 4.0
+    kernel = torch.stack([k, k.t()]).unsqueeze(1).repeat(C, 1, 1, 1)  # (2C, 1, 3, 3)
+    return F.conv2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), kernel, groups=C)
+
+
+def local_sharpness(x: torch.Tensor, window: int = 5) -> torch.Tensor:
+    """Strongest gradient magnitude within `window` px of each pixel, `(B, C, H, W)` (per channel)."""
+    g = image_gradients(x)
+    C = x.shape[1]
+    mag = torch.sqrt(g[:, :C] ** 2 + g[:, C:] ** 2 + 1e-8)
+    return F.max_pool2d(mag, window, stride=1, padding=window // 2)
+
+
 def _coarse(x: torch.Tensor, factor: int, mode: str) -> torch.Tensor:
     """
     Low-resolution view of `x` at `factor`. "blur" pools by factor/4 and then Gaussian-blurs, so the
@@ -57,6 +73,12 @@ class MultiScalePaintLoss(nn.Module):
         scales: downsampling factors of the coarse terms, e.g. (4, 16).
         scale_weights: weight per coarse scale (defaults to 1.0 each).
         coarse_mode: "blur" (smooth, overlapping) or "pool" (non-overlapping average pooling).
+        edge_weight: weight of two edge terms (0 disables them):
+            "edge"  - 0.5 x L1 between the image gradients (Sobel): places edges correctly. On its own it
+                      still prefers a smeared edge over a sharp one that is 1-2 px off (same hedging as
+                      pixel L1), hence:
+            "sharp" - L1 between the local maximum gradient magnitudes (5 px window): a sharp edge slightly
+                      off position matches the target's local sharpness, a smeared edge does not.
         extra_terms: optional named terms added on top (e.g. a perceptual or adversarial loss later),
             as `name -> (weight, fn(pred, target, mask))`.
     """
@@ -67,6 +89,7 @@ class MultiScalePaintLoss(nn.Module):
         scales: Sequence[int] = (4, 16),
         scale_weights: Optional[Sequence[float]] = None,
         coarse_mode: str = "blur",
+        edge_weight: float = 0.0,
         extra_terms: Optional[Dict[str, Tuple[float, LossTerm]]] = None,
     ):
         super().__init__()
@@ -76,6 +99,7 @@ class MultiScalePaintLoss(nn.Module):
         assert len(self.scale_weights) == len(self.scales)
         assert coarse_mode in ("blur", "pool")
         self.coarse_mode = coarse_mode
+        self.edge_weight = edge_weight
         self.extra_terms = dict(extra_terms or {})
 
     def forward(
@@ -85,6 +109,12 @@ class MultiScalePaintLoss(nn.Module):
         terms: Dict[str, torch.Tensor] = {}
         if self.detail_weight > 0:
             terms["detail"] = self.detail_weight * _masked_mean((pred - target).abs(), valid_mask)
+
+        if self.edge_weight > 0:
+            diff = (image_gradients(pred) - image_gradients(target)).abs()
+            terms["edge"] = 0.5 * self.edge_weight * _masked_mean(diff, valid_mask)
+            sharp = (local_sharpness(pred) - local_sharpness(target)).abs()
+            terms["sharp"] = self.edge_weight * _masked_mean(sharp, valid_mask)
 
         for factor, weight in zip(self.scales, self.scale_weights):
             if weight <= 0:

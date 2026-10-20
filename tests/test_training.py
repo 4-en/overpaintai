@@ -6,7 +6,7 @@ import torch
 from PIL import Image
 
 from overpaintai import views
-from overpaintai.data import ImageFolderDataset
+from overpaintai.data import ImageFolderDataset, LogUniformSquareCrop
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.train import box_mask, lr_lambda, main
 
@@ -78,6 +78,21 @@ def test_image_folder_split_and_augmentation(image_folder):
     assert torch.equal(val[0], val[0])  # validation crops are deterministic
 
 
+def test_log_uniform_crops_cover_all_zoom_levels():
+    torch.manual_seed(0)
+    crop = LogUniformSquareCrop(16, (0.01, 1.0))
+    img = torch.arange(200 * 300, dtype=torch.float32).view(1, 200, 300).expand(3, -1, -1)
+    assert crop(img).shape == (3, 16, 16)
+    sides = []
+    for _ in range(400):
+        lo, hi = (np.log(v) for v in crop.side_range)
+        sides.append(np.exp(lo + (hi - lo) * torch.rand(()).item()))
+    sides = np.array(sides)
+    assert 0.1 <= sides.min() and sides.max() <= 1.0
+    assert 0.25 < np.median(sides) < 0.40  # geometric mean of 0.1 and 1 is ~0.32
+    assert (sides < 0.2).mean() > 0.2  # small crops are common, not ~3% as with uniform-in-area
+
+
 TINY = (
     "--model-size tiny --image-size 32 --view-res 16 --strokes-per-step 4 --target-strokes 8,12 --steps 2 "
     "--batch-size 4 --steps-per-epoch 3 --val-size 4 --warmup-steps 1 --log-every 1 --num-workers 0 "
@@ -93,7 +108,7 @@ def test_training_modes_checkpoints_and_resume(tmp_path, image_folder):
 
     unroll = tmp_path / "unroll"
     main(TINY + ["--mode", "unroll", "--tile-prob", "1", "--epochs", "1", "--init-from", str(teacher / "best.pt"),
-                 "--out", str(unroll)])
+                 "--edge-loss", "--out", str(unroll)])
     main(TINY + ["--mode", "unroll", "--epochs", "2", "--resume", str(unroll / "last.pt"), "--out", str(unroll)])
     ckpt = torch.load(unroll / "last.pt", weights_only=False)
     assert ckpt["epoch"] == 1 and ckpt["global_step"] == 6 and len(ckpt["history"]) == 2
