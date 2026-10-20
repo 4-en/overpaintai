@@ -58,13 +58,18 @@ def create_app(runs_dir: str = "runs", device: str = None, out_dir: str = None) 
             raise HTTPException(400, str(exc))
 
     @app.post("/api/jobs")
-    async def submit(image: UploadFile = File(...), settings: str = Form(...), mask: UploadFile = File(None)):
+    async def submit(
+        settings: str = Form(...), image: UploadFile = File(None), mask: UploadFile = File(None),
+        parent: str = Form(None),
+    ):
+        """New painting, or with `parent` (a finished painting job) a continuation of it (no image needed)."""
         try:
             raw = json.loads(settings)
             known = {f.name for f in fields(JobSettings)}
             job_settings = JobSettings(**{k: v for k, v in raw.items() if k in known})
             mask_bytes = await mask.read() if mask is not None else None
-            job = manager.submit(await image.read(), mask_bytes, job_settings)
+            image_bytes = await image.read() if image is not None else None
+            job = manager.submit(image_bytes, mask_bytes, job_settings, parent=parent or None)
         except (ValueError, TypeError, json.JSONDecodeError, OSError) as exc:
             raise HTTPException(400, f"invalid request: {exc}")
         return job.summary()
@@ -118,6 +123,18 @@ def create_app(runs_dir: str = "runs", device: str = None, out_dir: str = None) 
     @app.get("/api/jobs/{job_id}/strokes.pt")
     def strokes(job_id: str):
         return result_file(job_id, "strokes.pt", "application/octet-stream")
+
+    @app.post("/api/jobs/{job_id}/video")
+    def video(job_id: str, duration: float = Form(15.0), max_side: int = Form(1080)):
+        """Queues a speed-painting video of a finished painting; returns the video job."""
+        try:
+            return manager.submit_video(job_id, duration, max_side).summary()
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/jobs/{job_id}/video.mp4")
+    def video_file(job_id: str):
+        return result_file(job_id, "timelapse.mp4", "video/mp4")
 
     @app.get("/api/jobs/{job_id}/stats.json")
     def stats(job_id: str):

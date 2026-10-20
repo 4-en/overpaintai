@@ -13,6 +13,8 @@ const state = {
   lastPoint: null,
   job: null,
   events: null,
+  lastDone: null, // last finished painting job (continue / video export start from it)
+  videoEvents: null,
   plan: null,
   startTime: 0,
   timer: null,
@@ -290,16 +292,29 @@ function formatTime(s) {
 function setRunning(running) {
   $("paint").disabled = running || !state.imageFile;
   $("cancel").hidden = !running;
+  $("continue").disabled = running;
+  $("export-video").disabled = running;
+}
+
+function stageKey(name) {
+  return `${state.job}|${name}`;
 }
 
 function buildStageTable(plan) {
   const body = document.querySelector("#stages tbody");
-  body.innerHTML = "";
-  const names = ["whole image", ...plan.levels.map((l) => `tiles ${l}`)];
+  if (plan.continues) {
+    const sep = document.createElement("tr");
+    sep.className = "separator";
+    sep.innerHTML = `<td colspan="5">continued</td>`;
+    body.appendChild(sep);
+  } else {
+    body.innerHTML = "";
+  }
+  const names = [...(plan.whole_steps > 0 ? ["whole image"] : []), ...plan.levels.map((l) => `tiles ${l}`)];
   for (const name of names) {
     const tr = document.createElement("tr");
     tr.className = "pending";
-    tr.dataset.stage = name;
+    tr.dataset.stage = stageKey(name);
     tr.innerHTML = `<td>${name}</td><td>–</td><td>–</td><td>–</td><td>–</td>`;
     body.appendChild(tr);
   }
@@ -307,15 +322,15 @@ function buildStageTable(plan) {
 
 function markActiveStage(name) {
   document.querySelectorAll("#stages tbody tr").forEach((tr) => {
-    tr.classList.toggle("active", tr.dataset.stage === name && tr.classList.contains("pending"));
+    tr.classList.toggle("active", tr.dataset.stage === stageKey(name) && tr.classList.contains("pending"));
   });
 }
 
 function fillStage(stat) {
-  let tr = document.querySelector(`#stages tbody tr[data-stage="${CSS.escape(stat.stage)}"]`);
+  let tr = document.querySelector(`#stages tbody tr[data-stage="${CSS.escape(stageKey(stat.stage))}"]`);
   if (!tr) {
     tr = document.createElement("tr");
-    tr.dataset.stage = stat.stage;
+    tr.dataset.stage = stageKey(stat.stage);
     document.querySelector("#stages tbody").appendChild(tr);
   }
   tr.className = "";
@@ -369,12 +384,18 @@ function finishJob(ev) {
     $("progress-bar").style.width = "100%";
     const last = ev.stats && ev.stats[ev.stats.length - 1];
     $("stage-label").textContent = "done";
-    if (last) $("stats-label").textContent = `${last.strokes} strokes · PSNR ${last.psnr.toFixed(2)} dB · ${formatTime(last.seconds)}`;
+    const total = ev.total_strokes || (last && last.strokes);
+    if (last) $("stats-label").textContent = `${total} strokes · PSNR ${last.psnr.toFixed(2)} dB · ${formatTime(last.seconds)}`;
     const base = `/api/jobs/${state.job}`;
     $("dl-png").href = `${base}/result.png`;
     $("dl-strokes").href = `${base}/strokes.pt`;
     $("dl-stats").href = `${base}/stats.json`;
     $("downloads").hidden = false;
+    state.lastDone = state.job;
+    $("continue-bar").hidden = false;
+    $("video-bar").hidden = false;
+    $("dl-video").hidden = true;
+    $("video-status").textContent = "";
     setMessage("");
   } else if (ev.status === "cancelled") {
     $("stage-label").textContent = "cancelled";
@@ -384,12 +405,26 @@ function finishJob(ev) {
   }
 }
 
-async function startJob() {
-  if (!state.imageFile) return;
+async function startJob(parent = null) {
+  if (!parent && !state.imageFile) return;
   saveSettings();
   const form = new FormData();
-  form.append("image", state.imageFile);
-  form.append("settings", JSON.stringify(collectSettings()));
+  const settings = collectSettings();
+  if (parent) {
+    // Continue the last painting: same image and resolution (server side), the bar's step settings
+    const rounds = Number($("cont-rounds").value);
+    settings.whole_steps = Number($("cont-whole").value);
+    settings.tiles = rounds > 0;
+    settings.rounds = Math.max(1, rounds);
+    settings.min_tile = $("cont-min-tile").value === "" ? null : Number($("cont-min-tile").value);
+    if (settings.whole_steps === 0 && !settings.tiles) return setMessage("Nothing to do: add steps or tile rounds.", true);
+    form.append("parent", parent);
+  } else {
+    form.append("image", state.imageFile);
+    $("continue-bar").hidden = true;
+    $("video-bar").hidden = true;
+  }
+  form.append("settings", JSON.stringify(settings));
   const mask = await maskBlob();
   if (mask) form.append("mask", mask, "mask.png");
 
@@ -399,7 +434,6 @@ async function startJob() {
   $("progress-bar").style.width = "0";
   $("stage-label").textContent = "submitting…";
   $("stats-label").textContent = "";
-  document.querySelector("#stages tbody").innerHTML = "";
 
   const res = await fetch("/api/jobs", { method: "POST", body: form });
   if (!res.ok) {
@@ -422,6 +456,40 @@ async function cancelJob() {
   await fetch(`/api/jobs/${state.job}/cancel`, { method: "POST" });
 }
 
+async function exportVideo() {
+  if (!state.lastDone) return;
+  const form = new FormData();
+  form.append("duration", $("video-duration").value);
+  const res = await fetch(`/api/jobs/${state.lastDone}/video`, { method: "POST", body: form });
+  if (!res.ok) return setMessage(`Video export failed: ${await res.text()}`, true);
+  const job = await res.json();
+  $("export-video").disabled = true;
+  $("dl-video").hidden = true;
+  $("video-status").textContent = "queued…";
+  if (state.videoEvents) state.videoEvents.close();
+  state.videoEvents = new EventSource(`/api/jobs/${job.id}/events`);
+  state.videoEvents.onmessage = (msg) => {
+    const ev = JSON.parse(msg.data);
+    if (ev.type === "plan") {
+      $("video-status").textContent = `rendering ${ev.strokes} strokes…`;
+    } else if (ev.type === "progress") {
+      $("video-status").textContent = `rendering ${Math.round(100 * ev.fraction)}%`;
+    } else if (ev.type === "status" && ["done", "error", "cancelled"].includes(ev.status)) {
+      state.videoEvents.close();
+      state.videoEvents = null;
+      $("export-video").disabled = false;
+      if (ev.status === "done") {
+        $("video-status").textContent = "ready";
+        $("dl-video").href = `/api/jobs/${job.id}/video.mp4`;
+        $("dl-video").hidden = false;
+      } else {
+        $("video-status").textContent = ev.status === "error" ? "failed" : "cancelled";
+        if (ev.error) setMessage(ev.error, true);
+      }
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------------------------------
 function setupCompare() {
   const apply = () => {
@@ -437,7 +505,9 @@ async function init() {
   updateSettingVisibility();
   SETTING_IDS.forEach((id) => $(id).addEventListener("change", () => { updateSettingVisibility(); saveSettings(); }));
   $("checkpoint").addEventListener("change", () => { saveSettings(); loadDefaults(); });
-  $("paint").addEventListener("click", startJob);
+  $("paint").addEventListener("click", () => startJob());
+  $("continue").addEventListener("click", () => startJob(state.lastDone));
+  $("export-video").addEventListener("click", exportVideo);
   $("cancel").addEventListener("click", cancelJob);
   setupDropZone();
   setupMaskEditor();

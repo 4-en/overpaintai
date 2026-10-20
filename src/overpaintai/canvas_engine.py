@@ -43,6 +43,37 @@ def _dab_masks(
 _dab_masks_compiled = torch.compile(_dab_masks, dynamic=True)
 
 
+def _segment_profile(
+    seg: torch.Tensor, grid_x: torch.Tensor, grid_y: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
+) -> torch.Tensor:
+    """
+    Profile of capsule segments `seg` `(B, N, H, W, 8)` (or broadcastable), with the last dimension
+    holding [ax, ay, abx, aby, r_start, r_end, a_start, a_end], evaluated on the pixel grid.
+    """
+    ax, ay, abx, aby, r0, r1, a0, a1 = seg.unbind(dim=-1)
+    apx = grid_x - ax
+    apy = grid_y - ay
+    h = ((apx * abx + apy * aby) / (abx * abx + aby * aby + 1e-8)).clamp(0.0, 1.0)
+    dist_sq = (apx - h * abx) ** 2 + (apy - h * aby) ** 2
+    r_seg = r0 + h * (r1 - r0)
+    a_seg = a0 + h * (a1 - a0)
+    return _brush_profile(dist_sq, r_seg, hardness, edge_sharpness) * a_seg
+
+
+def _best_segment(
+    seg: torch.Tensor, grid_x: torch.Tensor, grid_y: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
+):
+    """Max over all segments `(B, N, 8)` of their profiles, and the winning index, each `(B, 1, H, W)`."""
+    B, N, _ = seg.shape
+    prof = _segment_profile(seg.view(B, N, 1, 1, 8), grid_x, grid_y, hardness, edge_sharpness)
+    return prof.max(dim=1, keepdim=True)
+
+
+# Fusing profile + max avoids ~20 full-size intermediates per segment and stroke, which dominate rendering
+# cost; used for the no-grad winner search on CUDA
+_best_segment_compiled = torch.compile(_best_segment, dynamic=True)
+
+
 def _window_index(base: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     """Flat indices `(B, 4, n)` of a window: per-item start `base` `(B,)` plus shared offsets `offs` `(n,)`."""
     idx = base.view(-1, 1, 1) + offs.view(1, 1, -1)
@@ -140,6 +171,7 @@ class DifferentiableCanvasEngine(nn.Module):
         smudge_length: float = 12.0,
         smudge_max_dabs: int = 128,
         compile_smudge: bool = True,
+        compile_masks: bool = True,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
     ):
@@ -154,6 +186,7 @@ class DifferentiableCanvasEngine(nn.Module):
         self.smudge_length = smudge_length
         self.smudge_max_dabs = smudge_max_dabs
         self.compile_smudge = compile_smudge
+        self.compile_masks = compile_masks
         self.bg_texture_strength = bg_texture_strength
 
         self.register_buffer("bg_color", torch.tensor(bg_color, dtype=torch.float32).view(1, 3, 1, 1))
@@ -208,22 +241,6 @@ class DifferentiableCanvasEngine(nn.Module):
 
         self._cached_hw = (H, W)
 
-    def _segment_profile(
-        self, seg: torch.Tensor, hardness: torch.Tensor, edge_sharpness: float
-    ) -> torch.Tensor:
-        """
-        Profile of capsule segments `seg` `(B, N, H, W, 8)` (or broadcastable), with the last dimension
-        holding [ax, ay, abx, aby, r_start, r_end, a_start, a_end], evaluated on the pixel grid.
-        """
-        ax, ay, abx, aby, r0, r1, a0, a1 = seg.unbind(dim=-1)
-        apx = self.grid_x - ax
-        apy = self.grid_y - ay
-        h = ((apx * abx + apy * aby) / (abx * abx + aby * aby + 1e-8)).clamp(0.0, 1.0)
-        dist_sq = (apx - h * abx) ** 2 + (apy - h * aby) ** 2
-        r_seg = r0 + h * (r1 - r0)
-        a_seg = a0 + h * (a1 - a0)
-        return _brush_profile(dist_sq, r_seg, hardness, edge_sharpness) * a_seg
-
     def _stroke_mask(
         self,
         bx: torch.Tensor,
@@ -252,19 +269,23 @@ class DifferentiableCanvasEngine(nn.Module):
         n_seg = seg.shape[1]
 
         with torch.no_grad():
-            best_val = torch.full((B, 1, H, W), -1.0, device=seg.device, dtype=seg.dtype)
-            best_idx = torch.zeros((B, 1, H, W), device=seg.device, dtype=torch.long)
-            for c in range(0, n_seg, chunk):
-                part = seg[:, c : c + chunk].view(B, -1, 1, 1, 8)
-                val, idx = self._segment_profile(part, hardness, edge_sharpness).max(dim=1, keepdim=True)
-                better = val > best_val
-                best_val = torch.where(better, val, best_val)
-                best_idx = torch.where(better, idx + c, best_idx)
+            if self.compile_masks and seg.is_cuda:
+                best_val, best_idx = _best_segment_compiled(seg, self.grid_x, self.grid_y, hardness, edge_sharpness)
+            else:
+                best_val = torch.full((B, 1, H, W), -1.0, device=seg.device, dtype=seg.dtype)
+                best_idx = torch.zeros((B, 1, H, W), device=seg.device, dtype=torch.long)
+                for c in range(0, n_seg, chunk):
+                    part = seg[:, c : c + chunk].view(B, -1, 1, 1, 8)
+                    val, idx = _segment_profile(part, self.grid_x, self.grid_y, hardness, edge_sharpness).max(
+                        dim=1, keepdim=True)
+                    better = val > best_val
+                    best_val = torch.where(better, val, best_val)
+                    best_idx = torch.where(better, idx + c, best_idx)
 
         if not (torch.is_grad_enabled() and (seg.requires_grad or hardness.requires_grad)):
             return best_val
         winner = torch.gather(seg, 1, best_idx.view(B, H * W, 1).expand(B, H * W, 8))  # (B, H*W, 8)
-        return self._segment_profile(winner.view(B, 1, H, W, 8), hardness, edge_sharpness)
+        return _segment_profile(winner.view(B, 1, H, W, 8), self.grid_x, self.grid_y, hardness, edge_sharpness)
 
     def _smudge(
         self,
@@ -583,31 +604,41 @@ class DifferentiableCanvasEngine(nn.Module):
             c_rgb,
         )
 
+        # Tools whose weight is zero everywhere are skipped when no gradient needs them (e.g. paint-only
+        # inference): the result is the same up to float rounding, and each skipped step saves several
+        # full-canvas passes per stroke.
+        need_all = tool_weights.requires_grad
+
         # 7. STEP B: Smudge / Push — dab-sequential paint transport in premultiplied RGBA
-        premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
-        if tool_weights.requires_grad or bool((w_smudge > 0).any()):
+        if need_all or bool((w_smudge > 0).any()):
+            premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
             ctrl = torch.cat([p[:, 0:6].view(B, 6)] + [v.view(B, 1) for v in (r0, r2, a0, a2)], dim=1)
             premult_rgba = self._smudge(
                 premult_rgba, ctrl, bx, by, hardness.view(B), w_smudge.view(B), edge_sharpness
             )
-        a_after_smudge = premult_rgba[:, 3:4].clamp(0.0, 1.0)
-        rgb_after_smudge = torch.where(
-            a_after_smudge > 1e-5,
-            (premult_rgba[:, :3] / (a_after_smudge + 1e-6)).clamp(0.0, 1.0),
-            rgb_after_paint,
-        )
+            a_after_smudge = premult_rgba[:, 3:4].clamp(0.0, 1.0)
+            rgb_after_smudge = torch.where(
+                a_after_smudge > 1e-5,
+                (premult_rgba[:, :3] / (a_after_smudge + 1e-6)).clamp(0.0, 1.0),
+                rgb_after_paint,
+            )
+        else:
+            a_after_smudge, rgb_after_smudge = a_after_paint, rgb_after_paint
 
         # 8. STEP C: In-Place Isotropic Blur / Blend Tool
-        post_smudge_premult = torch.cat([rgb_after_smudge * a_after_smudge, a_after_smudge], dim=1)
-        blurred_post_smudge = self._gaussian_blur_rgba(post_smudge_premult)
-        blended_blur_premult = (1.0 - blur_mask) * post_smudge_premult + blur_mask * blurred_post_smudge
+        if need_all or bool((w_blur > 0).any()):
+            post_smudge_premult = torch.cat([rgb_after_smudge * a_after_smudge, a_after_smudge], dim=1)
+            blurred_post_smudge = self._gaussian_blur_rgba(post_smudge_premult)
+            blended_blur_premult = (1.0 - blur_mask) * post_smudge_premult + blur_mask * blurred_post_smudge
 
-        a_after_blur = blended_blur_premult[:, 3:4].clamp(0.0, 1.0)
-        rgb_after_blur = torch.where(
-            a_after_blur > 1e-5,
-            (blended_blur_premult[:, :3] / (a_after_blur + 1e-6)).clamp(0.0, 1.0),
-            rgb_after_smudge,
-        )
+            a_after_blur = blended_blur_premult[:, 3:4].clamp(0.0, 1.0)
+            rgb_after_blur = torch.where(
+                a_after_blur > 1e-5,
+                (blended_blur_premult[:, :3] / (a_after_blur + 1e-6)).clamp(0.0, 1.0),
+                rgb_after_smudge,
+            )
+        else:
+            a_after_blur, rgb_after_blur = a_after_smudge, rgb_after_smudge
 
         # 9. STEP D: True Subtractive Eraser (supports both soft and hard erasing via `hardness`)
         a_final = a_after_blur * (1.0 - eraser_mask)

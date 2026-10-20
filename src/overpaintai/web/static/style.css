@@ -159,6 +159,31 @@ button.primary {
 
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
 
+.continue-bar, .video-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.video-bar { margin: 12px 0 0; }
+.continue-bar[hidden], .video-bar[hidden] { display: none; }
+.continue-bar input[type="number"] { width: 64px; margin: 0; }
+.continue-bar select, .video-bar select { width: auto; margin: 0; }
+.bar-title { font-weight: 600; font-size: 13px; }
+button.accent { border-color: var(--accent); color: var(--accent); }
+tr.separator td {
+  color: var(--accent);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  border-bottom-color: var(--accent);
+}
+
 .progress {
   height: 6px;
   border-radius: 6px;

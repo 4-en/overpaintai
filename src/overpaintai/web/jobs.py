@@ -25,6 +25,7 @@ from overpaintai.highres import (
     load_checkpoint_model,
     load_padded,
 )
+from overpaintai.timelapse import render_timelapse
 from overpaintai.viz import to_uint8
 
 PREVIEW_INTERVAL = 1.0  # seconds between live previews (stage ends always get one)
@@ -52,7 +53,7 @@ class JobSettings:
         self.max_tiles = int(min(256, max(1, self.max_tiles)))
         self.num_stamps = int(min(128, max(8, self.num_stamps)))
         if self.whole_steps is not None:
-            self.whole_steps = int(min(256, max(1, self.whole_steps)))
+            self.whole_steps = int(min(256, max(0, self.whole_steps)))  # 0: tiles only (e.g. when continuing)
         if self.min_tile is not None and not 0 < self.min_tile <= 0.5:
             raise ValueError("min_tile must be in (0, 0.5]")
 
@@ -72,14 +73,21 @@ class Job:
     cancel_requested: bool = False
     image_bytes: bytes = b""
     mask_bytes: Optional[bytes] = None
+    kind: str = "paint"  # paint | video
+    parent: Optional[str] = None  # paint job this one continues (paint) or replays (video)
+    whole_done: int = 0  # whole-image steps painted so far, including all parents
+    video_duration: float = 15.0
+    video_max_side: int = 1080
+    total_strokes: int = 0  # strokes in the painting so far, including all parents
 
     def push(self, event: Dict):
         event = {"seq": len(self.events), "time": time.time(), **event}
         self.events.append(event)
 
     def summary(self) -> Dict:
-        return {"id": self.id, "status": self.status, "error": self.error, "settings": asdict(self.settings),
-                "stats": self.stats, "preview_version": self.preview_version, "events": len(self.events)}
+        return {"id": self.id, "kind": self.kind, "parent": self.parent, "status": self.status, "error": self.error,
+                "settings": asdict(self.settings), "stats": self.stats, "preview_version": self.preview_version,
+                "events": len(self.events)}
 
 
 # ----------------------------------------------------------------------------------------------------
@@ -161,18 +169,50 @@ class JobManager:
             raise ValueError(f"checkpoint must be an existing .pt file inside {self.runs_dir}")
         return p
 
-    def submit(self, image_bytes: bytes, mask_bytes: Optional[bytes], settings: JobSettings) -> Job:
+    def _finished_paint_job(self, job_id: str) -> Job:
+        parent = self.jobs.get(job_id)
+        if parent is None or parent.kind != "paint" or parent.status != "done":
+            raise ValueError("the job to continue from must be a finished painting")
+        return parent
+
+    def _enqueue(self, job: Job) -> Job:
+        self.jobs[job.id] = job
+        job.push({"type": "status", "status": "queued", "position": self.queue.qsize()})
+        self.queue.put(job.id)
+        return job
+
+    def submit(
+        self, image_bytes: Optional[bytes], mask_bytes: Optional[bytes], settings: JobSettings,
+        parent: Optional[str] = None,
+    ) -> Job:
+        """
+        Queues a painting. With `parent` (a finished painting job) it continues that painting: same image and
+        resolution, starting from its paint layer, so further steps / finer tiles add to it.
+        """
         settings.validate()
         settings.checkpoint = str(self.resolve_checkpoint(settings.checkpoint))
+        if parent is not None:
+            source = self._finished_paint_job(parent)
+            settings.size = source.settings.size
+            image_bytes = (source.out_dir / "source.img").read_bytes()
+        if not image_bytes:
+            raise ValueError("an image is required")
         Image.open(io.BytesIO(image_bytes)).verify()  # reject non-images early
         if mask_bytes:
             Image.open(io.BytesIO(mask_bytes)).verify()
         job_id = uuid.uuid4().hex[:12]
-        job = Job(job_id, settings, self.out_dir / job_id, image_bytes=image_bytes, mask_bytes=mask_bytes or None)
-        self.jobs[job_id] = job
-        job.push({"type": "status", "status": "queued", "position": self.queue.qsize()})
-        self.queue.put(job_id)
-        return job
+        job = Job(job_id, settings, self.out_dir / job_id, image_bytes=image_bytes, mask_bytes=mask_bytes or None,
+                  parent=parent)
+        return self._enqueue(job)
+
+    def submit_video(self, paint_job: str, duration: float, max_side: int = 1080) -> Job:
+        """Queues a speed-painting video of a finished painting (including everything it continued)."""
+        source = self._finished_paint_job(paint_job)
+        duration = float(min(60.0, max(3.0, duration)))
+        # The video is written next to the painting it shows
+        job = Job(uuid.uuid4().hex[:12], source.settings, source.out_dir, kind="video", parent=paint_job,
+                  video_duration=duration, video_max_side=int(min(2160, max(128, max_side))))
+        return self._enqueue(job)
 
     def cancel(self, job: Job):
         job.cancel_requested = True
@@ -189,10 +229,10 @@ class JobManager:
             job.status = "running"
             job.push({"type": "status", "status": "running"})
             try:
-                self._run(job)
+                self._run_video(job) if job.kind == "video" else self._run(job)
                 job.status = "done"
-                job.push({"type": "status", "status": "done", "stats": job.stats})
-            except PaintCancelled:
+                job.push({"type": "status", "status": "done", "stats": job.stats, "total_strokes": job.total_strokes})
+            except (PaintCancelled, InterruptedError):
                 job.status = "cancelled"
                 job.push({"type": "status", "status": "cancelled"})
             except Exception as exc:  # report any failure to the browser instead of killing the worker
@@ -236,9 +276,16 @@ class JobManager:
             importance, _, _, _ = load_padded(job.mask_bytes, s.size, self.device, mode="L")
             importance = importance * valid
 
+        initial_layer, prior_strokes, whole_done = None, None, 0
+        if job.parent is not None:  # continue a finished painting
+            parent = self.jobs[job.parent]
+            initial_layer = torch.load(parent.out_dir / "layer.pt", map_location=self.device).float()
+            prior_strokes = torch.load(parent.out_dir / "strokes.pt", weights_only=False)["strokes"]
+            whole_done = parent.whole_done
+
         levels = [f"1/{round(1 / c)}" for c in painter.core_sizes(src_side)] if s.tiles else []
         job.push({"type": "plan", "whole_steps": cfg.whole_steps, "levels": levels, "rounds": cfg.rounds_per_level,
-                  "size": s.size, "content": list(wh), "source_side": src_side})
+                  "size": s.size, "content": list(wh), "source_side": src_side, "continues": job.parent})
         last_preview = [0.0]
 
         def on_progress(event: Dict, get_canvas):
@@ -260,16 +307,42 @@ class JobManager:
         result = painter.paint(
             target, src_side, valid=valid, importance=importance, log=lambda *_: None,
             on_progress=on_progress, should_stop=lambda: job.cancel_requested, on_stage=on_stage,
+            initial_layer=initial_layer, whole_done=whole_done,
         )
         job.stats = result.stats
+        job.whole_done = whole_done + cfg.whole_steps
         w, h = wh
         out = job.out_dir
         out.mkdir(parents=True, exist_ok=True)
+        (out / "source.img").write_bytes(job.image_bytes)  # for continuing this painting later
+        torch.save(result.layer.half().cpu(), out / "layer.pt")
         Image.fromarray(to_uint8(result.canvas[0, :, :h, :w])).save(out / "final.png")
         Image.fromarray(to_uint8(target[0, :, :h, :w])).save(out / "target.png")
-        torch.save({"strokes": torch.cat(result.strokes), "size": s.size, "content_wh": wh,
+        new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, 14)
+        strokes = new if prior_strokes is None else torch.cat([prior_strokes, new])  # the whole history
+        job.total_strokes = int(strokes.shape[0])
+        torch.save({"strokes": strokes, "size": s.size, "content_wh": wh, "num_stamps": s.num_stamps,
+                    "min_radius": painter.min_radius, "max_radius": painter.max_radius,
                     "format": "points(6), radii(2), opacity(2), hardness, color(3); image coords"}, out / "strokes.pt")
         (out / "stats.json").write_text(json.dumps({"settings": asdict(s), "stages": result.stats}, indent=2))
         job.preview = _encode_preview(result.canvas, wh)
         job.preview_version += 1
         job.push({"type": "preview", "preview": job.preview_version})
+
+    @torch.no_grad()
+    def _run_video(self, job: Job):
+        data = torch.load(job.out_dir / "strokes.pt", weights_only=False)
+        n = data["strokes"].shape[0]
+        job.push({"type": "plan", "video": True, "strokes": n, "duration": job.video_duration})
+        start = time.time()
+
+        def on_progress(fraction: float):
+            job.push({"type": "progress", "kind": "video", "stage": "rendering video", "fraction": fraction,
+                      "strokes": n, "seconds": time.time() - start})
+
+        render_timelapse(
+            data["strokes"], data["size"], tuple(data["content_wh"]), job.out_dir / "timelapse.mp4",
+            duration=job.video_duration, max_side=job.video_max_side, num_stamps=data.get("num_stamps", 32),
+            min_radius=data.get("min_radius", 1e-4), max_radius=data.get("max_radius", 0.75), device=self.device,
+            on_progress=on_progress, should_stop=lambda: job.cancel_requested,
+        )

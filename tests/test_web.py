@@ -106,3 +106,60 @@ def test_placeholder_auto_mask(client):
     assert mask.size == (80, 60) and mask.mode == "L"
     assert mask.getpixel((40, 22)) > mask.getpixel((2, 58))  # brighter in the upper middle
     assert c.post("/api/mask/auto", data={"mode": "x"}, files={"image": ("i.png", _png(), "image/png")}).status_code == 400
+
+
+def _paint(c, ckpt, **extra):
+    settings = {"checkpoint": ckpt, "size": 128, "whole_steps": 2, "rounds": 1, "max_tiles": 2, "min_tile": 0.25,
+                "threshold": 0.0, "num_stamps": 16, **extra}
+    job = c.post("/api/jobs", data={"settings": json.dumps(settings)},
+                 files={"image": ("img.png", _png(), "image/png")}).json()
+    status = _wait(c, job["id"])
+    assert status["status"] == "done", status
+    return job["id"]
+
+
+def test_continue_from_a_finished_painting(client, tmp_path):
+    c, ckpt = client
+    first = _paint(c, ckpt)
+    before = torch.load(tmp_path / "runs" / "web" / first / "strokes.pt", weights_only=False)["strokes"]
+
+    # Continue: no image needed, size comes from the parent, tiles only
+    settings = {"checkpoint": ckpt, "size": 999, "whole_steps": 0, "rounds": 1, "max_tiles": 2, "min_tile": 0.125,
+                "threshold": 0.0, "num_stamps": 16}
+    job = c.post("/api/jobs", data={"settings": json.dumps(settings), "parent": first}).json()
+    status = _wait(c, job["id"])
+    assert status["status"] == "done", status
+    assert status["parent"] == first and status["settings"]["size"] == 128
+    assert [s["stage"] for s in status["stats"]] == ["tiles 1/2", "tiles 1/4", "tiles 1/8"]  # no whole stage
+
+    after = torch.load(tmp_path / "runs" / "web" / job["id"] / "strokes.pt", weights_only=False)["strokes"]
+    assert after.shape[0] > before.shape[0] and torch.equal(after[: before.shape[0]], before)  # history kept
+    plan = next(e for e in c.get(f"/api/jobs/{job['id']}/events").text.splitlines() if '"plan"' in e)
+    assert first in plan  # the plan event says which painting it continues
+
+    # Only finished paintings can be continued
+    r = c.post("/api/jobs", data={"settings": json.dumps(settings), "parent": "nope"})
+    assert r.status_code == 400
+
+
+def test_speed_painting_video_export(client):
+    import shutil
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    c, ckpt = client
+    painting = _paint(c, ckpt)
+    video = c.post(f"/api/jobs/{painting}/video", data={"duration": 3, "max_side": 128}).json()
+    assert video["kind"] == "video" and video["parent"] == painting
+    assert _wait(c, video["id"])["status"] == "done"
+    mp4 = c.get(f"/api/jobs/{video['id']}/video.mp4")
+    assert mp4.status_code == 200 and mp4.content[4:8] == b"ftyp"  # an MP4 container
+    assert c.post("/api/jobs/nope/video", data={"duration": 10}).status_code == 400
+
+
+def test_stroke_schedule_is_slow_first_and_complete():
+    from overpaintai.timelapse import stroke_schedule
+
+    s = stroke_schedule(1000, 100)
+    assert s[-1] == 1000 and s == sorted(s)
+    assert s[49] < 300  # half the time shows well under half the strokes (big early strokes get more time)

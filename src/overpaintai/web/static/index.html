@@ -117,6 +117,20 @@
             <a id="dl-stats" class="button ghost" download>stats.json</a>
           </div>
         </div>
+        <div class="continue-bar" id="continue-bar" hidden>
+          <span class="bar-title">Keep painting</span>
+          <label class="inline">+ whole steps <input id="cont-whole" type="number" min="0" max="256" value="0"></label>
+          <label class="inline">tile rounds <input id="cont-rounds" type="number" min="0" max="8" value="2"></label>
+          <label class="inline">smallest tile
+            <select id="cont-min-tile">
+              <option value="">auto</option>
+              <option value="0.125">1/8</option>
+              <option value="0.0625" selected>1/16</option>
+              <option value="0.03125">1/32</option>
+            </select>
+          </label>
+          <button id="continue" class="accent">Continue ▶</button>
+        </div>
         <div id="paint-stage" class="stage empty">
           <div class="drop-hint">The painting appears here while it is being made</div>
           <div class="stack compare" id="paint-stack" hidden>
@@ -131,6 +145,18 @@
         <div class="status-line">
           <span id="stage-label">idle</span>
           <span id="stats-label" class="muted"></span>
+        </div>
+        <div class="video-bar" id="video-bar" hidden>
+          <span class="bar-title">Speed-painting video</span>
+          <select id="video-duration">
+            <option value="10">10 s</option>
+            <option value="15" selected>15 s</option>
+            <option value="20">20 s</option>
+            <option value="30">30 s</option>
+          </select>
+          <button id="export-video">Export video</button>
+          <span id="video-status" class="muted"></span>
+          <a id="dl-video" class="button ghost" download hidden>video.mp4</a>
         </div>
       </div>
     </div>

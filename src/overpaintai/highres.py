@@ -119,6 +119,87 @@ def _smoothstep(x: torch.Tensor) -> torch.Tensor:
     return x * x * (3.0 - 2.0 * x)
 
 
+class CropRenderer:
+    """
+    Renders image-space strokes onto a square paint layer of `size` px, each batch of strokes only inside a
+    square crop of the canvas that contains their footprint (identical to a full-canvas render, since the
+    renderer is resolution-independent, at a fraction of the cost). Shared by painting and video replay.
+    """
+
+    def __init__(self, size: int, num_stamps: int, min_radius: float, max_radius: float, device, tool: int = 0):
+        self.S = size
+        self.num_stamps = num_stamps
+        self.min_radius = min_radius
+        self.max_radius = max_radius
+        self.device = torch.device(device)
+        self.tool = tool
+        self.engine = self._engine(size, 1.0)
+        self.background = self.engine.create_background(1, size, size, self.device)
+        self._crop_engines: Dict[int, DifferentiableCanvasEngine] = {}
+
+    def _engine(self, n: int, scale: float) -> DifferentiableCanvasEngine:
+        """Engine for an n-px canvas covering `scale` of the image side (radii in its own units)."""
+        return DifferentiableCanvasEngine(
+            canvas_size=n, num_stamps=self.num_stamps,
+            min_radius=self.min_radius / scale, max_radius=self.max_radius / scale,
+        ).to(self.device).eval()
+
+    def blank(self) -> torch.Tensor:
+        return self.engine.create_blank_paint_layer(1, self.S, self.S, self.device)
+
+    def composite(self, layer: torch.Tensor) -> torch.Tensor:
+        return self.engine.composite(layer, self.background)
+
+    @torch.no_grad()
+    def render(self, layer: torch.Tensor, strokes: views.Strokes) -> torch.Tensor:
+        """Renders image-space strokes `(1, N)` in order onto `layer` (in place) and returns it."""
+        if strokes.radii.shape[1] == 0:
+            return layer
+        S = self.S
+        r = strokes.radii.amax(-1)  # (1, N)
+        soft = (strokes.hardness[..., 0] < 0.999).float()
+        ext = r * (1.0 + 1.15 * soft) + 3.0 / (S - 1)  # soft profile reaches ~2.15 r
+        pts = strokes.points  # (1, N, 3, 2)
+        lo = (pts.amin(dim=2) - ext.unsqueeze(-1)).amin(dim=1)[0].clamp(0, 1)  # (2,)
+        hi = (pts.amax(dim=2) + ext.unsqueeze(-1)).amax(dim=1)[0].clamp(0, 1)
+        x0, y0 = math.floor(lo[0].item() * (S - 1)), math.floor(lo[1].item() * (S - 1))
+        x1, y1 = math.ceil(hi[0].item() * (S - 1)), math.ceil(hi[1].item() * (S - 1))
+        n = min(S, max(x1 - x0, y1 - y0) + 1)
+        x0, y0 = min(x0, S - n), min(y0, S - n)
+        box = torch.tensor([[x0 / (S - 1), y0 / (S - 1), (n - 1) / (S - 1)]], device=self.device)
+
+        if n not in self._crop_engines:
+            self._crop_engines[n] = self._engine(n, (n - 1) / (S - 1)) if n < S else self.engine
+        eng = self._crop_engines[n]
+        params = views.to_engine_params(views.image_to_view(strokes, box), eng)
+        tools = torch.zeros(1, params.shape[1], eng.NUM_TOOLS, device=self.device)
+        tools[..., self.tool] = 1.0
+        crop = layer[:, :, y0 : y0 + n, x0 : x0 + n].contiguous()
+        layer[:, :, y0 : y0 + n, x0 : x0 + n] = eng(crop, params, tools)  # in place (no autograd here)
+        return layer
+
+
+def pack_strokes(s: views.Strokes) -> torch.Tensor:
+    """Image-space strokes `(1, N)` as `(N, 14)`: points (6), radii (2), opacity (2), hardness, color (3)."""
+    N = s.radii.shape[1]
+    return torch.cat([s.points.reshape(1, N, 6), s.radii, s.opacity, s.hardness, s.color], dim=-1)[0]
+
+
+def unpack_strokes(t: torch.Tensor) -> views.Strokes:
+    """Inverse of `pack_strokes`: `(N, 14)` -> `Strokes` with batch 1."""
+    t = t.unsqueeze(0)
+    N = t.shape[1]
+    return views.Strokes(points=t[..., 0:6].reshape(1, N, 3, 2), radii=t[..., 6:8], opacity=t[..., 8:10],
+                         hardness=t[..., 10:11], color=t[..., 11:14])
+
+
+def radius_limits(model: StrokePredictor, size: int) -> Tuple[float, float]:
+    """Engine radius range for painting at `size` px: down to the model's smallest stroke in the smallest
+    tile (but not below a quarter pixel), up to canvas-filling."""
+    lo, hi = model.radius_range
+    return max(0.25 / (size - 1), lo / 64.0), hi
+
+
 class HighResPainter:
     """
     Args:
@@ -149,55 +230,16 @@ class HighResPainter:
         self.cfg = config or HighResConfig()
         self.autocast = autocast
         self.device = device or next(model.parameters()).device
-        # Radii down to the model's smallest stroke in the smallest tile, and up to canvas-filling
-        lo, hi = model.radius_range
-        self.min_radius = max(0.25 / (size - 1), lo / 64.0)
-        self.max_radius = hi
-        self.engine = self._engine(size, 1.0)
-        self.background = self.engine.create_background(1, size, size, self.device)
-        self._crop_engines: Dict[int, DifferentiableCanvasEngine] = {}
-
-    # --- rendering --------------------------------------------------------------------------------
-    def _engine(self, n: int, scale: float) -> DifferentiableCanvasEngine:
-        """Engine for an n-px canvas covering `scale` of the image side (radii in its own units)."""
-        return DifferentiableCanvasEngine(
-            canvas_size=n, num_stamps=self.num_stamps,
-            min_radius=self.min_radius / scale, max_radius=self.max_radius / scale,
-        ).to(self.device).eval()
+        self.min_radius, self.max_radius = radius_limits(model, size)
+        self.renderer = CropRenderer(size, num_stamps, self.min_radius, self.max_radius, self.device, tool)
+        self.engine = self.renderer.engine
+        self.background = self.renderer.background
 
     def composite(self, layer: torch.Tensor) -> torch.Tensor:
-        return self.engine.composite(layer, self.background)
+        return self.renderer.composite(layer)
 
-    @torch.no_grad()
     def render(self, layer: torch.Tensor, strokes: views.Strokes) -> torch.Tensor:
-        """
-        Renders image-space strokes `(1, N)` in order, only inside a square crop of the canvas that contains
-        their footprint (identical to a full-canvas render; the renderer is resolution-independent).
-        """
-        if strokes.radii.shape[1] == 0:
-            return layer
-        S = self.S
-        r = strokes.radii.amax(-1)  # (1, N)
-        soft = (strokes.hardness[..., 0] < 0.999).float()
-        ext = r * (1.0 + 1.15 * soft) + 3.0 / (S - 1)  # soft profile reaches ~2.15 r
-        pts = strokes.points  # (1, N, 3, 2)
-        lo = (pts.amin(dim=2) - ext.unsqueeze(-1)).amin(dim=1)[0].clamp(0, 1)  # (2,)
-        hi = (pts.amax(dim=2) + ext.unsqueeze(-1)).amax(dim=1)[0].clamp(0, 1)
-        x0, y0 = math.floor(lo[0].item() * (S - 1)), math.floor(lo[1].item() * (S - 1))
-        x1, y1 = math.ceil(hi[0].item() * (S - 1)), math.ceil(hi[1].item() * (S - 1))
-        n = min(S, max(x1 - x0, y1 - y0) + 1)
-        x0, y0 = min(x0, S - n), min(y0, S - n)
-        box = torch.tensor([[x0 / (S - 1), y0 / (S - 1), (n - 1) / (S - 1)]], device=self.device)
-
-        if n not in self._crop_engines:
-            self._crop_engines[n] = self._engine(n, (n - 1) / (S - 1)) if n < S else self.engine
-        eng = self._crop_engines[n]
-        params = views.to_engine_params(views.image_to_view(strokes, box), eng)
-        tools = torch.zeros(1, params.shape[1], eng.NUM_TOOLS, device=self.device)
-        tools[..., self.tool] = 1.0
-        crop = layer[:, :, y0 : y0 + n, x0 : x0 + n].contiguous()
-        layer[:, :, y0 : y0 + n, x0 : x0 + n] = eng(crop, params, tools)  # in place (no autograd here)
-        return layer
+        return self.renderer.render(layer, strokes)
 
     # --- model ------------------------------------------------------------------------------------
     def _autocast(self):
@@ -314,6 +356,8 @@ class HighResPainter:
         on_progress: Optional[Callable[[Dict, Callable[[], torch.Tensor]], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         on_stage: Optional[Callable[[Dict], None]] = None,
+        initial_layer: Optional[torch.Tensor] = None,
+        whole_done: int = 0,
     ) -> PaintResult:
         """
         Args:
@@ -327,10 +371,14 @@ class HighResPainter:
                 canvas `(1, 3, S, S)` on demand (so callers can throttle previews cheaply).
             should_stop: checked at the same points; returning True raises `PaintCancelled`.
             on_stage: called with each stage's stats (stage, strokes, tiles, psnr, seconds) when it ends.
+            initial_layer: (1, 4, S, S) paint layer to continue from (e.g. an earlier result) instead of a
+                blank canvas; it is not modified.
+            whole_done: whole-image steps already painted on `initial_layer`, so progress continues from
+                there: step k gets progress (whole_done + k) / (whole_done + whole_steps).
         """
-        cfg, S, A = self.cfg, self.S, min(self.cfg.analysis_res, self.S)
+        cfg, A = self.cfg, min(self.cfg.analysis_res, self.S)
         t0 = time.time()
-        layer = self.engine.create_blank_paint_layer(1, S, S, self.device)
+        layer = self.renderer.blank() if initial_layer is None else initial_layer.to(self.device).float().clone()
         result = PaintResult(layer=layer, canvas=self.composite(layer))
         target_a = F.interpolate(target, size=(A, A), mode="area")
         weight_a = torch.ones(1, 1, A, A, device=self.device)
@@ -367,14 +415,16 @@ class HighResPainter:
 
         # 1. Whole-image steps
         whole = views.whole_image_boxes(1, self.device)
+        whole_total = max(1, whole_done + cfg.whole_steps)
         for k in range(cfg.whole_steps):
-            out = self.predict(target, result.layer, whole, k / max(1, cfg.whole_steps))
+            out = self.predict(target, result.layer, whole, (whole_done + k) / whole_total)
             strokes = views.view_to_image(out.strokes, whole)
             result.layer = self.render(result.layer, strokes)
-            result.strokes.append(self._pack(strokes))
+            result.strokes.append(pack_strokes(strokes).cpu())
             n_strokes += strokes.radii.shape[1]
             progress({"stage": "whole image", "kind": "whole", "step": k + 1, "steps": cfg.whole_steps}, k + 1)
-        record("whole image")
+        if cfg.whole_steps > 0:
+            record("whole image")
 
         # 2. Tile levels
         for level, core in enumerate(cores_plan):
@@ -400,7 +450,7 @@ class HighResPainter:
                         color=img.color[t : t + 1, keep],
                     )
                     result.layer = self.render(result.layer, tile)
-                    result.strokes.append(self._pack(tile))
+                    result.strokes.append(pack_strokes(tile).cpu())
                     n_strokes += tile.radii.shape[1]
                 level_tiles += cores.shape[0]
                 progress({"stage": label, "kind": "tiles", "round": rnd + 1, "rounds": cfg.rounds_per_level,
@@ -409,9 +459,3 @@ class HighResPainter:
 
         result.canvas = self.composite(result.layer)
         return result
-
-    @staticmethod
-    def _pack(s: views.Strokes) -> torch.Tensor:
-        """Image-space strokes as (N, 14): points (6), radii (2), opacity (2), hardness, color (3)."""
-        N = s.radii.shape[1]
-        return torch.cat([s.points.reshape(1, N, 6), s.radii, s.opacity, s.hardness, s.color], dim=-1)[0].cpu()
