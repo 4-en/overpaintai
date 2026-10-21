@@ -28,8 +28,9 @@ class Strokes:
     Strokes in physical units of some coordinate frame (a view, or the whole image).
 
     points:   (B, N, 3, 2) Bezier start / control / end points (x, y)
-    radii:    (B, N, 2) start / end radius, in the same units as the points
-    opacity:  (B, N, 2) start / end opacity in [0.05, 1]
+    radii:    (B, N, 2) start / end radius, in the same units as the points; (B, N, 3) [start, end, mid]
+              with a pressure curve (control value of a quadratic profile along the stroke, see the engine)
+    opacity:  (B, N, 2) start / end opacity in [0.05, 1]; (B, N, 3) [start, end, mid] likewise
     hardness: (B, N, 1) in [0, 1]
     color:    (B, N, 3) RGB in [0, 1]
     """
@@ -222,34 +223,37 @@ def image_to_view(strokes: Strokes, boxes: torch.Tensor) -> Strokes:
 
 def to_engine_params(strokes: Strokes, engine: DifferentiableCanvasEngine, clamp_points: bool = True) -> torch.Tensor:
     """
-    Encodes image-space strokes as the engine's `(B, N, 14)` parameters in [0, 1]. Radii are clamped to the
+    Encodes image-space strokes as the engine's `(B, N, 14)` parameters in [0, 1] (`(B, N, 16)` for strokes with
+    a pressure curve: the middle radius / opacity appended). Radii are clamped to the
     engine's [min_radius, max_radius]; engines meant for high resolutions can use a smaller `min_radius`.
     With `clamp_points=False`, points may lie outside the canvas (e.g. when rendering a stroke piecewise
     into a crop that only covers part of it).
     """
     B, N = strokes.radii.shape[:2]
-    r = (strokes.radii - engine.min_radius) / (engine.max_radius - engine.min_radius)
+    r = ((strokes.radii - engine.min_radius) / (engine.max_radius - engine.min_radius)).clamp(0.0, 1.0)
     lo = engine.min_opacity
-    a = (strokes.opacity - lo) / (1.0 - lo)
-    return torch.cat(
-        [
-            strokes.points.reshape(B, N, 6).clamp(0.0, 1.0) if clamp_points else strokes.points.reshape(B, N, 6),
-            r.clamp(0.0, 1.0),
-            a.clamp(0.0, 1.0),
-            strokes.hardness,
-            strokes.color,
-        ],
-        dim=-1,
-    )
+    a = ((strokes.opacity - lo) / (1.0 - lo)).clamp(0.0, 1.0)
+    parts = [
+        strokes.points.reshape(B, N, 6).clamp(0.0, 1.0) if clamp_points else strokes.points.reshape(B, N, 6),
+        r[..., :2],
+        a[..., :2],
+        strokes.hardness,
+        strokes.color,
+    ]
+    if r.shape[-1] == 3:  # pressure curve
+        parts += [r[..., 2:], a[..., 2:]]
+    return torch.cat(parts, dim=-1)
 
 
 def from_engine_params(params: torch.Tensor, engine: DifferentiableCanvasEngine) -> Strokes:
-    """Decodes the engine's `(B, N, 14)` parameters into image-space `Strokes`."""
+    """Decodes the engine's `(B, N, 14)` (or `(B, N, 16)`, with a pressure curve) parameters into image-space
+    `Strokes`."""
     B, N = params.shape[:2]
+    r_idx, a_idx = ([6, 7, 14], [8, 9, 15]) if params.shape[-1] == 16 else ([6, 7], [8, 9])
     return Strokes(
         points=params[..., 0:6].reshape(B, N, 3, 2),
-        radii=engine.min_radius + params[..., 6:8] * (engine.max_radius - engine.min_radius),
-        opacity=engine.min_opacity + (1.0 - engine.min_opacity) * params[..., 8:10],
+        radii=engine.min_radius + params[..., r_idx] * (engine.max_radius - engine.min_radius),
+        opacity=engine.min_opacity + (1.0 - engine.min_opacity) * params[..., a_idx],
         hardness=params[..., 10:11],
         color=params[..., 11:14],
     )

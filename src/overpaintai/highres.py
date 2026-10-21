@@ -29,6 +29,7 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.metrics import ACTIVE_OPACITY
 from overpaintai.model import StrokePredictor
+from overpaintai.plan_model import build_model
 
 
 @dataclass
@@ -110,7 +111,7 @@ def config_from_checkpoint(ckpt: Dict, **overrides) -> Tuple[HighResConfig, int,
 def load_checkpoint_model(path: str, device: torch.device) -> Tuple[StrokePredictor, Dict]:
     """Rebuilds the model of a training checkpoint (EMA weights when available)."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = StrokePredictor(**ckpt["model_config"])
+    model = build_model(ckpt["model_config"])
     model.load_state_dict(ckpt.get("ema") or ckpt["model"])
     return model.to(device).eval(), ckpt
 
@@ -218,18 +219,34 @@ class CropRenderer:
         layer[:, :, y0 : y0 + h, x0 : x0 + w] = eng(crop, params, tools)[:, :, :h, :w]  # in place (no autograd)
 
 
+STROKE_FORMAT = "points(6), radii(2), opacity(2), hardness, color(3), mid radius, mid opacity; image coords"
+
+
 def pack_strokes(s: views.Strokes) -> torch.Tensor:
-    """Image-space strokes `(1, N)` as `(N, 14)`: points (6), radii (2), opacity (2), hardness, color (3)."""
+    """
+    Image-space strokes `(1, N)` as `(N, 16)`: points (6), radii (2), opacity (2), hardness, color (3), middle
+    radius and opacity (the pressure curve; the mean of the ends for strokes without one, which renders the
+    same linear profile).
+    """
     N = s.radii.shape[1]
-    return torch.cat([s.points.reshape(1, N, 6), s.radii, s.opacity, s.hardness, s.color], dim=-1)[0]
+    r, a = s.radii, s.opacity
+    mid = [r[..., 2:], a[..., 2:]] if r.shape[-1] == 3 else [r.mean(-1, keepdim=True), a.mean(-1, keepdim=True)]
+    return torch.cat([s.points.reshape(1, N, 6), r[..., :2], a[..., :2], s.hardness, s.color] + mid, dim=-1)[0]
+
+
+def pad_strokes(t: torch.Tensor) -> torch.Tensor:
+    """Older `(N, 14)` stroke records -> `(N, 16)` (linear pressure: middle = mean of the ends)."""
+    if t.shape[-1] == 16:
+        return t
+    return torch.cat([t, t[..., 6:8].mean(-1, keepdim=True), t[..., 8:10].mean(-1, keepdim=True)], dim=-1)
 
 
 def unpack_strokes(t: torch.Tensor) -> views.Strokes:
-    """Inverse of `pack_strokes`: `(N, 14)` -> `Strokes` with batch 1."""
-    t = t.unsqueeze(0)
+    """Inverse of `pack_strokes`: `(N, 16)` (or older `(N, 14)`) -> `Strokes` with batch 1."""
+    t = pad_strokes(t).unsqueeze(0)
     N = t.shape[1]
-    return views.Strokes(points=t[..., 0:6].reshape(1, N, 3, 2), radii=t[..., 6:8], opacity=t[..., 8:10],
-                         hardness=t[..., 10:11], color=t[..., 11:14])
+    return views.Strokes(points=t[..., 0:6].reshape(1, N, 3, 2), radii=t[..., [6, 7, 14]],
+                         opacity=t[..., [8, 9, 15]], hardness=t[..., 10:11], color=t[..., 11:14])
 
 
 def render_strokes(

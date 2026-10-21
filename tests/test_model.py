@@ -174,3 +174,42 @@ def test_stationary_model_ignores_the_step_and_hard_gate_is_on_or_off():
     assert (out.gate == 0).all()
     grad, = torch.autograd.grad(out.gate.sum(), model.attr_mlp[-1].bias)
     assert grad[-1] > 0  # straight-through (+ leak): an off stroke still learns whether to switch on
+
+
+def test_placement_noise_varies_training_draws_and_replays():
+    torch.manual_seed(8)
+    model = _small_model(stroke_gate=True, hard_gate=True)
+    model.placement_noise = 1.0
+    x, boxes = torch.randn(2, 12, R, R), views.whole_image_boxes(2)
+
+    model.eval()  # no noise at inference: deterministic
+    assert torch.equal(model(x, boxes, torch.zeros(2)).anchors, model(x, boxes, torch.zeros(2)).anchors)
+
+    model.train()
+    first = model(x, boxes, torch.zeros(2))
+    other = model(x, boxes, torch.zeros(2))
+    assert not torch.allclose(first.anchors, other.anchors)  # a new draw each time
+    again = model(x, boxes, torch.zeros(2), samples=first.samples)
+    assert torch.equal(first.anchors, again.anchors) and torch.equal(first.gate, again.gate)
+
+    grad, = torch.autograd.grad(again.anchors.sum(), model.log_temperature)  # positions stay differentiable
+    assert grad.abs() > 0
+
+
+def test_deeper_model_from_shallow_weights_starts_identical(tmp_path):
+    from overpaintai.train import Trainer
+
+    torch.manual_seed(9)
+    old = _small_model()
+    cfg = dict(num_strokes=4, widths=(8, 16, 32, 64), token_dim=64, heads=4)
+    path = tmp_path / "old.pt"
+    torch.save({"model": old.state_dict(), "ema": None, "model_config": cfg}, path)
+
+    trainer = Trainer.__new__(Trainer)  # only the weight loading is under test
+    trainer.model = _small_model(global_blocks=4, query_blocks=3)
+    trainer.ema = None
+    trainer._init_from(str(path))
+    x, boxes = torch.randn(2, 12, R, R), views.whole_image_boxes(2)
+    a, b = old.eval()(x, boxes, torch.zeros(2)), trainer.model.eval()(x, boxes, torch.zeros(2))
+    for f in ("points", "radii", "opacity", "hardness", "color"):
+        assert torch.allclose(getattr(a.strokes, f), getattr(b.strokes, f), atol=1e-5), f

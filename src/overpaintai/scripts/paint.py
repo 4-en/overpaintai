@@ -13,7 +13,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
-from overpaintai.highres import HighResPainter, config_from_checkpoint, load_checkpoint_model, load_padded
+from overpaintai.highres import (
+    STROKE_FORMAT, HighResPainter, config_from_checkpoint, load_checkpoint_model, load_padded,
+)
 from overpaintai.viz import to_uint8
 
 
@@ -92,7 +94,7 @@ def main():
             name = label.replace(" ", "_").replace("/", "-")
             Image.fromarray(to_uint8(canvas[crop][0])).save(out / f"stage_{i}_{name}.png")
     torch.save({"strokes": torch.cat(result.strokes), "size": args.size, "content_wh": wh,
-                "format": "points(6), radii(2), opacity(2), hardness, color(3); image coords"}, out / "strokes.pt")
+                "format": STROKE_FORMAT}, out / "strokes.pt")
     (out / "stats.json").write_text(json.dumps({"args": vars(args), "stages": result.stats}, indent=2))
     print(f"-> {out}/final.png ({result.stats[-1]['strokes']} strokes, PSNR {result.stats[-1]['psnr']:.2f} dB)")
 

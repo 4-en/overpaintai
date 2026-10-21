@@ -1,3 +1,4 @@
+import math
 import json
 
 import numpy as np
@@ -190,3 +191,111 @@ def test_painting_metrics_sanity():
     assert m["psnr"] > 90 and abs(m["sharpness"] - 1) < 1e-4 and m["edge_err"] < 1e-6
     assert m["strokes"] == 2.5  # (2 active + 3 active) / 2: the 0.01-opacity stroke does not count
     assert abs(m["faint_share"] - 0.25) < 1e-6  # image 1: 1 of 2 active strokes is faint (thin); image 2: none
+
+
+def test_robust_loss_saturates_and_counts_lightness_over_hue():
+    from overpaintai.losses import robust_color_error
+
+    t = torch.full((1, 3, 4, 4), 0.5)
+    err = lambda d: robust_color_error(t + torch.tensor(d).view(1, 3, 1, 1), t, 0.1).mean().item()
+    assert abs(err([0.01] * 3) - 0.01) < 2e-3  # small gray error: like L1
+    assert err([0.5] * 3) < 0.1 and err([0.5] * 3) - err([0.3] * 3) < 0.01  # wrong vs. other wrong: ~same
+    assert err([0.1, -0.1, 0.0]) < 0.5 * err([0.1] * 3)  # a hue change at equal lightness counts less
+    # a big stroke 60% right / 40% wrong on a mostly-wrong canvas beats doing nothing
+    before = torch.cat([torch.full((1, 3, 6, 1), 0.9), torch.full((1, 3, 4, 1), 0.9)], 2)
+    after = torch.cat([torch.full((1, 3, 6, 1), 0.5), torch.full((1, 3, 4, 1), 0.1)], 2)
+    target = torch.full((1, 3, 10, 1), 0.5)
+    assert robust_color_error(after, target, 0.1).mean() < robust_color_error(before, target, 0.1).mean()
+
+
+def test_stroke_edge_sharpness_looks_at_the_stroke_border():
+    from overpaintai.losses import sharpness_pyramid, stroke_edge_sharpness
+
+    target = torch.zeros(1, 3, 64, 64)
+    target[..., 32:] = 1.0  # one vertical edge at x ~ 0.5
+    pyr = sharpness_pyramid(target)
+    r = 8 / 63
+    edge_x = 31.5 / 63
+    side = torch.tensor([[edge_x - r, 0.3], [edge_x - r, 0.5], [edge_x - r, 0.7]])  # vertical, right side on the edge
+    near = torch.tensor([[edge_x - 4 / 63, 0.5]] * 3)  # a dot over the edge, 4 px from its center and border
+    far = torch.tensor([[0.1, 0.5]] * 3)
+    s = stroke_edge_sharpness(pyr, torch.stack([side, near, far]).unsqueeze(0), torch.full((1, 3, 2), r))
+    assert s[0, 0] > 0.5 and s[0, 1] < 0.3 and s[0, 2] < 0.05
+
+
+def test_value_loss_and_forgiving_edges():
+    from overpaintai.losses import MultiScalePaintLoss
+
+    target = torch.full((1, 3, 32, 32), 0.5)
+    hue = target + torch.tensor([0.2, -0.2, 0.0]).view(1, 3, 1, 1)  # same lightness, other hue
+    value = MultiScalePaintLoss(0.0, (4,), scale_weights=(0.0,), value_weight=1.0)
+    assert value(hue, target)[0] < 1e-6 and value(target + 0.2, target)[0] > 0.19
+
+    edged = target.clone()
+    edged[..., 16:] = 0.6  # a crisp edge the flat target doesn't have
+    wrong = edged.clone() + 0.4  # the same edge over an area that is far off in color
+    strict = MultiScalePaintLoss(0.0, (), edge_weight=1.0)
+    lenient = MultiScalePaintLoss(0.0, (), edge_weight=1.0, forgive_tau=0.1)
+    assert torch.allclose(lenient(edged, target)[0], strict(edged, target)[0], rtol=0.6)  # nearly right: still counts
+    assert lenient(wrong, target)[0] < 0.3 * strict(wrong, target)[0]  # far off anyway: mostly forgiven
+    soft = MultiScalePaintLoss(0.0, (), edge_weight=1.0, forgive_tau=0.1)
+    assert soft(target, edged)[0] > 0.9 * strict(target, edged)[0]  # too soft is never forgiven
+
+
+def test_hardness_reward_and_step_ramp_train(tmp_path):
+    from overpaintai.train import Trainer, parse_args
+
+    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--robust-loss", "--hard-edge-reward", "0.1",
+                                         "--step-ramp", "2", "--edge-loss", "--flat-loss", "--forgive-edges",
+                                         "--value-weight", "1", "--out", str(tmp_path / "r")]))
+    stats = trainer.train_step()
+    assert "soft_edges" in stats and 0.0 <= stats["soft_edges"] <= 1.0 and math.isfinite(stats["loss"])
+
+
+def test_checkpointed_steps_give_the_same_gradient(tmp_path):
+    from overpaintai.train import Trainer, parse_args
+
+    grads = []
+    for extra in ([], ["--checkpoint-steps"]):
+        torch.manual_seed(0)
+        trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--tile-prob", "0", "--seed", "3",
+                                             "--out", str(tmp_path / f"c{len(extra)}")] + extra))
+        trainer.model.train()
+        trainer.unroll_batch()["loss"].backward()
+        grads.append(torch.cat([q.grad.flatten() for q in trainer.model.parameters() if q.grad is not None]))
+    assert torch.allclose(grads[0], grads[1], rtol=1e-3, atol=1e-6)
+
+
+def test_best_of_replays_each_images_best_attempt(tmp_path):
+    from overpaintai.losses import psnr  # noqa: F401
+    from overpaintai.train import Trainer, parse_args
+
+    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--placement-noise", "1", "--best-of", "3",
+                                         "--tile-prob", "0", "--out", str(tmp_path / "b")]))
+    trainer.model.train()
+    target, layer, depth, _ = trainer.batch_start(trainer.args.steps)
+    total = (depth + trainer.args.steps).float()
+    forced = trainer._best_of_draws(target, layer, depth, total, trainer.args.steps, lambda k: (None, None))
+    with torch.no_grad():
+        for k in range(trainer.args.steps):
+            layer = trainer.painter.step(target, layer, (depth + k).float() / total, samples=forced[k]).layer
+        replay = trainer.loss_fn(trainer.painter.composite(layer), target, per_sample=True)[0]
+    assert torch.allclose(replay, trainer._best_of_scores.amin(0), rtol=1e-4, atol=1e-6)
+    stats = trainer.train_step()
+    assert stats["best_of_gain"] >= 0 and math.isfinite(stats["loss"])
+
+
+def test_plan_architecture_trains_in_teacher_and_unroll_mode(tmp_path):
+    plan = ["--arch", "plan", "--global-blocks", "1", "--query-blocks", "1", "--refine-layers", "1",
+            "--view-tokens", "2", "--plan-slots", "2"]
+    teacher = tmp_path / "teacher"
+    main(TINY + plan + ["--mode", "teacher", "--epochs", "1", "--out", str(teacher)])
+    cfg = torch.load(teacher / "best.pt", weights_only=False)["model_config"]
+    assert cfg["arch"] == "plan" and cfg["pressure"] and cfg["refine_layers"] == 1
+
+    unroll = tmp_path / "unroll"
+    main(TINY + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--tile-prob", "1", "--edge-loss",
+                 "--robust-loss", "--hard-edge-reward", "0.05", "--checkpoint-steps", "--epochs", "1",
+                 "--out", str(unroll)] + plan)
+    hist = torch.load(unroll / "last.pt", weights_only=False)["history"][-1]
+    assert "val_long_psnr" in hist and math.isfinite(hist["train_loss"])

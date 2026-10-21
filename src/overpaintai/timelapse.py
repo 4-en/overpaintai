@@ -40,7 +40,7 @@ def render_timelapse(
 ) -> Path:
     """
     Args:
-        strokes: (N, 14) strokes in the painting order, coordinates of the square `canvas_size` canvas.
+        strokes: (N, 16) (or older (N, 14)) strokes in the painting order, coordinates of the square `canvas_size` canvas.
         content_wh: (w, h) of the image content on that canvas (the rest is padding and is cropped off).
         duration: video length in seconds, including `hold` seconds on the finished painting.
         max_side: longer side of the video in pixels (strokes are re-rendered at that resolution).

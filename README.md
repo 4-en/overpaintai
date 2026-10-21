@@ -22,6 +22,7 @@ Every stroke is defined by a vector in `[0, 1]^14`:
 5. `a0, a2`: Start and end opacity/flow taper.
 6. `hardness`: Continuous edge hardness in `[0, 1]`, shared across all tools (`0.0` = soft Gaussian airbrush falloff, `1.0` = crisp cel/ink edge).
 7. `R, G, B`: Stroke pigment color.
+8. Optional pressure curve, `[0, 1]^16`: `r_mid, a_mid` appended. Radius and opacity then follow a quadratic profile along the stroke, with control values (start, mid, end) like the curve's control point, so a stroke can swell, taper at both ends or fade in and out. Without them the profile is linear (mid = mean of the ends gives exactly that), so 14-parameter strokes, old checkpoints and recorded `strokes.pt` files render as before.
 
 ### Discrete Tool Modes (5 Tools)
 
@@ -40,11 +41,14 @@ All 5 tools utilize the continuous capsule distance field and respect the stroke
 
 ## Predictor Architecture
 
-To balance global composition planning with 1:1 pixel accuracy for fine details:
-- **Global Path**: Pretrained `ConvNeXt` encoder + Feature Pyramid Network (FPN) operating on the 9-channel state (`Target RGB`, `Composited Canvas RGB`, `Error Map`).
-- **High-Resolution Detail Bypass**: Parallel `stride=1` shallow convolutional stem that preserves 1-pixel edges and lineart without downsampling.
-- **Prediction Head**: Spatial Soft-Argmax for coordinate regression (`x0, y0, x1, y1, x2, y2`) paired with pooled feature projection for brush attributes (`r0, r2, a0, a2, hardness, R, G, B`) and tool logits.
-- **Training Strategy**: Multi-step unrolled backpropagation ($K$ sequential strokes per gradient step) using temperature-annealed Softmax over tool selections.
+Two predictors with the same inputs (12-13 channel 128 px view: target, canvas, error, paint alpha, coordinates, paintable mask) and outputs (N = 16 strokes per view and step), selected with `--arch` (stored in the checkpoint; checkpoints without it are `unet`):
+
+- **`unet`** (`model.py`, `StrokePredictor`, 13.4M parameters as `small`): a residual U-Net. Its 16x16 bottleneck is pooled to 8x8 tokens, attended together with the whole image's tokens (2 blocks) and fed back into the bottleneck. 16 stroke queries coordinate and read the tokens (2 block pairs), then place themselves by a spatial soft-argmax over full-resolution pixel features. The attributes come from the features at that one point.
+- **`plan`** (`plan_model.py`, `PlanStrokePredictor`, 26.3M parameters): plan first, then strokes that see each other.
+  - **Plan:** the view's 16x16 bottleneck as tokens, the whole image as 8x8 tokens and 8 learned plan slots (6 self-attention blocks), fed back into the U-Net.
+  - **Stroke latents:** query blocks (4 pairs), an initial position (soft-argmax as above, with a weaker, wider "paint where it's wrong" prior), then 3 refinement layers on the latents. Each layer reads a provisional shape out of each latent (position, endpoints, size) only to decide where to look: it encodes where the stroke is and samples features at 5 points along its provisional curve. Then the strokes attend to each other (who covers what) and to the plan.
+  - **Output:** the final stroke is decoded once from the last latent, with a pressure curve, an anchor anywhere along the stroke (`B(anchor_t) = anchor`, `anchor_t` in [0.2, 0.8], instead of always the curve's midpoint, which made ~30% of strokes double back on themselves), and a color that starts from the 9 px target average instead of a single pixel.
+  - **Cost:** ~1.2-1.3x the unet per training step (6-step unroll 1.9 vs 1.5 s, 32-step 8.1 vs 6.8 s per batch of 16).
 
 ## Installation & Usage
 
@@ -88,6 +92,45 @@ New models (`--init-from` an older checkpoint copies its weights; new inputs / o
 - a **paintable-mask** input: unroll tile steps get a core plus context margin (`--tile-margin`); strokes outside the core are faded as in the high-res harness, which also pulls them inward (`--outside-penalty` adds an explicit cost, off by default: at 0.1 the model learned to shrink tile strokes to the minimum radius); validation includes a tile step and logs `val_tile_gate` to catch tile views that stop painting;
 - the stationary conditioning above.
 Each can be switched off for new models (`--no-stroke-gate`, `--soft-gate`, `--no-paintable-mask`, `--step-progress`). Loss options: `--edge-loss` (sharp, correctly placed edges) and `--flat-loss` (local variation matching, so flat areas stay flat instead of mottled). Validation also logs sharpness (painting vs target edge strength), line-art edge error, active strokes per image, the share of barely visible strokes and the PSNR gain per 100 strokes.
+
+**Soft early strokes.** Early, big strokes come out soft even where the target edge is crisp. A probe (only the hardness of a trained model's first strokes optimized, positions fixed) showed the loss itself wants them soft, at 128 px and equally at 512 px: it is not the training resolution but hedging. A soft edge has a lower expected error than a crisp one that might be a few pixels off (L1 ~0.43, L2 ~0.38 optimal hardness; the edge loss only moves it to ~0.5). Three options against it:
+- `--robust-loss` (`--robust-tau 0.1`): the full-resolution term becomes a saturating error `tau * e / (e + tau)` (L1-like for small errors, capped at tau), on lightness at full weight and on color at half. Painting a wrong color over another wrong color then costs almost nothing, breaking a pixel that was right costs a lot, so a big stroke that gets 60% of its area right is clearly worth it on a mostly-wrong (early) canvas and expensive on a mostly-right (late) one, as a painter blocks in and then refines. It is a score of the canvas, not of the per-step change, so breaking a pixel in one step and repairing it in the next gains nothing (an asymmetric "reward gains more than losses" per step could be farmed that way). A saturating error also prefers a crisp edge slightly off (few pixels fully wrong) to a soft one (many half wrong), but in the probe only a little (optimal hardness 0.43 -> 0.46 for first strokes, 0.48 -> 0.53 at step 3): it is mainly for the bold-strokes trade, crisp edges need the reward below. The coarse terms stay L1 for their pull.
+- `--hard-edge-reward` (e.g. 0.05): pushes visible strokes towards hard where the target is sharp along their border (8 points on both sides and the end caps, in a band ~radius / 2 wide); strokes inside soft or flat areas are left free, even with an edge nearby. Logged as `soft_edges`. A first version that looked for the strongest edge anywhere within the stroke's radius (reward 0.1) made nearly every stroke hard (hardness 0.45 -> 0.96), glows and blurry backgrounds included, for -0.4 dB; the block-in did look much more like a painter's.
+- `--forgive-edges`: the edge, sharp and flat terms count "too soft / too flat" always, but "too sharp / too busy" only where the colors around are already roughly right (weight `tau / (e + tau)`, e = 5 px mean color error, tau = `--robust-tau`, not differentiated so the model can't dodge it by being wrong). A crisp stroke over a still-wrong area is judged by its color; once the area is right, a spurious edge costs fully again.
+- `--value-weight` (e.g. 0.5): a lightness-only L1 term over full resolution and the coarse scales, a squint test: value structure reads first, hue errors matter less.
+
+Ablations (3 epochs from `with_edge_loss`, all with `--robust-loss --hard-edge-reward 0.05 --value-weight 0.5`; baseline = same run with none of these):
+
+| run | hardness | sharpness | PSNR step 1 | 8 / 32 / 128 steps |
+|---|---|---|---|---|
+| baseline (soft) | 0.45 | 0.68 | 15.42 | 18.76 / 20.41 / 21.17 |
+| + forgive, ramp 2, tau 0.1 | 0.85 | 0.83 | 13.85 | 17.92 / 19.63 / 20.24 |
+| ramp 0 | 0.86 | 0.81 | 14.91 | 18.09 / 19.72 / 20.30 |
+| tau 0.25 | 0.85 | 0.76 | 14.68 | 18.41 / 20.11 / 20.97 |
+| no forgive | 0.85 | 0.71 | 14.72 | 18.48 / 20.21 / 21.17 |
+
+`--forgive-edges` cost most of the quality (more faint strokes, messier detail, bare paper left early) and is not recommended; without it the hard-edged model matches the soft one at 128 steps. The step ramp hardly matters, a larger `--robust-tau` helps when forgiving is on.
+
+**Model vs. renderer ceiling.** Greedy direct stroke fitting (64 strokes at a time, 150 Adam steps each, error-guided init, radius 0.12 -> 0.01 over the painting) on 16 validation images reaches 21.96 / 23.04 / 24.30 / 26.22 / 30.35 dB at 128 / 256 / 512 / 1024 / 2048 strokes and is still accelerating; the models reach ~19.5 / 20.5 / 21.3 / 22.0 / 22.3 dB. The renderer is not the limit, the predictor is. Measured stroke schedule of a model trained on 6-step unrolls: median radius 11 px at step 1, 2.8 px at step 4, 1.4 px at step 16, then sub-pixel dabs whose opacity falls to 0.15 by step 128. It compresses its coarse-to-fine schedule into the training horizon (96 strokes) and has nothing useful left to do afterwards.
+
+`--checkpoint-steps` recomputes each painting step in backward (full gradient, 32 steps in 4.6 GB at batch 16, ~5.7 s per batch). 400 batches of 32-step unrolls from `abl_noforgive`: 19.38 / 20.41 / 21.34 / 22.18 / 22.75 dB (the same 400 batches at 6 steps: ... / 21.79 at 2048), opacity stays higher for longer (0.81 at step 16, 0.45 at step 64, vs 0.62 / 0.23). The horizon explains part of the plateau; the schedule stretches to about the training horizon and then decays again.
+
+**Committing instead of hedging, judged over the whole window.** A stroke's position is the mean of its placement map (soft-argmax); with an entropy of ~5 nats that is an average over ~150 candidate pixels, and with two good spots it lands between them, where only a small, faint stroke is safe. `--best-of K` paints each training window K times with independent random draws, without gradients, and trains on each image's best attempt, replaying its draws exactly (`StrokeSamples`). Attempts are ranked by the loss at the *end* of the window, so a block-in that only pays off later wins over a safe detail stroke: no fitted or optimizer strokes, only the model's own. `best_of_gain` logs how much better the chosen attempt was than the average one (relative loss units). The draws come from the hard gate and `--placement-noise` (Gumbel noise on the placement logits in training, replayable through a per-image seed): each draw leans towards one of a map's good spots, while the position stays continuous and gets the renderer's gradient as before; no noise at inference. On `long32` (trained without noise), noise 1 costs ~0.05 dB, 4 seeds differ by ~0.3 dB per image, and the best of 4 is slightly above the noise-free painting.
+
+A first version drew one pixel from the map instead (straight-through gradient of the mean). It collapsed within 200-400 batches from `long32`, with or without best-of (32-step validation 20.4 -> 13.0 / 12.4 dB): the 16 strokes of a step piled onto 3-6 spots. With a drawn pixel, the renderer's gradient no longer moves a stroke, it only shifts the map's mean, and the shared "paint where the error is largest" prior pulled every map onto the same few pixels; the soft-argmax had kept strokes apart through that direct gradient.
+
+Trials from `long32`, 400 batches of 32-step unrolls each, PSNR on 16 validation images at 128 / 256 / 512 / 1024 / 2048 strokes:
+
+| run | 128 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| direct fitting (ceiling) | 21.96 | 23.04 | 24.30 | 26.22 | 30.35 |
+| `long32` (start) | 19.38 | 20.41 | 21.34 | 22.18 | 22.75 |
+| plain continuation (`cont32`) | 19.31 | 20.44 | 21.45 | 22.30 | 22.79 |
+| `--placement-noise 1 --best-of 4` | 19.22 | 20.40 | 21.36 | 22.21 | 22.82 |
+| `--global-blocks 6 --query-blocks 4` | 19.14 | 20.21 | 21.14 | 21.84 | 22.37 |
+
+Best-of-4 is a wash at 1.7x the training cost: attempts differ by only ~0.3 dB per image, so the winner is picked mostly by chance. The deeper attention (8 extra blocks starting as identity, 19.75M parameters) is worse after this short budget at lr 1e-4 (placement entropy fell to 3.8 vs 4.9: the new blocks change placement but haven't paid off yet); not a verdict on depth, a fair test needs longer training or a higher learning rate for the new blocks.
+- `--step-ramp` (e.g. 2): earlier unroll steps weigh `--intermediate-weight x ((k + 1) / steps) ** ramp`, so the first steps are judged more by where the painting ends up than by their own result.
 
 Each run writes `best.pt` (best validation PSNR, the long one if measured; EMA weights included), `last.pt`, `epochs.csv` / `steps.csv`, `curve.png` and validation samples per epoch to `--out`.
 

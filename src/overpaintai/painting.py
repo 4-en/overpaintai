@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
-from overpaintai.model import StrokeOutput, StrokePredictor
+from overpaintai.model import StrokeOutput, StrokePredictor, StrokeSamples
 
 
 @dataclass
@@ -115,11 +115,12 @@ class Painter:
         progress: torch.Tensor,
         global_tokens: Optional[torch.Tensor] = None,
         paintable: Optional[torch.Tensor] = None,
+        samples: Optional[StrokeSamples] = None,
     ) -> StrokeOutput:
-        """Model output for one view per image (`boxes` (B, 3))."""
+        """Model output for one view per image (`boxes` (B, 3)); `samples` replays earlier random draws."""
         x, e = self.inputs(target, layer, boxes, paintable)
         with self._autocast(target.device):
-            return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e)
+            return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e, samples=samples)
 
     def render(self, layer: torch.Tensor, params: torch.Tensor, tool_w: torch.Tensor) -> torch.Tensor:
         return self.engine(layer, params, tool_w, checkpoint_strokes=self.checkpoint_strokes)
@@ -132,6 +133,7 @@ class Painter:
         boxes: Optional[torch.Tensor] = None,
         cores: Optional[torch.Tensor] = None,
         margin: float = 0.25,
+        samples: Optional[StrokeSamples] = None,
     ) -> StepResult:
         """
         One painting step. `boxes` is (B, 3) for one view per image (default: whole image), or (B, T, 3)
@@ -141,7 +143,8 @@ class Painter:
         `cores` (same shape as `boxes`) restricts painting to a core inside each view, with the rest as
         context: the model gets it as its paintable mask, and strokes anchored outside the core or reaching
         past the view are faded over `margin` x core size, exactly as in the high-res harness.
-        Rendered opacity = predicted opacity x stroke gate (x fade).
+        Rendered opacity = predicted opacity x stroke gate (x fade). `samples` (from an earlier
+        `StepResult.output.samples` of the same step) replays its random draws.
         """
         B = target.shape[0]
         if boxes is None:
@@ -151,12 +154,12 @@ class Painter:
         flat_cores = None if cores is None else cores.reshape(B * T, 3)
         paintable = None if flat_cores is None else views.core_mask(flat_boxes, flat_cores, self.view_res)
         if T == 1:
-            out = self.predict(target, layer, flat_boxes, progress, paintable=paintable)
+            out = self.predict(target, layer, flat_boxes, progress, paintable=paintable, samples=samples)
         else:
             g = self.global_tokens(target, layer, progress).repeat_interleave(T, dim=0)
             out = self.predict(
                 target.repeat_interleave(T, 0), layer.repeat_interleave(T, 0), flat_boxes,
-                progress.repeat_interleave(T, 0), global_tokens=g, paintable=paintable,
+                progress.repeat_interleave(T, 0), global_tokens=g, paintable=paintable, samples=samples,
             )
         opacity = out.strokes.opacity * out.gate.unsqueeze(-1)
         reach = None

@@ -157,6 +157,10 @@ class DifferentiableCanvasEngine(nn.Module):
     """
 
     NUM_CONT_PARAMS = 14  # x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B
+    # Optional pressure curve: 2 more params appended, [..., r_mid, a_mid]: control values of a quadratic radius /
+    # opacity profile along t, like the curve's control point (value at the middle = (start + 2 mid + end) / 4).
+    # Without them the profile is linear (mid = mean of the ends gives exactly that).
+    NUM_PRESSURE_PARAMS = 16
     NUM_TOOLS = 5         # Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser
 
     def __init__(
@@ -319,7 +323,7 @@ class DifferentiableCanvasEngine(nn.Module):
         Blend tool's job.
 
         Args:
-            ctrl: (B, 10) decoded [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2] (radii in canvas units)
+            ctrl: (B, 12) decoded [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, r_mid, a_mid] (radii in canvas units)
             bx, by: (B, S, 1, 1) curve samples, used to measure the stroke length
             hardness, w_smudge: (B,)
         """
@@ -329,12 +333,12 @@ class DifferentiableCanvasEngine(nn.Module):
         with torch.no_grad():
             # Per-stroke dab count: spacing `smudge_spacing` * the stroke's smallest radius
             length = torch.sqrt((bx[:, 1:] - bx[:, :-1]) ** 2 + (by[:, 1:] - by[:, :-1]) ** 2).sum(dim=1).flatten()
-            r_min = torch.minimum(ctrl[:, 6], ctrl[:, 7])
+            r_min = ctrl[:, [6, 7, 10]].amin(dim=1)
             n_dabs = (length / (self.smudge_spacing * r_min)).ceil().long() + 1
             n_dabs = n_dabs.clamp(2, self.smudge_max_dabs)
 
             # Per-stroke window half-size R (pixels): profiles are truncated where they fall below ~1e-4
-            r_max = torch.maximum(ctrl[:, 6], ctrl[:, 7])
+            r_max = ctrl[:, [6, 7, 10]].amax(dim=1)
             hard_ext = r_max + 9.2 / edge_sharpness  # sigmoid < 1e-4 beyond this
             soft_ext = torch.maximum(2.15 * r_max, hard_ext)  # exp(-2 d^2 / r^2) < 1e-4 beyond 2.15 r
             ext = torch.where(hardness < 1.0 - 1e-6, soft_ext, hard_ext)
@@ -411,7 +415,7 @@ class DifferentiableCanvasEngine(nn.Module):
         than `n_max` dabs repeat their final dab, which is a no-op (zero motion).
         """
         B, _, H, W = premult.shape
-        x0, y0, x1, y1, x2, y2, r0, r2, a0, a2 = ctrl.unbind(dim=-1)
+        x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, r1, a1 = ctrl.unbind(dim=-1)
 
         # Dab positions evaluated directly on the quadratic Bezier, per-stroke spacing
         j = torch.arange(n_max, device=premult.device, dtype=premult.dtype)
@@ -419,8 +423,8 @@ class DifferentiableCanvasEngine(nn.Module):
         omt = 1.0 - t
         dx = omt * omt * x0[:, None] + 2.0 * omt * t * x1[:, None] + t * t * x2[:, None]
         dy = omt * omt * y0[:, None] + 2.0 * omt * t * y1[:, None] + t * t * y2[:, None]
-        dr = omt * r0[:, None] + t * r2[:, None]
-        da = omt * a0[:, None] + t * a2[:, None]
+        dr = omt * omt * r0[:, None] + 2.0 * omt * t * r1[:, None] + t * t * r2[:, None]
+        da = omt * omt * a0[:, None] + 2.0 * omt * t * a1[:, None] + t * t * a2[:, None]
 
         rate = (da - (2.0 / self.smudge_length) * da * da).clamp(0.0, 1.0)
         strength = w_smudge.view(B, 1) * rate  # (B, n_max)
@@ -548,8 +552,9 @@ class DifferentiableCanvasEngine(nn.Module):
         """
         B, C, H, W = paint_layer.shape
         assert C == 4, f"Expected 4-channel RGBA paint_layer (B, 4, H, W), got shape {tuple(paint_layer.shape)}"
-        assert stroke_params.shape[-1] == self.NUM_CONT_PARAMS, (
-            f"Expected {self.NUM_CONT_PARAMS} continuous stroke params, got {stroke_params.shape[-1]}"
+        n_params = stroke_params.shape[-1]
+        assert n_params in (self.NUM_CONT_PARAMS, self.NUM_PRESSURE_PARAMS), (
+            f"Expected {self.NUM_CONT_PARAMS} or {self.NUM_PRESSURE_PARAMS} continuous stroke params, got {n_params}"
         )
         device = paint_layer.device
         self._update_spatial_buffers(H, W, device)
@@ -559,7 +564,7 @@ class DifferentiableCanvasEngine(nn.Module):
             tool_weights[:, 0] = 1.0
 
         # 1. Unpack normalized stroke parameters (14 params)
-        p = stroke_params.view(B, self.NUM_CONT_PARAMS, 1, 1, 1)
+        p = stroke_params.view(B, n_params, 1, 1, 1)
         x0, y0 = p[:, 0], p[:, 1]
         x1, y1 = p[:, 2], p[:, 3]
         x2, y2 = p[:, 4], p[:, 5]
@@ -569,6 +574,11 @@ class DifferentiableCanvasEngine(nn.Module):
 
         a0 = self.min_opacity + (1.0 - self.min_opacity) * p[:, 8]
         a2 = self.min_opacity + (1.0 - self.min_opacity) * p[:, 9]
+        if n_params == self.NUM_PRESSURE_PARAMS:  # pressure curve: control values of the radius / opacity profile
+            r1 = self.min_radius + p[:, 14] * (self.max_radius - self.min_radius)
+            a1 = self.min_opacity + (1.0 - self.min_opacity) * p[:, 15]
+        else:  # linear profile (the quadratic one below with mid = mean reduces to it exactly)
+            r1, a1 = 0.5 * (r0 + r2), 0.5 * (a0 + a2)
 
         hardness = p[:, 10]  # Continuous edge hardness in [0, 1] across all tools
         stroke_rgb = stroke_params[:, 11:14].view(B, 3, 1, 1)
@@ -579,8 +589,8 @@ class DifferentiableCanvasEngine(nn.Module):
         bx = (omt ** 2) * x0 + 2.0 * omt * t * x1 + (t ** 2) * x2  # (B, S, 1, 1)
         by = (omt ** 2) * y0 + 2.0 * omt * t * y1 + (t ** 2) * y2  # (B, S, 1, 1)
 
-        rt = omt * r0 + t * r2  # (B, S, 1, 1)
-        at = omt * a0 + t * a2  # (B, S, 1, 1)
+        rt = (omt ** 2) * r0 + 2.0 * omt * t * r1 + (t ** 2) * r2  # (B, S, 1, 1)
+        at = (omt ** 2) * a0 + 2.0 * omt * t * a1 + (t ** 2) * a2  # (B, S, 1, 1)
 
         # 3-4. Continuous capsule distance field along the curve, with the unified hardness profile.
         # Hard edge falloff (10%-90% alpha) spans `hard_edge_px` output pixels at any resolution.
@@ -616,7 +626,7 @@ class DifferentiableCanvasEngine(nn.Module):
         # 7. STEP B: Smudge / Push — dab-sequential paint transport in premultiplied RGBA
         if need_all or bool((w_smudge > 0).any()):
             premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
-            ctrl = torch.cat([p[:, 0:6].view(B, 6)] + [v.view(B, 1) for v in (r0, r2, a0, a2)], dim=1)
+            ctrl = torch.cat([p[:, 0:6].view(B, 6)] + [v.view(B, 1) for v in (r0, r2, a0, a2, r1, a1)], dim=1)
             premult_rgba = self._smudge(
                 premult_rgba, ctrl, bx, by, hardness.view(B), w_smudge.view(B), edge_sharpness
             )
@@ -683,11 +693,12 @@ class DifferentiableCanvasEngine(nn.Module):
 
 def reverse_strokes(stroke_params: torch.Tensor) -> torch.Tensor:
     """
-    Returns the reversed-direction encoding of `(..., 14)` strokes: endpoints swapped, radius and
-    opacity tapers swapped. For every tool except Smudge the reversed stroke renders identically, so
-    parameter-space losses should take the minimum over both orderings.
+    Returns the reversed-direction encoding of `(..., 14)` (or `(..., 16)`, with the pressure curve) strokes:
+    endpoints swapped, radius and opacity tapers swapped (the middle stays the middle). For every tool except
+    Smudge the reversed stroke renders identically, so parameter-space losses should take the minimum over
+    both orderings.
     """
-    idx = [4, 5, 2, 3, 0, 1, 7, 6, 9, 8, 10, 11, 12, 13]
+    idx = [4, 5, 2, 3, 0, 1, 7, 6, 9, 8, 10, 11, 12, 13] + [14, 15][: stroke_params.shape[-1] - 14]
     return stroke_params[..., idx]
 
 

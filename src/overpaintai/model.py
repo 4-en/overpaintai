@@ -100,6 +100,26 @@ class StrokeOutput:
     placement_logits: torch.Tensor  # (B, N, R*R) pre-softmax placement maps (for heatmap supervision)
     gate: torch.Tensor  # (B, N) in [0, 1]: how much of each stroke to paint (1 for models without a gate)
     gate_logit: Optional[torch.Tensor] = None  # (B, N) pre-sigmoid gate (for the range penalty in training)
+    samples: Optional["StrokeSamples"] = None  # the random draws of this output (sampled placement / gates)
+    anchor_t: Optional[torch.Tensor] = None  # (B, N) curve parameter of the anchor (None: 0.5, the midpoint)
+
+
+@dataclass
+class StrokeSamples:
+    """The random choices of one forward pass, so it can be replayed exactly (see `StrokePredictor.forward`)."""
+
+    place_seed: Optional[torch.Tensor] = None  # (B,) long: seed of each view's placement noise
+    gate_on: Optional[torch.Tensor] = None  # (B, N) float in {0, 1}: sampled hard gates
+
+
+def _gumbel(seeds: torch.Tensor, shape: torch.Size) -> torch.Tensor:
+    """Standard Gumbel noise `(B, *shape)`, image b drawn from its own seed (so one image can be replayed)."""
+    out = []
+    for seed in seeds.tolist():
+        g = torch.Generator(device=seeds.device).manual_seed(seed)
+        u = torch.rand(shape, generator=g, device=seeds.device).clamp(1e-9, 1.0 - 1e-9)
+        out.append(-torch.log(-torch.log(u)))
+    return torch.stack(out)
 
 
 class StrokePredictor(nn.Module):
@@ -152,6 +172,12 @@ class StrokePredictor(nn.Module):
         hard_gate: bool = False,
     ):
         super().__init__()
+        # Runtime switches (not part of the architecture):
+        # placement_noise > 0 adds Gumbel noise of that scale to the placement logits while sampling, so the
+        # soft-argmax leans towards one of a map's good spots per draw (different attempts commit to different
+        # plans, for --best-of) while positions stay continuous; sample_in_eval draws noise / gates at inference
+        self.placement_noise = 0.0
+        self.sample_in_eval = False
         self.num_strokes = num_strokes
         self.paintable_mask = paintable_mask
         self.stroke_gate = stroke_gate
@@ -288,6 +314,7 @@ class StrokePredictor(nn.Module):
         global_tokens: Optional[torch.Tensor] = None,
         view_size: Optional[torch.Tensor] = None,
         error_progress: Optional[torch.Tensor] = None,
+        samples: Optional[StrokeSamples] = None,
     ) -> StrokeOutput:
         """
         Args:
@@ -300,7 +327,10 @@ class StrokePredictor(nn.Module):
                 the range seen in training when painting smaller tiles (token positions still use `boxes`).
             error_progress: (B,) error-based progress (`views.error_progress`), for models with
                 `uses_error_progress`.
+            samples: replay these random draws (from an earlier `StrokeOutput.samples` on the same inputs)
+                instead of drawing new ones.
         """
+        sampling = self.training or self.sample_in_eval
         B, _, R, _ = inputs.shape
         cond = self._cond(progress, boxes[:, 2] if view_size is None else view_size, error_progress)
         h0, h1, h2, h3 = self._encode(inputs, cond)
@@ -341,7 +371,14 @@ class StrokePredictor(nn.Module):
         err = F.avg_pool2d(inputs[:, 6:9].float().abs().mean(1, keepdim=True), 5, stride=1, padding=2)
         logits = logits + self.error_gain * torch.log(err.flatten(2) + 1e-3)  # (B, 1, R*R) broadcast
         prob = logits.softmax(dim=-1)  # (B, N, R*R)
-        anchors = torch.einsum("bnk,bkc->bnc", prob, uv.float()).to(inputs.dtype)  # view coords
+        place_seed, place_prob = None, prob
+        if self.placement_noise > 0 and (sampling or (samples is not None and samples.place_seed is not None)):
+            if samples is not None and samples.place_seed is not None:
+                place_seed = samples.place_seed
+            else:
+                place_seed = torch.randint(0, 2**62, (B,), device=logits.device)
+            place_prob = (logits + self.placement_noise * _gumbel(place_seed, logits.shape[1:])).softmax(-1)
+        anchors = torch.einsum("bnk,bkc->bnc", place_prob, uv.float()).to(inputs.dtype)  # view coords
         entropy = -(prob * prob.clamp(min=1e-12).log()).sum(-1)
 
         # Features at the anchors from several decoder levels, plus the target color there
@@ -355,7 +392,7 @@ class StrokePredictor(nn.Module):
         feats = torch.cat([q, sample(pixel), sample(d2), sample(m), target_color], dim=-1)
         out = self.attr_mlp(feats)
 
-        gate_logit = None
+        gate_logit, gate_on = None, None
         if self.stroke_gate:  # start with every stroke on (sigmoid(3) = 0.95)
             gate_logit, out = out[..., -1].float() + 3.0, out[..., :-1]
             gate = torch.sigmoid(gate_logit)
@@ -364,8 +401,13 @@ class StrokePredictor(nn.Module):
                 # learning signal and can come back, instead of dying
                 gate = gate + GATE_LEAK * (gate_logit - gate_logit.detach())
             if self.hard_gate:  # on / off; gradient of the soft gate (straight-through)
-                on = torch.bernoulli(gate.detach().clamp(0.0, 1.0)) if self.training else (gate_logit > 0).float()
-                gate = on + (gate - gate.detach())
+                if samples is not None and samples.gate_on is not None:
+                    gate_on = samples.gate_on
+                elif sampling:
+                    gate_on = torch.bernoulli(gate.detach().clamp(0.0, 1.0))
+                else:
+                    gate_on = (gate_logit > 0).float()
+                gate = gate_on + (gate - gate.detach())
         else:
             gate = torch.ones(out.shape[:-1], device=out.device)
         offsets, out = out[..., 0:4], out[..., 4:]
@@ -393,4 +435,5 @@ class StrokePredictor(nn.Module):
         return StrokeOutput(
             strokes=strokes, tool_logits=tool_logits.float(), anchors=anchors.float(),
             anchor_entropy=entropy, placement_logits=logits, gate=gate, gate_logit=gate_logit,
+            samples=StrokeSamples(place_seed, gate_on),
         )

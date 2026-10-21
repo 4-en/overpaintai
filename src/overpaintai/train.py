@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 import torch
+import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -37,10 +38,11 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas
-from overpaintai.losses import MultiScalePaintLoss, psnr
+from overpaintai.losses import MultiScalePaintLoss, psnr, sharpness_pyramid, stroke_edge_sharpness
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
-from overpaintai.model import GATE_LOGIT_RANGE, StrokePredictor
+from overpaintai.model import GATE_LOGIT_RANGE, StrokeSamples, TransformerBlock
+from overpaintai.plan_model import build_model
 from overpaintai.painting import Painter
 from overpaintai.viz import save_curve, save_frame, save_progress
 
@@ -79,6 +81,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g = p.add_argument_group("model")
     g.add_argument("--model-size", choices=sorted(MODEL_PRESETS), default="small")
     g.add_argument("--strokes-per-step", type=int, default=16, help="N strokes predicted per view and step")
+    g.add_argument("--arch", choices=("unet", "plan"), default="unet",
+                   help="New models: 'unet' = StrokePredictor; 'plan' = PlanStrokePredictor (plan tokens, stroke "
+                        "latents refined while seeing each other's provisional strokes, pressure curve, anchor "
+                        "anywhere along the stroke; see plan_model.py)")
+    g.add_argument("--global-blocks", type=int, default=None,
+                   help="Transformer blocks over the plan / global tokens (default: 2 unet, 6 plan)")
+    g.add_argument("--query-blocks", type=int, default=None,
+                   help="Query block pairs (strokes coordinate, then read the plan; default: 2 unet, 4 plan). With "
+                        "--init-from a shallower model, the extra blocks start as identity")
+    g.add_argument("--refine-layers", type=int, default=3, help="Plan arch: stroke refinement layers")
+    g.add_argument("--view-tokens", type=int, default=16, help="Plan arch: side of the view's token grid")
+    g.add_argument("--plan-slots", type=int, default=8, help="Plan arch: learned plan tokens")
+    g.add_argument("--no-pressure", action="store_true", help="Plan arch: no pressure curve (linear tapers)")
     g.add_argument("--no-stroke-gate", action="store_true", help="New models: no per-stroke gate output")
     g.add_argument("--no-paintable-mask", action="store_true", help="New models: no paintable-mask input")
     g.add_argument("--no-error-progress", action="store_true",
@@ -106,6 +121,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Validation: also paint this many whole-image steps and log PSNR along the way, drift "
                         "from the best point and strokes still painted at the end; selects best.pt (0 = off)")
     g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
+    g.add_argument("--step-ramp", type=float, default=0.0,
+                   help="Unroll: earlier steps' weight = --intermediate-weight x ((k + 1) / steps) ** this, so the "
+                        "first steps are judged more by where the painting ends up than by their own result "
+                        "(room for a bold block-in that later steps refine). 0 = all earlier steps alike")
     g.add_argument("--start-mix", default="blank:1",
                    help="Unroll: start canvases per batch, as kind:weight pairs. 'blank' = empty canvas, "
                         "'warmup' = the model first paints 1..--rollout-max steps without gradients, "
@@ -140,6 +159,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--flat-loss", action="store_true",
                    help="Add a loss matching local variation (std) so flat target areas stay flat, not mottled")
     g.add_argument("--flat-weight", type=float, default=1.0, help="Weight of the flatness loss (with --flat-loss)")
+    g.add_argument("--robust-loss", action="store_true",
+                   help="Saturating full-resolution error instead of L1 (lightness counts double): painting over "
+                        "already-wrong pixels is cheap, breaking right ones is expensive; favors bold early "
+                        "strokes and crisp over soft edges")
+    g.add_argument("--robust-tau", type=float, default=0.1,
+                   help="Error at which the robust loss is half saturated (it is capped at this value); also the "
+                        "color error at which --forgive-edges counts spurious edges half")
+    g.add_argument("--hard-edge-reward", type=float, default=0.0,
+                   help="Unroll: pushes strokes towards hard edges where the target is sharp along their border, "
+                        "e.g. 0.05. Strokes in soft / flat areas are left free")
+    g.add_argument("--value-weight", type=float, default=0.0,
+                   help="Weight of a lightness-only loss over full resolution and the coarse scales, e.g. 1")
+    g.add_argument("--forgive-edges", action="store_true",
+                   help="Edges / texture the target doesn't have only count where the colors around are already "
+                        "roughly right: a crisp stroke over a still-wrong area is judged by its color")
     g.add_argument("--stroke-cost", type=float, default=0.0,
                    help="Cost per active stroke (mean stroke gate) so steps leave out strokes they don't need. "
                         "With the relative loss it is a share of the remaining error: 0.02 = a batch's steps "
@@ -163,6 +197,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--heatmap-sigma", type=float, default=1.5, help="Teacher: heatmap target width (view px)")
     g.add_argument("--num-stamps", type=int, default=16, help="Curve samples per stroke in the renderer")
     g.add_argument("--no-checkpoint-strokes", action="store_true", help="Faster, but much more memory")
+    g.add_argument("--best-of", type=int, default=1,
+                   help="Unroll: paint each window this many times with different random draws (no gradient), "
+                        "train on each image's best attempt (by its loss at the end of the window). Attempts "
+                        "differ by --placement-noise and the hard gate's draws")
+    g.add_argument("--placement-noise", type=float, default=0.0,
+                   help="Training: Gumbel noise scale on the placement logits, so each stroke leans towards one "
+                        "of its map's good spots per draw (e.g. 1); positions stay continuous, no noise at inference")
+    g.add_argument("--checkpoint-steps", action="store_true",
+                   help="Unroll: recompute each painting step in backward, keeping only the canvas between "
+                        "steps: long unrolls (--steps 32+) fit in memory, with the full gradient, at ~1.3x compute")
 
     g = p.add_argument_group("optimization")
     g.add_argument("--epochs", type=int, default=20)
@@ -306,18 +350,28 @@ class Trainer:
         if args.mode == "teacher" and args.data != "synthetic":
             raise SystemExit("--mode teacher needs ground-truth strokes, i.e. --data synthetic")
 
-        self.model_config = resume["model_config"] if resume else dict(
-            num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
-            paintable_mask=not args.no_paintable_mask, stationary=not args.step_progress,
-            error_progress=args.step_progress and not args.no_error_progress,  # stationary: built in
-            hard_gate=not args.no_stroke_gate and not args.soft_gate,
-        )
+        if resume:
+            self.model_config = resume["model_config"]
+        else:
+            plan = args.arch == "plan"
+            self.model_config = dict(
+                num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
+                global_blocks=args.global_blocks or (6 if plan else 2),
+                query_blocks=args.query_blocks or (4 if plan else 2),
+                paintable_mask=not args.no_paintable_mask, stationary=not args.step_progress,
+                error_progress=args.step_progress and not args.no_error_progress,  # stationary: built in
+                hard_gate=not args.no_stroke_gate and not args.soft_gate,
+            )
+            if plan:
+                self.model_config.update(arch="plan", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
+                                         plan_slots=args.plan_slots, pressure=not args.no_pressure)
         # Gated strokes must be able to vanish completely: no opacity floor in the engine then
         min_opacity = 0.0 if self.model_config.get("stroke_gate") else 0.05
         self.engine = DifferentiableCanvasEngine(
             canvas_size=self.S, num_stamps=args.num_stamps, min_opacity=min_opacity
         ).to(self.device).train()
-        self.model = StrokePredictor(**self.model_config).to(self.device)
+        self.model = build_model(self.model_config).to(self.device)
+        self.model.placement_noise = args.placement_noise
         self.N = self.model.num_strokes
         self.ema = EMA(self.model, args.ema) if args.ema > 0 else None
 
@@ -333,6 +387,8 @@ class Trainer:
         self.loss_fn = MultiScalePaintLoss(
             args.detail_weight, scales, weights, edge_weight=args.edge_weight if args.edge_loss else 0.0,
             flat_weight=args.flat_weight if args.flat_loss else 0.0,
+            robust_tau=args.robust_tau if args.robust_loss else 0.0, value_weight=args.value_weight,
+            forgive_tau=args.robust_tau if args.forgive_edges else 0.0,
         )
 
         decay, no_decay = [], []
@@ -447,7 +503,7 @@ class Trainer:
         params = views.to_engine_params(views.view_to_image(gated, boxes), self.engine)
         canvas = self.painter.composite(self.painter.render(layer, params, self.painter.tool_weights(out.tool_logits)))
         render_loss, terms = self.loss_fn(canvas, gt_canvas)
-        heat_loss = self.heatmap_loss(out.placement_logits, gt, assign)
+        heat_loss = self.heatmap_loss(out.placement_logits, gt, assign, out.anchor_t, out.anchors)
         gate_loss = (1.0 - out.gate).mean()  # every ground-truth stroke is real: matched strokes stay on
         loss = (a.match_weight * match_loss + a.render_weight * render_loss + a.heatmap_weight * heat_loss
                 + 0.1 * gate_loss)
@@ -467,17 +523,28 @@ class Trainer:
             metrics["hardness"] = out.strokes.hardness.mean()
         return {"loss": loss, **metrics}
 
-    def heatmap_loss(self, logits: torch.Tensor, gt: "views.Strokes", assign: torch.Tensor) -> torch.Tensor:
+    def heatmap_loss(self, logits: torch.Tensor, gt: "views.Strokes", assign: torch.Tensor,
+                     anchor_t: Optional[torch.Tensor] = None, anchors: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Cross-entropy between each matched query's placement map `(B, N, R*R)` and a Gaussian around its
         ground-truth stroke's curve midpoint B(0.5) (in view coordinates). Gives placement a direct, strong
-        gradient; soft-argmax alone barely moves a near-uniform map.
+        gradient; soft-argmax alone barely moves a near-uniform map. Models whose anchor can sit anywhere along
+        the stroke (`anchor_t`) are pointed at the GT curve at their own t (or 1 - t: the GT may be reversed,
+        whichever is closer to the predicted anchor).
         """
         B, N, RR = logits.shape
         R = int(math.isqrt(RR))
         b = torch.arange(B, device=logits.device).unsqueeze(1)
         p0, p1, p2 = gt.points[b, assign[1]].unbind(dim=2)  # matched GT strokes, (B, K, 2)
-        mid = 0.25 * p0 + 0.5 * p1 + 0.25 * p2
+        if anchor_t is None:
+            mid = 0.25 * p0 + 0.5 * p1 + 0.25 * p2
+        else:
+            t = anchor_t[b, assign[0]].detach().unsqueeze(-1)
+            fwd = (1 - t) ** 2 * p0 + 2 * t * (1 - t) * p1 + t ** 2 * p2
+            rev = t ** 2 * p0 + 2 * t * (1 - t) * p1 + (1 - t) ** 2 * p2
+            a = anchors[b, assign[0]].detach()
+            closer = ((fwd - a) ** 2).sum(-1, keepdim=True) <= ((rev - a) ** 2).sum(-1, keepdim=True)
+            mid = torch.where(closer, fwd, rev)
         u = torch.linspace(0.0, 1.0, R, device=logits.device)
         uv = torch.stack(torch.meshgrid(u, u, indexing="xy"), dim=-1).reshape(1, 1, RR, 2)
         sigma = self.args.heatmap_sigma / (R - 1)
@@ -538,7 +605,9 @@ class Trainer:
         B, S = target.shape[0], target.shape[-1]
         total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
         loss, weight_sum, entropy, hardness, gates, outside, gate_range, worse = 0.0, 0.0, [], [], [], [], [], []
+        soft_edges = []
         with torch.no_grad():
+            pyramid = sharpness_pyramid(target) if a.hard_edge_reward > 0 else None
             start = self.painter.composite(layer)
             start_psnr = psnr(start, target)  # (B,)
             prev = self.loss_fn(start, target, per_sample=True)[0]  # (B,) loss before each step
@@ -548,27 +617,46 @@ class Trainer:
         # (an absolute cost outweighed everything a deep painting could still gain and switched all strokes off)
         scale = 1.0 / prev.clamp(min=1e-4) if not a.no_relative_loss else torch.ones_like(prev)
 
+        tile_boxes = tile_cores = None
+        if tile:  # one zoomed tile per image in the last step: a core plus context margin around it
+            lo, hi = _pair(a.tile_size)
+            c = lo + (hi - lo) * torch.rand(B, 1, generator=self.gen, device=self.device)
+            xy = (1.0 - c) * torch.rand(B, 2, generator=self.gen, device=self.device)
+            tile_cores = torch.cat([xy, c], dim=1)
+            if self.model.paintable_mask:
+                v = (c * (1.0 + 2.0 * a.tile_margin)).clamp(max=1.0)
+                vxy = torch.minimum((xy - 0.5 * (v - c)).clamp(min=0.0), 1.0 - v)
+                tile_boxes = torch.cat([vxy, v], dim=1).unsqueeze(1)
+            else:  # models without a mask input: the tile view is the core itself, as before
+                tile_boxes = tile_cores.unsqueeze(1)
+                tile_cores = None
+
+        def step_views(k: int):
+            if tile and k == window - 1:
+                return tile_boxes, tile_cores
+            return None, None
+
+        forced = self._best_of_draws(target, layer, depth, total, window, step_views) if a.best_of > 1 else None
+
         for k in range(window):
             progress = (depth + k).float() / total
-            boxes = cores = None
-            if tile and k == window - 1:  # one zoomed tile per image: a core plus context margin around it
-                lo, hi = _pair(a.tile_size)
-                c = lo + (hi - lo) * torch.rand(B, 1, generator=self.gen, device=self.device)
-                xy = (1.0 - c) * torch.rand(B, 2, generator=self.gen, device=self.device)
-                cores = torch.cat([xy, c], dim=1)
-                if self.model.paintable_mask:
-                    v = (c * (1.0 + 2.0 * a.tile_margin)).clamp(max=1.0)
-                    vxy = torch.minimum((xy - 0.5 * (v - c)).clamp(min=0.0), 1.0 - v)
-                    boxes = torch.cat([vxy, v], dim=1).unsqueeze(1)
-                else:  # models without a mask input: the tile view is the core itself, as before
-                    boxes = cores.unsqueeze(1)
-                    cores = None
-            res = self.painter.step(target, layer, progress, boxes,
-                                    None if cores is None else cores.unsqueeze(1), margin=a.tile_margin)
+            boxes, cores = step_views(k)
+            step_args = (target, layer, progress, boxes, None if cores is None else cores.unsqueeze(1))
+            draws = None if forced is None else forced[k]
+            if a.checkpoint_steps:  # same random gate / tool samples in the recomputation (RNG state is kept)
+                res = torch.utils.checkpoint.checkpoint(self.painter.step, *step_args, margin=a.tile_margin,
+                                                        samples=draws, use_reentrant=False)
+            else:
+                res = self.painter.step(*step_args, margin=a.tile_margin, samples=draws)
             layer = res.layer
             entropy.append(res.output.anchor_entropy.mean().detach())
             hardness.append(res.output.strokes.hardness.mean().detach())
             gates.append(res.gate.mean())
+            if pyramid is not None:  # softness of visible strokes where the target is sharp around them
+                st = views.from_engine_params(res.params, self.engine)
+                vis = st.opacity.mean(-1).detach()
+                want = stroke_edge_sharpness(pyramid, st.points.detach(), st.radii.detach())
+                soft_edges.append((vis * want * (1.0 - st.hardness[..., 0])).sum() / vis.sum().clamp(min=1e-6))
             if res.output.gate_logit is not None:  # keep gate logits in range so off-gates can come back
                 over = (res.output.gate_logit.abs() - GATE_LOGIT_RANGE).clamp(min=0.0)
                 gate_range.append((over * over).mean())
@@ -584,7 +672,7 @@ class Trainer:
             if a.worse_weight > 0:  # a step should never make the painting worse
                 worse.append((full - prev).clamp(min=0.0))
             prev = full.detach()
-            w = 1.0 if last else a.intermediate_weight
+            w = 1.0 if last else a.intermediate_weight * ((k + 1) / window) ** a.step_ramp
             if w > 0:
                 step_loss = full
                 if boxes is not None:  # emphasize the zoomed region the tile step painted
@@ -606,6 +694,8 @@ class Trainer:
             loss = loss + a.outside_penalty * torch.stack(outside).mean()
         if gate_range:
             loss = loss + 0.01 * torch.stack(gate_range).mean()
+        if soft_edges:
+            loss = loss + a.hard_edge_reward * torch.stack(soft_edges).mean()
         with torch.no_grad():
             final = self.painter.composite(layer)
             gain = psnr(final, target) - start_psnr  # (B,)
@@ -616,7 +706,12 @@ class Trainer:
                 metrics["outside"] = torch.stack(outside).mean().detach()
             if worse:
                 metrics["worse"] = torch.stack(worse).mean().detach()
+            if soft_edges:
+                metrics["soft_edges"] = torch.stack(soft_edges).mean().detach()
             metrics["gain"] = gain.mean()  # improvement of this window over its start
+            if forced is not None:  # how much better the chosen attempt was than the average one (loss units)
+                sc = self._best_of_scores
+                metrics["best_of_gain"] = ((sc.mean(0) - sc.amin(0)) * scale).mean()
             metrics.update({k: torch.tensor(v) for k, v in terms.items()})
             if slots is not None:  # back into the pool, to be continued by a later batch
                 layer, depth = layer.detach(), depth + window
@@ -624,6 +719,39 @@ class Trainer:
                     layer = self.painter.step(target, layer, (depth + i).float() / (depth + a.pool_fast_forward)).layer
                 self.pool.put(slots, target, layer, depth + a.pool_fast_forward, gain)
         return {"loss": loss, **metrics}
+
+    @torch.no_grad()
+    def _best_of_draws(self, target, layer, depth, total, window, step_views) -> List[StrokeSamples]:
+        """
+        --best-of: paints the window --best-of times with independent random draws (stroke positions and
+        gates), without gradients, and returns per step the draws of each image's best attempt (lowest
+        loss at the end of the window). The training pass replays them, so it learns from the plan that
+        worked out best over the whole window rather than from the best single step.
+        """
+        a = self.args
+        attempts, scores = [], []
+        for _ in range(a.best_of):
+            cur, draws = layer, []
+            for k in range(window):
+                boxes, cores = step_views(k)
+                res = self.painter.step(target, cur, (depth + k).float() / total, boxes,
+                                        None if cores is None else cores.unsqueeze(1), margin=a.tile_margin)
+                cur = res.layer
+                draws.append(res.output.samples)
+            attempts.append(draws)
+            scores.append(self.loss_fn(self.painter.composite(cur), target, per_sample=True)[0])
+        self._best_of_scores = torch.stack(scores)  # (K, B) loss of each attempt at the end of the window
+        winner = self._best_of_scores.argmin(0)  # (B,)
+
+        def pick(field: str, k: int):
+            values = [getattr(att[k], field) for att in attempts]
+            if values[0] is None:
+                return None
+            stacked = torch.stack(values)  # (K, B, ...)
+            idx = winner.view(1, -1, *([1] * (stacked.dim() - 2))).expand(1, *stacked.shape[1:])
+            return stacked.gather(0, idx)[0]
+
+        return [StrokeSamples(pick("place_seed", k), pick("gate_on", k)) for k in range(window)]
 
     def train_step(self) -> Dict[str, float]:
         self.model.train()
@@ -784,6 +912,17 @@ class Trainer:
             print(f"grown layers (old weights copied, new parts zero): {', '.join(grown)}")
         skipped = sorted(set(own) - set(compatible))
         self.model.load_state_dict(compatible, strict=False)
+        # Transformer blocks the old model didn't have (a deeper model): zero their residual outputs, so they
+        # start as identity and the model starts out painting exactly like the old one
+        new_blocks = []
+        for name, module in self.model.named_modules():
+            if isinstance(module, TransformerBlock) and not any(k.startswith(name + ".") for k in compatible):
+                for layer in (module.attn.out_proj, module.mlp[-1]):
+                    torch.nn.init.zeros_(layer.weight)
+                    torch.nn.init.zeros_(layer.bias)
+                new_blocks.append(name)
+        if new_blocks:
+            print(f"new transformer blocks (start as identity): {', '.join(new_blocks)}")
         if self.ema:
             self.ema.model.load_state_dict(self.model.state_dict())
         print(f"initialized from {path} ({len(compatible)} tensors" + (f", {len(skipped)} skipped)" if skipped else ")"))

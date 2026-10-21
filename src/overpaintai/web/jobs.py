@@ -19,11 +19,13 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFilter
 
 from overpaintai.highres import (
+    STROKE_FORMAT,
     HighResPainter,
     PaintCancelled,
     config_from_checkpoint,
     load_checkpoint_model,
     load_padded,
+    pad_strokes,
     render_strokes,
 )
 from overpaintai.timelapse import render_timelapse
@@ -330,12 +332,12 @@ class JobManager:
         torch.save(result.layer.half().cpu(), out / "layer.pt")
         Image.fromarray(to_uint8(result.canvas[0, :, :h, :w])).save(out / "final.png")
         Image.fromarray(to_uint8(target[0, :, :h, :w])).save(out / "target.png")
-        new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, 14)
-        strokes = new if prior_strokes is None else torch.cat([prior_strokes, new])  # the whole history
+        new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, 16)
+        strokes = new if prior_strokes is None else torch.cat([pad_strokes(prior_strokes), new])  # the whole history
         job.total_strokes = int(strokes.shape[0])
         torch.save({"strokes": strokes, "size": s.size, "content_wh": wh, "num_stamps": s.num_stamps,
                     "min_radius": painter.min_radius, "max_radius": painter.max_radius,
-                    "format": "points(6), radii(2), opacity(2), hardness, color(3); image coords"}, out / "strokes.pt")
+                    "format": STROKE_FORMAT}, out / "strokes.pt")
         (out / "stats.json").write_text(json.dumps({"settings": asdict(s), "stages": result.stats}, indent=2))
         job.preview = _encode_preview(result.canvas, wh)
         job.preview_version += 1

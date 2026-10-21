@@ -163,3 +163,20 @@ def test_checkpointed_unroll_matches_plain_unroll():
 
     for a, b in zip(run(False), run(True)):
         assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_pressure_curve_defaults_to_linear_and_can_swell():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).eval()
+    layer = engine.create_blank_paint_layer(1, SIZE, SIZE)
+    straight = torch.tensor([[0.15, 0.5, 0.5, 0.5, 0.85, 0.5, 0.2, 0.2, 0.9, 0.9, 1.0, 0.1, 0.2, 0.3]])
+    mean_mid = torch.cat([straight, torch.tensor([[0.2, 0.9]])], dim=-1)  # middle = mean of the ends
+    assert torch.allclose(engine.forward_single_step(layer, straight), engine.forward_single_step(layer, mean_mid),
+                          atol=1e-5)
+
+    swell = torch.cat([straight, torch.tensor([[0.6, 0.9]])], dim=-1)  # thicker in the middle
+    width = lambda out, x: (out[0, 3, :, x] > 0.5).sum().item()  # painted rows in column x
+    out = engine.forward_single_step(layer, swell)
+    assert width(out, SIZE // 2) >= width(out, int(0.2 * SIZE)) + 3
+
+    reversed_swell = reverse_strokes(swell)
+    assert torch.allclose(out, engine.forward_single_step(layer, reversed_swell), atol=1e-4)
