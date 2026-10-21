@@ -9,6 +9,8 @@ Modes:
   unroll   Render-loss training: paint K steps from a blank canvas with the model's own strokes and
            compare the paintings to the target (multi-scale loss). Works with synthetic targets or a
            folder of images; optionally adds a zoomed-in tile step to train the high-resolution path.
+           With a canvas pool (--pool-size), most batches continue paintings from earlier batches
+           instead of starting over, so the model also learns to work on deep canvases.
 
 Typical PoC: teacher pretraining, then unroll fine-tuning initialized from it:
   overpaint-train --mode teacher --epochs 10 --out runs/teacher
@@ -37,7 +39,7 @@ from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas
 from overpaintai.losses import MultiScalePaintLoss, psnr
 from overpaintai.matching import matched_stroke_loss
-from overpaintai.metrics import painting_metrics
+from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
 from overpaintai.model import GATE_LOGIT_RANGE, StrokePredictor
 from overpaintai.painting import Painter
 from overpaintai.viz import save_curve, save_frame, save_progress
@@ -79,7 +81,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--strokes-per-step", type=int, default=16, help="N strokes predicted per view and step")
     g.add_argument("--no-stroke-gate", action="store_true", help="New models: no per-stroke gate output")
     g.add_argument("--no-paintable-mask", action="store_true", help="New models: no paintable-mask input")
-    g.add_argument("--no-error-progress", action="store_true", help="New models: no error-based progress input")
+    g.add_argument("--no-error-progress", action="store_true",
+                   help="New --step-progress models: no error-based progress input")
+    g.add_argument("--step-progress", action="store_true",
+                   help="New models: condition on step / num_steps as before, instead of only on the canvas "
+                        "(stationary: the same model fits any number of steps; needed for the canvas pool)")
+    g.add_argument("--soft-gate", action="store_true",
+                   help="New models: stroke gate as a dimmer in [0, 1] instead of on / off")
 
     g = p.add_argument_group("painting / loss")
     g.add_argument("--steps", type=int, default=6, help="K whole-image painting steps (unroll + validation)")
@@ -94,6 +102,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "to shrink all tile strokes to the minimum radius instead")
     g.add_argument("--val-tile-steps", type=int, default=1,
                    help="Validation: extra 2x2-tile steps (with context margin for paintable-mask models)")
+    g.add_argument("--val-long-steps", type=int, default=128,
+                   help="Validation: also paint this many whole-image steps and log PSNR along the way, drift "
+                        "from the best point and strokes still painted at the end; selects best.pt (0 = off)")
     g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
     g.add_argument("--start-mix", default="blank:1",
                    help="Unroll: start canvases per batch, as kind:weight pairs. 'blank' = empty canvas, "
@@ -107,6 +118,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--grad-through-inputs", action="store_true",
                    help="Unroll: also backprop through the canvas the model looks at (unstable: explodes "
                         "over several steps); by default earlier steps get gradients via the renderer only")
+    g.add_argument("--pool-size", type=int, default=0,
+                   help="Unroll: paintings kept between batches and painted on further, e.g. 512 (0 = always "
+                        "start over; needs a stationary model). ~0.5 MB GPU memory each at --image-size 128. "
+                        "Experimental: at 128 px paintings saturate after a few dozen steps, and it has not beaten "
+                        "fresh starts yet")
+    g.add_argument("--pool-reset", type=float, default=0.05,
+                   help="Unroll: chance per image and batch that a pool painting is replaced by a fresh start "
+                        "(--start-mix). Sets the depth spread: median ~0.7/x batch visits, 10%% beyond 2.3/x")
+    g.add_argument("--pool-min-gain", type=float, default=0.1,
+                   help="Unroll: pool paintings whose last batch gained less PSNR than this (dB) are replaced "
+                        "by fresh starts: finished paintings teach nothing but 'don't touch it', and with most "
+                        "of a batch saying so, the model learned to paint timid soft strokes, then none")
+    g.add_argument("--pool-fast-forward", type=int, default=0,
+                   help="Unroll: extra steps without gradients on each painting before it goes back into the "
+                        "pool (reaches deep canvases faster, at their cost)")
     g.add_argument("--detail-weight", type=float, default=1.0)
     g.add_argument("--edge-loss", action="store_true",
                    help="Add an L1 loss on image gradients (Sobel) that rewards sharp, correctly placed edges")
@@ -114,8 +140,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--flat-loss", action="store_true",
                    help="Add a loss matching local variation (std) so flat target areas stay flat, not mottled")
     g.add_argument("--flat-weight", type=float, default=1.0, help="Weight of the flatness loss (with --flat-loss)")
-    g.add_argument("--stroke-cost", type=float, default=0.01,
-                   help="Cost per active stroke (mean stroke gate) so steps leave out strokes they don't need")
+    g.add_argument("--stroke-cost", type=float, default=0.0,
+                   help="Cost per active stroke (mean stroke gate) so steps leave out strokes they don't need. "
+                        "With the relative loss it is a share of the remaining error: 0.02 = a batch's steps "
+                        "with all strokes on must remove 2%% of the error left. Experimental: every cost tried "
+                        "so far eventually switched all strokes off (off strokes get no gradient for position "
+                        "and color, so turning them back on never pays off)")
+    g.add_argument("--no-relative-loss", action="store_true",
+                   help="Unroll: plain loss instead of each image's loss relative to its loss at the start of "
+                        "the batch (relative: deep canvases with little error left still get a strong signal)")
+    g.add_argument("--worse-weight", type=float, default=1.0,
+                   help="Unroll: extra loss for steps that make the painting worse than before the step")
     g.add_argument("--scales", default="4,16")
     g.add_argument("--scale-weights", default="1,1")
     g.add_argument("--teacher-tail", type=int, default=2,
@@ -202,6 +237,55 @@ def infinite(loader: DataLoader) -> Iterator[torch.Tensor]:
         yield from loader
 
 
+class CanvasPool:
+    """
+    Paintings (target, paint layer, steps painted so far) that unroll training keeps painting on across
+    batches, as in the sample pool of "Growing Neural Cellular Automata": each batch continues some of them
+    for a short unroll and puts them back, so the model sees canvases hundreds of steps deep, painted by
+    itself, and learns to keep improving them (or to stop) instead of only the first steps of a painting.
+    Kept on the training device.
+    """
+
+    def __init__(self, size: int, image_size: int, device: torch.device):
+        self.targets = torch.zeros(size, 3, image_size, image_size, device=device)
+        self.layers = torch.zeros(size, 4, image_size, image_size, device=device)
+        self.depth = torch.zeros(size, dtype=torch.long, device=device)
+        self.gain = torch.zeros(size, device=device)  # PSNR gained on the last visit
+        self.filled = 0
+
+    @property
+    def size(self) -> int:
+        return self.targets.shape[0]
+
+    def draw(self, B: int, reset: float, gen: torch.Generator, min_gain: float = float("-inf")):
+        """
+        Slots `(B,)` for a batch and which of them start fresh `(B,)`: the next empty slots while the pool
+        fills up (all fresh), then random slots, each replaced by a fresh start with probability `reset` or
+        when it gained less than `min_gain` dB on its last visit (stagnant: finished, or stuck).
+        """
+        dev = self.targets.device
+        if self.filled < self.size:
+            slots = torch.arange(self.filled, self.filled + B, device=dev) % self.size
+            self.filled = min(self.size, self.filled + B)
+            return slots, torch.ones(B, dtype=torch.bool, device=dev)
+        slots = torch.randperm(self.size, generator=gen, device=dev)[:B]
+        fresh = (torch.rand(B, generator=gen, device=dev) < reset) | (self.gain[slots] < min_gain)
+        return slots, fresh
+
+    def get(self, slots: torch.Tensor):
+        return self.targets[slots], self.layers[slots], self.depth[slots]
+
+    def put(self, slots: torch.Tensor, targets: torch.Tensor, layers: torch.Tensor, depth: torch.Tensor,
+            gain: torch.Tensor):
+        self.targets[slots], self.layers[slots], self.depth[slots] = targets, layers.detach(), depth
+        self.gain[slots] = gain
+
+    def stats(self) -> Dict[str, float]:
+        d = self.depth[: self.filled].float()
+        return {"pool_depth_mean": d.mean().item(), "pool_depth_p90": torch.quantile(d, 0.9).item(),
+                "pool_depth_max": d.max().item()}
+
+
 # ----------------------------------------------------------------------------------------------------
 class Trainer:
     def __init__(self, args: argparse.Namespace):
@@ -224,7 +308,9 @@ class Trainer:
 
         self.model_config = resume["model_config"] if resume else dict(
             num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
-            paintable_mask=not args.no_paintable_mask, error_progress=not args.no_error_progress,
+            paintable_mask=not args.no_paintable_mask, stationary=not args.step_progress,
+            error_progress=args.step_progress and not args.no_error_progress,  # stationary: built in
+            hard_gate=not args.no_stroke_gate and not args.soft_gate,
         )
         # Gated strokes must be able to vanish completely: no opacity floor in the engine then
         min_opacity = 0.0 if self.model_config.get("stroke_gate") else 0.05
@@ -258,6 +344,12 @@ class Trainer:
         )
 
         self._setup_data()
+        self.pool = None
+        if args.mode == "unroll" and args.pool_size > 0:
+            if self.model.stationary:
+                self.pool = CanvasPool(max(args.pool_size, args.batch_size), self.S, self.device)
+            else:
+                print("note: canvas pool off (needs a stationary model; this one conditions on step progress)")
         self.start_kinds, weights = [], []
         for part in args.start_mix.split(","):
             kind, _, w = part.partition(":")
@@ -416,20 +508,48 @@ class Trainer:
             layer = self.painter.step(target, layer, progress).layer
         return layer, done, kind
 
+    @torch.no_grad()
+    def batch_start(self, window: int):
+        """
+        Targets and start paint layers of an unroll batch, the steps already painted on each `(B,)`, and the
+        pool slots to put the results back into (None without a pool). Without a pool every batch starts
+        over (--start-mix); with one, most images continue a pool painting and a --pool-reset share starts
+        fresh.
+        """
+        B = self.args.batch_size
+        if self.pool is None:
+            target = self.next_targets()
+            layer, done, _ = self.start_canvas(target, window)
+            return target, layer, torch.full((B,), done, device=self.device), None
+        slots, fresh = self.pool.draw(B, self.args.pool_reset, self.gen, self.args.pool_min_gain)
+        target, layer, depth = self.pool.get(slots)
+        n = int(fresh.sum())
+        if n:
+            new_target = self.next_targets()[:n]
+            new_layer, done, _ = self.start_canvas(new_target, window)
+            target[fresh], layer[fresh], depth[fresh] = new_target, new_layer, done
+        return target, layer, depth, slots
+
     def unroll_batch(self) -> Dict[str, torch.Tensor]:
         a = self.args
-        target = self.next_targets()
-        B, S = target.shape[0], target.shape[-1]
         tile = torch.rand((), generator=self.gen, device=self.device).item() < a.tile_prob
         window = a.steps + int(tile)
-        layer, done, _ = self.start_canvas(target, window)
-        total = done + window  # this batch's painting length: `done` steps are already on the canvas
-        loss, weight_sum, entropy, hardness, gates, outside, gate_range = 0.0, 0.0, [], [], [], [], []
+        target, layer, depth, slots = self.batch_start(window)
+        B, S = target.shape[0], target.shape[-1]
+        total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
+        loss, weight_sum, entropy, hardness, gates, outside, gate_range, worse = 0.0, 0.0, [], [], [], [], [], []
         with torch.no_grad():
-            start_psnr = psnr(self.painter.composite(layer), target).mean()
+            start = self.painter.composite(layer)
+            start_psnr = psnr(start, target)  # (B,)
+            prev = self.loss_fn(start, target, per_sample=True)[0]  # (B,) loss before each step
+        # Relative loss: each image's loss in units of its loss at the start of this batch, so a deep painting
+        # with little error left counts as much as a blank one. The stroke cost is then relative too: a step
+        # must remove a share of the error that is left, which keeps fine strokes worth it late in a painting
+        # (an absolute cost outweighed everything a deep painting could still gain and switched all strokes off)
+        scale = 1.0 / prev.clamp(min=1e-4) if not a.no_relative_loss else torch.ones_like(prev)
 
         for k in range(window):
-            progress = torch.full((B,), (done + k) / total, device=self.device)
+            progress = (depth + k).float() / total
             boxes = cores = None
             if tile and k == window - 1:  # one zoomed tile per image: a core plus context margin around it
                 lo, hi = _pair(a.tile_size)
@@ -459,20 +579,26 @@ class Trainer:
                 outside.append((res.reach / width.clamp(min=1e-3)).clamp(max=2.0).mean())
 
             last = k == window - 1
+            canvas = self.painter.composite(layer)
+            full, terms = self.loss_fn(canvas, target, per_sample=True)
+            if a.worse_weight > 0:  # a step should never make the painting worse
+                worse.append((full - prev).clamp(min=0.0))
+            prev = full.detach()
             w = 1.0 if last else a.intermediate_weight
             if w > 0:
-                canvas = self.painter.composite(layer)
-                step_loss, terms = self.loss_fn(canvas, target)
+                step_loss = full
                 if boxes is not None:  # emphasize the zoomed region the tile step painted
                     region = boxes[:, 0] if cores is None else cores
-                    tile_loss, _ = self.loss_fn(canvas, target, box_mask(region, S))
+                    tile_loss, _ = self.loss_fn(canvas, target, box_mask(region, S), per_sample=True)
                     step_loss = 0.5 * (step_loss + tile_loss)
                 loss = loss + w * step_loss
                 weight_sum += w
             if a.detach_canvas and not last:
                 layer = layer.detach()
 
-        loss = loss / weight_sum
+        loss = (scale * loss).mean() / weight_sum
+        if worse:
+            loss = loss + a.worse_weight * (scale * torch.stack(worse).mean(0)).mean()
         mean_gate = torch.stack(gates).mean()
         if self.model.stroke_gate and a.stroke_cost > 0:
             loss = loss + a.stroke_cost * mean_gate
@@ -482,13 +608,21 @@ class Trainer:
             loss = loss + 0.01 * torch.stack(gate_range).mean()
         with torch.no_grad():
             final = self.painter.composite(layer)
+            gain = psnr(final, target) - start_psnr  # (B,)
             metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean(),
-                       "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr,
-                       "gate": mean_gate.detach()}
+                       "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr.mean(),
+                       "gate": mean_gate.detach(), "depth": depth.float().mean()}
             if outside:
                 metrics["outside"] = torch.stack(outside).mean().detach()
-            metrics["gain"] = metrics["psnr"] - start_psnr  # improvement of this window over its start
+            if worse:
+                metrics["worse"] = torch.stack(worse).mean().detach()
+            metrics["gain"] = gain.mean()  # improvement of this window over its start
             metrics.update({k: torch.tensor(v) for k, v in terms.items()})
+            if slots is not None:  # back into the pool, to be continued by a later batch
+                layer, depth = layer.detach(), depth + window
+                for i in range(a.pool_fast_forward):
+                    layer = self.painter.step(target, layer, (depth + i).float() / (depth + a.pool_fast_forward)).layer
+                self.pool.put(slots, target, layer, depth + a.pool_fast_forward, gain)
         return {"loss": loss, **metrics}
 
     def train_step(self) -> Dict[str, float]:
@@ -542,6 +676,40 @@ class Trainer:
             self.out / "samples" / f"epoch_{self.epoch:03d}.png", self.val_targets[:4], torch.cat(finals)[:4],
             f"epoch {self.epoch} | {self.args.mode} | {per_step.numel()} steps | val PSNR {metrics['val_psnr']:.2f} dB",
         )
+        return metrics
+
+    @torch.no_grad()
+    def validate_long(self) -> Dict[str, float]:
+        """
+        Paints the validation images for --val-long-steps whole-image steps (inference runs far longer than
+        the training unroll): PSNR after 8, 16, 32, ... steps and at the end, `drift` (how much PSNR the
+        painting lost from its best step by the end; > 0 = later steps make it worse) and `end_strokes`
+        (active strokes per step over the last 8 steps: a finished painting should need few).
+        """
+        L = self.args.val_long_steps
+        marks = sorted({2**i for i in range(3, 20) if 2**i < L} | {L})
+        painter = self.eval_painter
+        painter.model.eval()
+        sums = {f"val_long_psnr@{m}": 0.0 for m in marks}
+        sums.update(val_long_drift=0.0, val_long_end_strokes=0.0)
+        for chunk in self.val_targets.split(16):
+            b, _, h, w = chunk.shape
+            layer = self.engine.create_blank_paint_layer(b, h, w, self.device)
+            best = torch.full((b,), float("-inf"), device=self.device)
+            for k in range(L):
+                res = painter.step(chunk, layer, torch.full((b,), k / L, device=self.device))
+                layer = res.layer
+                p = psnr(painter.composite(layer), chunk)
+                best = torch.maximum(best, p)
+                if k + 1 in marks:
+                    sums[f"val_long_psnr@{k + 1}"] += p.sum().item()
+                if k >= L - 8:
+                    opacity = views.from_engine_params(res.params, self.engine).opacity.mean(-1)
+                    sums["val_long_end_strokes"] += (opacity > ACTIVE_OPACITY).float().sum().item() / min(8, L)
+            sums["val_long_drift"] += (best - p).sum().item()
+        n = self.val_targets.shape[0]
+        metrics = {k: v / n for k, v in sums.items()}
+        metrics["val_long_psnr"] = metrics[f"val_long_psnr@{L}"]
         return metrics
 
     @torch.no_grad()
@@ -647,9 +815,14 @@ class Trainer:
             is_best = False
             if (epoch + 1) % a.val_every == 0 or epoch + 1 == a.epochs:
                 row.update(self.validate())
-                if row["val_psnr"] > self.best_psnr:
-                    self.best_psnr, is_best = row["val_psnr"], True
+                if a.val_long_steps > 0:
+                    row.update(self.validate_long())
+                score = row.get("val_long_psnr", row["val_psnr"])  # best.pt: the long painting, if measured
+                if score > self.best_psnr:
+                    self.best_psnr, is_best = score, True
             row.update(self.preview(f"epoch_{epoch + 1:03d}"))
+            if self.pool is not None:
+                row.update(self.pool.stats())
             self.history.append(row)
 
             self.save(self.out / "last.pt")
@@ -665,11 +838,15 @@ class Trainer:
             )
             val_txt = (f" | val PSNR {row['val_psnr']:.2f} dB (loss {row['val_loss']:.4f}, edge err {row['val_edge_err']:.4f})"
                        f"{' * best' if is_best else ''}") if "val_psnr" in row else ""
+            if "val_long_psnr" in row:
+                val_txt += (f" | {a.val_long_steps} steps {row['val_long_psnr']:.2f} dB (drift "
+                            f"{row['val_long_drift']:.2f}, {row['val_long_end_strokes']:.1f} strokes/step at the end)")
             preview_txt = f" | preview {row['preview_psnr']:.2f} dB" if "preview_psnr" in row else ""
             tqdm.write(f"epoch {epoch + 1}: train loss {row['train_loss']:.4f}, PSNR {row['train_psnr']:.2f} dB, "
                        f"entropy {row['train_entropy']:.2f}, hardness {row['train_hardness']:.2f}"
                        f"{val_txt}{preview_txt} | {row['time']:.0f}s")
-        print(f"done: best val PSNR {self.best_psnr:.2f} dB -> {self.out / 'best.pt'}")
+        metric = f"{a.val_long_steps}-step val PSNR" if a.val_long_steps > 0 else "val PSNR"
+        print(f"done: best {metric} {self.best_psnr:.2f} dB -> {self.out / 'best.pt'}")
 
     @staticmethod
     def _append_csv(path: Path, row: Dict):

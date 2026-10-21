@@ -123,7 +123,9 @@ def checkpoint_defaults(path: Path) -> Dict:
     args = json.loads(args_file.read_text()) if args_file.exists() else {}
     cfg, view_res, _ = config_from_checkpoint({"args": args})
     return {"whole_steps": cfg.whole_steps, "view_res": view_res, "tile_range": list(cfg.scale_clamp),
-            "train_image_size": args.get("image_size"), "data": args.get("data")}
+            "train_image_size": args.get("image_size"), "data": args.get("data"),
+            # runs from before --step-progress existed condition on step / num_steps
+            "stationary": "step_progress" in args and not args["step_progress"]}
 
 
 def auto_importance(img: Image.Image, mode: str) -> Image.Image:

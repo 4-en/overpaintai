@@ -9,7 +9,12 @@ import torch.nn.functional as F
 LossTerm = Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
 
 
-def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+def _masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor], per_sample: bool = False) -> torch.Tensor:
+    """Mean of `x` (over the `mask`ed pixels); with `per_sample`, one mean per batch element `(B,)`."""
+    if per_sample:
+        if mask is None:
+            return x.flatten(1).mean(1)
+        return (x * mask).flatten(1).sum(1) / (mask.flatten(1).sum(1) * x.shape[1] + 1e-6)
     if mask is None:
         return x.mean()
     return (x * mask).sum() / (mask.sum() * x.shape[1] + 1e-6)
@@ -116,29 +121,37 @@ class MultiScalePaintLoss(nn.Module):
         self.extra_terms = dict(extra_terms or {})
 
     def forward(
-        self, pred: torch.Tensor, target: torch.Tensor, valid_mask: Optional[torch.Tensor] = None
+        self, pred: torch.Tensor, target: torch.Tensor, valid_mask: Optional[torch.Tensor] = None,
+        per_sample: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Returns the total loss and a dict of the individual (weighted) terms for logging."""
+        """
+        Returns the total loss (a scalar, or `(B,)` per image with `per_sample`) and a dict of the
+        individual (weighted) terms, as batch means, for logging. Extra terms are always batch scalars.
+        """
+
+        def mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+            return _masked_mean(x, mask, per_sample)
+
         terms: Dict[str, torch.Tensor] = {}
         if self.detail_weight > 0:
-            terms["detail"] = self.detail_weight * _masked_mean((pred - target).abs(), valid_mask)
+            terms["detail"] = self.detail_weight * mean((pred - target).abs(), valid_mask)
 
         if self.edge_weight > 0:
             diff = (image_gradients(pred) - image_gradients(target)).abs()
-            terms["edge"] = 0.5 * self.edge_weight * _masked_mean(diff, valid_mask)
+            terms["edge"] = 0.5 * self.edge_weight * mean(diff, valid_mask)
             sharp = (local_sharpness(pred) - local_sharpness(target)).abs()
-            terms["sharp"] = self.edge_weight * _masked_mean(sharp, valid_mask)
+            terms["sharp"] = self.edge_weight * mean(sharp, valid_mask)
 
         if self.flat_weight > 0:
             flat = (local_std(pred) - local_std(target)).abs()
-            terms["flat"] = self.flat_weight * _masked_mean(flat, valid_mask)
+            terms["flat"] = self.flat_weight * mean(flat, valid_mask)
 
         for factor, weight in zip(self.scales, self.scale_weights):
             if weight <= 0:
                 continue
             if valid_mask is None:
                 diff = _coarse(pred, factor, self.coarse_mode) - _coarse(target, factor, self.coarse_mode)
-                terms[f"x{factor}"] = weight * diff.abs().mean()
+                terms[f"x{factor}"] = weight * mean(diff.abs(), None)
             else:
                 # Downsample masked images and renormalize by the downsampled mask so padding does not leak in
                 m = _coarse(valid_mask, factor, self.coarse_mode)
@@ -146,13 +159,13 @@ class MultiScalePaintLoss(nn.Module):
                     _coarse(pred * valid_mask, factor, self.coarse_mode)
                     - _coarse(target * valid_mask, factor, self.coarse_mode)
                 ) / (m + 1e-6)
-                terms[f"x{factor}"] = weight * _masked_mean(diff.abs(), (m > 0).to(diff.dtype))
+                terms[f"x{factor}"] = weight * mean(diff.abs(), (m > 0).to(diff.dtype))
 
         for name, (weight, fn) in self.extra_terms.items():
             terms[name] = weight * fn(pred, target, valid_mask)
 
         total = sum(terms.values())
-        return total, {k: float(v.detach()) for k, v in terms.items()}
+        return total, {k: float(v.detach().mean()) for k, v in terms.items()}
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

@@ -148,3 +148,29 @@ def test_gate_keeps_a_gradient_when_switched_off():
     assert out.gate.max() < 1e-6  # forward: off
     grad, = torch.autograd.grad(out.gate.sum(), model.attr_mlp[-1].bias)
     assert grad[-1] >= GATE_LEAK * out.gate.numel() * 0.99  # backward: still a usable signal
+
+
+def test_stationary_model_ignores_the_step_and_hard_gate_is_on_or_off():
+    torch.manual_seed(7)
+    model = _small_model(stroke_gate=True, stationary=True, hard_gate=True).eval()
+    assert model.uses_error_progress
+    x, boxes = torch.randn(2, 12, R, R), views.whole_image_boxes(2)
+    e = torch.tensor([0.2, 0.95])
+    a = model(x, boxes, torch.zeros(2), error_progress=e)
+    b = model(x, boxes, torch.ones(2), error_progress=e)
+    assert torch.equal(a.strokes.points, b.strokes.points)  # step progress has no effect
+    c = model(x, boxes, torch.zeros(2), error_progress=torch.tensor([0.5, 0.5]))
+    assert not torch.allclose(a.strokes.radii, c.strokes.radii)  # the canvas state does
+    assert set(a.gate.unique().tolist()) <= {0.0, 1.0}
+
+    model.train()
+    with torch.no_grad():
+        model.attr_mlp[-1].bias[-1] = -3.0  # logit 0: on with probability 0.5 in training
+    on = torch.stack([model(x, boxes, torch.zeros(2), error_progress=e).gate.detach() for _ in range(20)])
+    assert set(on.unique().tolist()) <= {0.0, 1.0} and 0.3 < on.mean() < 0.7  # sampled
+    with torch.no_grad():
+        model.attr_mlp[-1].bias[-1] = -20.0  # logit -17: off
+    out = model(x, boxes, torch.zeros(2), error_progress=e)
+    assert (out.gate == 0).all()
+    grad, = torch.autograd.grad(out.gate.sum(), model.attr_mlp[-1].bias)
+    assert grad[-1] > 0  # straight-through (+ leak): an off stroke still learns whether to switch on

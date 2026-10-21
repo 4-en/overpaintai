@@ -333,7 +333,7 @@ class HighResPainter:
             paintable = (views.core_mask(boxes, cores, self.R) if cores is not None
                          else torch.ones(boxes.shape[0], 1, self.R, self.R, device=self.device))
         x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.R, paintable)
-        e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.error_progress else None
+        e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.uses_error_progress else None
         return x, e
 
     @torch.no_grad()

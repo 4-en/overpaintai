@@ -119,7 +119,16 @@ class StrokePredictor(nn.Module):
             (trained with a per-stroke cost).
         error_progress: condition on a second progress value derived from the canvas error, in addition
             to the step-based progress (see `views.error_progress`).
-        The three switches default to off so that checkpoints from before they existed load unchanged.
+        stationary: condition only on the canvas, not on the step: the progress slot gets the error-based
+            progress instead of step / num_steps (the `progress` argument is ignored), plus a log-scale
+            version of it that still tells a 90% from a 99% finished view. The same model then fits any
+            number of steps (step 3 and step 3000 are the same problem).
+        hard_gate: the stroke gate is either on or off instead of a dimmer: logit > 0 at inference, sampled
+            with the gate probability in training, with the soft gate's gradient (straight-through). With a
+            soft gate, a stroke cost makes dimming strokes cheaper than dropping them, which piles up faint
+            strokes. Sampling matters: at full opacity a well-placed stroke has ~zero marginal benefit, so a
+            deterministic gate only ever learns "off"; sampled off, the gradient sees what it is worth.
+        The switches default to off so that checkpoints from before they existed load unchanged.
     """
 
     IN_CHANNELS = 12  # see views.view_inputs (13 with paintable_mask)
@@ -139,12 +148,16 @@ class StrokePredictor(nn.Module):
         paintable_mask: bool = False,
         stroke_gate: bool = False,
         error_progress: bool = False,
+        stationary: bool = False,
+        hard_gate: bool = False,
     ):
         super().__init__()
         self.num_strokes = num_strokes
         self.paintable_mask = paintable_mask
         self.stroke_gate = stroke_gate
         self.error_progress = error_progress
+        self.stationary = stationary
+        self.hard_gate = hard_gate
         self.in_channels = self.IN_CHANNELS + int(paintable_mask)
         self.token_grid = token_grid
         self.max_offset = max_offset
@@ -152,8 +165,9 @@ class StrokePredictor(nn.Module):
         w0, w1, w2, w3 = widths
         cond_dim = token_dim
 
-        # Conditioning: step progress in [0, 1], log2 of the view size (and the error-based progress)
-        n_cond = 2 + int(error_progress)
+        # Conditioning: step progress in [0, 1], log2 of the view size (and the error-based progress);
+        # stationary: error-based progress, log2 of the view size, log-scale error progress
+        n_cond = 2 + int(error_progress or stationary)
         self.cond_mlp = nn.Sequential(nn.Linear(n_cond, cond_dim), nn.SiLU(), nn.Linear(cond_dim, cond_dim))
 
         # Local path: residual U-Net, three downsamples
@@ -219,10 +233,21 @@ class StrokePredictor(nn.Module):
     def _cond(
         self, progress: torch.Tensor, view_size: torch.Tensor, error_progress: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        parts = [progress, torch.log2(view_size.clamp(min=1e-4))]
+        log_size = torch.log2(view_size.clamp(min=1e-4))
+        if self.stationary:
+            e = torch.zeros_like(view_size) if error_progress is None else error_progress.to(view_size.dtype)
+            # remaining error on a log scale: 0 at blank, 1 at 1/1024 of the blank canvas' error
+            fine = (-torch.log2((1.0 - e).clamp(min=2.0**-10)) / 10.0).clamp(0.0, 1.0)
+            return self.cond_mlp(torch.stack([e, log_size, fine], dim=-1))
+        parts = [progress, log_size]
         if self.error_progress:
             parts.append(torch.zeros_like(progress) if error_progress is None else error_progress)
         return self.cond_mlp(torch.stack(parts, dim=-1))
+
+    @property
+    def uses_error_progress(self) -> bool:
+        """Whether callers must pass `error_progress` (see `views.error_progress`)."""
+        return self.error_progress or self.stationary
 
     def _token_positions(self, boxes: torch.Tensor) -> torch.Tensor:
         """Image-space centers of the token grid cells of each view, `(B, G*G, 2)`."""
@@ -268,12 +293,13 @@ class StrokePredictor(nn.Module):
         Args:
             inputs: (B, 12 or 13, R, R) view inputs from `views.view_inputs` (any R; trained at a fixed R).
             boxes: (B, 3) view boxes (x, y, s) in image coordinates.
-            progress: (B,) painting progress in [0, 1] (e.g. step / num_steps).
+            progress: (B,) painting progress in [0, 1] (e.g. step / num_steps); ignored by stationary models.
             global_tokens: (B, G*G, D) from `encode_global`; if omitted, this view's own tokens are used
                 as global context (correct for whole-image views).
             view_size: (B,) view size fed to the conditioning instead of `boxes[:, 2]`, e.g. clamped to
                 the range seen in training when painting smaller tiles (token positions still use `boxes`).
-            error_progress: (B,) error-based progress (`views.error_progress`), for `error_progress` models.
+            error_progress: (B,) error-based progress (`views.error_progress`), for models with
+                `uses_error_progress`.
         """
         B, _, R, _ = inputs.shape
         cond = self._cond(progress, boxes[:, 2] if view_size is None else view_size, error_progress)
@@ -337,6 +363,9 @@ class StrokePredictor(nn.Module):
                 # Leaky gradient (forward value unchanged): a saturated, switched-off gate still gets a
                 # learning signal and can come back, instead of dying
                 gate = gate + GATE_LEAK * (gate_logit - gate_logit.detach())
+            if self.hard_gate:  # on / off; gradient of the soft gate (straight-through)
+                on = torch.bernoulli(gate.detach().clamp(0.0, 1.0)) if self.training else (gate_logit > 0).float()
+                gate = on + (gate - gate.detach())
         else:
             gate = torch.ones(out.shape[:-1], device=out.device)
         offsets, out = out[..., 0:4], out[..., 4:]

@@ -103,7 +103,9 @@ async function loadDefaults() {
   if (!res.ok) return;
   const d = await res.json();
   $("whole-steps").placeholder = `as trained (${d.whole_steps})`;
-  $("steps-hint").textContent = `trained with ${d.whole_steps}`;
+  $("steps-hint").textContent = d.stationary
+    ? `trained with ${d.whole_steps} · any number works`
+    : `trained with ${d.whole_steps} · far more steps go beyond what it learned`;
   const data = d.data ? ` · data: ${d.data}` : "";
   $("ckpt-info").textContent = `view ${d.view_res}px · trained at ${d.train_image_size ?? "?"}px${data}`;
 }

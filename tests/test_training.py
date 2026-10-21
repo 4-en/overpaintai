@@ -96,7 +96,7 @@ def test_log_uniform_crops_cover_all_zoom_levels():
 TINY = (
     "--model-size tiny --image-size 32 --view-res 16 --strokes-per-step 4 --target-strokes 8,12 --steps 2 "
     "--batch-size 4 --steps-per-epoch 3 --val-size 4 --warmup-steps 1 --log-every 1 --num-workers 0 "
-    "--device cpu --amp none"
+    "--device cpu --amp none --val-long-steps 8"
 ).split()
 
 
@@ -142,7 +142,42 @@ def test_new_losses_tile_cores_and_quality_metrics(tmp_path):
                 "val_faint_share", "val_gain_per_100", "val_lineart_edge_err", "val_tile_gate"):
         assert key in hist, key
     cfg = torch.load(out / "last.pt", weights_only=False)["model_config"]
-    assert cfg["stroke_gate"] and cfg["paintable_mask"] and cfg["error_progress"]
+    assert cfg["stroke_gate"] and cfg["paintable_mask"] and cfg["stationary"] and cfg["hard_gate"]
+
+
+def test_canvas_pool_continues_paintings_and_long_validation(tmp_path):
+    from overpaintai.train import Trainer, parse_args
+
+    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--pool-size", "8", "--pool-reset", "0", "--pool-min-gain", "-1000", "--tile-prob", "0",
+                                         "--start-mix", "blank:1,degraded:1", "--out", str(tmp_path / "pool")]))
+    assert trainer.pool is not None
+    for _ in range(2):  # batch size 4: two batches fill the pool, all fresh
+        trainer.train_step()
+    assert trainer.pool.filled == 8
+    first_depth = trainer.pool.depth.clone()
+    stats = [trainer.train_step() for _ in range(4)]  # no resets: every batch continues pool paintings
+    assert all(st["depth"] > 0 for st in stats)
+    assert trainer.pool.depth.sum() == first_depth.sum() + 4 * 4 * 2  # 4 batches x 4 images x 2 steps
+    assert "worse" in stats[0]
+    long = trainer.validate_long()
+    for key in ("val_long_psnr", "val_long_psnr@8", "val_long_drift", "val_long_end_strokes"):
+        assert key in long, key
+    assert long["val_long_drift"] >= 0
+
+    old = Trainer(parse_args(TINY + ["--mode", "unroll", "--step-progress", "--out", str(tmp_path / "old")]))
+    assert old.pool is None and not old.model.stationary  # step-conditioned models can't use the pool
+
+
+def test_per_sample_loss_matches_the_batch_loss():
+    from overpaintai.losses import MultiScalePaintLoss
+
+    loss_fn = MultiScalePaintLoss(edge_weight=1.0, flat_weight=1.0)
+    pred, target = torch.rand(3, 3, 32, 32), torch.rand(3, 3, 32, 32)
+    mask = box_mask(torch.tensor([[0.1, 0.2, 0.5]] * 3), 32)
+    for m in (None, mask):
+        total, _ = loss_fn(pred, target, m)
+        per, _ = loss_fn(pred, target, m, per_sample=True)
+        assert per.shape == (3,) and torch.allclose(per.mean(), total, rtol=1e-4)
 
 
 def test_painting_metrics_sanity():

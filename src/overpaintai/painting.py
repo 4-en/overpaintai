@@ -99,7 +99,7 @@ class Painter:
         if not self.model.paintable_mask:
             paintable = None
         x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, R, paintable)
-        e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.error_progress else None
+        e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.uses_error_progress else None
         return x, e
 
     def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
