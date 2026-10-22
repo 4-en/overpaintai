@@ -19,7 +19,7 @@ def _inputs(engine, target, boxes):
     return views.view_inputs(target, engine.composite(layer), layer[:, 3:], boxes, R), layer
 
 
-def test_outputs_pressure_curve_and_anchor_anywhere_on_the_stroke():
+def test_outputs_pressure_curve_and_points_around_the_anchor():
     torch.manual_seed(0)
     model = _model(stroke_gate=True, hard_gate=True, stationary=True).eval()
     boxes = views.whole_image_boxes(2)
@@ -29,11 +29,9 @@ def test_outputs_pressure_curve_and_anchor_anywhere_on_the_stroke():
     lo, hi = model.radius_range
     assert (s.radii >= lo).all() and (s.radii <= hi).all() and (s.opacity >= 0.05).all() and (s.opacity <= 1).all()
     assert set(out.gate.unique().tolist()) <= {0.0, 1.0} and out.tool_logits.shape == (2, 4, 5)
-    assert ((out.anchor_t >= 0.2) & (out.anchor_t <= 0.8)).all()
-    p0, p1, p2 = s.points.unbind(2)
-    t = out.anchor_t.unsqueeze(-1)
-    on_curve = (1 - t) ** 2 * p0 + 2 * t * (1 - t) * p1 + t ** 2 * p2
-    assert torch.allclose(on_curve, out.anchors, atol=1e-5)  # the anchor is B(anchor_t)
+    # the anchor is a reference point: all three Bezier points are bounded offsets from it
+    reach = (s.points - out.anchors.unsqueeze(2)).abs()
+    assert (reach <= model.max_offset + 0.1 + 1e-5).all()
 
     engine = DifferentiableCanvasEngine(canvas_size=48, min_opacity=0.0)
     params = views.to_engine_params(views.view_to_image(s, boxes), engine)
@@ -41,6 +39,38 @@ def test_outputs_pressure_curve_and_anchor_anywhere_on_the_stroke():
     assert torch.allclose(views.from_engine_params(params, engine).radii, s.radii.clamp(engine.min_radius), atol=1e-6)
     plain = _model(pressure=False).eval()(torch.randn(1, 12, R, R), views.whole_image_boxes(1), torch.zeros(1))
     assert plain.strokes.radii.shape == (1, 4, 2)
+
+
+def test_strokes_run_past_their_anchor():
+    torch.manual_seed(1)
+    model = _model().eval()
+    with torch.no_grad():  # long, bent strokes
+        model.decoder[-1].weight.normal_(std=2.0)
+    out = model(torch.randn(2, 12, R, R), views.whole_image_boxes(2), torch.zeros(2))
+    p, a = out.strokes.points, out.anchors
+    # the anchor is the chord's middle and the curve passes close by it, however long or bent the stroke
+    assert torch.allclose(0.5 * (p[:, :, 0] + p[:, :, 2]), a, atol=1e-5)
+    mid = 0.25 * p[:, :, 0] + 0.5 * p[:, :, 1] + 0.25 * p[:, :, 2]
+    assert ((mid - a).norm(dim=-1) <= model.max_offset / 4 * 2**0.5 + 1e-5).all()
+    assert (p[:, :, 0] - a).norm(dim=-1).max() > model.max_offset / 2  # long strokes exist
+    # plan checkpoints from before the options keep their free offsets and 9 px colors
+    old = build_model(dict(SMALL, arch="plan"))
+    assert old.stroke_points == "free" and old.color_base == "blur9"
+
+
+def test_color_starts_from_the_target_at_the_strokes_width():
+    from overpaintai.plan_model import _blur
+
+    model = _model().eval()
+    target = torch.zeros(1, 3, 128, 128)
+    target[:, :, :, 64:] = 1.0  # an edge at x = 0.5
+    target[:, :, :, 66] = 0.0  # and a thin dark line just right of it
+    colors = torch.cat([target, _blur(target, 9), _blur(target, 33)], 1)
+    look = torch.tensor([[[[66 / 127, 0.5]], [[0.7, 0.5]]]])  # (1, 2 strokes, 1 point, 2)
+    thin, wide = torch.full((1, 2, 3), 0.5 / 127), torch.full((1, 2, 3), 16 / 127)
+    c_thin, c_wide = model._base_color(colors, look, thin), model._base_color(colors, look, wide)
+    assert c_thin[0, 0].max() < 0.01 and c_thin[0, 1].min() > 0.99  # single pixels: the line itself
+    assert 0.3 < c_wide[0, 0].mean() < 0.9  # ~33 px: the edge and the line averaged
 
 
 def test_any_input_size_and_resolution_independent_strokes():
@@ -63,19 +93,18 @@ def test_any_input_size_and_resolution_independent_strokes():
     assert out.strokes.points.shape == (1, 4, 3, 2)
 
 
-def test_strokes_coordinate_through_their_provisional_shapes():
+def test_strokes_see_along_their_curve_and_each_other():
     torch.manual_seed(4)
     model = _model().eval()
-    with torch.no_grad():  # make the provisional geometry non-trivial (it starts at zero)
-        model.geo_head[-1].weight.normal_(std=0.5)
-    x, boxes = torch.randn(1, 12, R, R).requires_grad_(True), views.whole_image_boxes(1)
+    with torch.no_grad():  # strokes start as dots; give them some extent so there is a curve to look along
+        model.decoder[-1].weight.normal_(std=0.5)
+    x, boxes = torch.randn(1, 12, R, R), views.whole_image_boxes(1)
     out = model(x, boxes, torch.zeros(1))
     # stroke 0's output depends on stroke 1's latent (self-attention among the stroke latents) ...
-    q = model.queries
-    g, = torch.autograd.grad(out.strokes.points[0, 0].sum(), q, retain_graph=True)
+    g, = torch.autograd.grad(out.strokes.points[0, 0].sum(), model.queries, retain_graph=True)
     assert g[1].abs().sum() > 0
-    # ... and on the provisional shape read out of the latents (where features are sampled, the encoding)
-    g, = torch.autograd.grad(out.strokes.color.sum(), model.geo_head[-1].weight)
+    # ... and on what lies along the strokes' current curves (features sampled there enter the latents)
+    g, = torch.autograd.grad(out.strokes.color.sum(), model.refine[0]["feat"][1].weight)
     assert g.abs().sum() > 0
 
 

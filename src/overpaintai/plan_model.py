@@ -6,13 +6,18 @@ deciding the N strokes of a step.
    plan slots attend to each other (6 blocks). The view tokens also flow back into the U-Net bottleneck.
 2. Strokes: one latent per stroke (query blocks: coordinate, then read the plan), an initial position from a
    spatial soft-argmax over full-resolution pixel features (as in `StrokePredictor`), then refinement layers on
-   the latents. Each layer reads a provisional shape out of each latent (position, endpoints, size), encodes
-   where the stroke is and samples features along its provisional curve, then lets the strokes attend to each
-   other (who covers what) and to the plan. Stroke parameters are only read out of the latents, never carried as
-   the state; the final stroke is decoded once from the last latent.
+   the latents. Attention only ever sees the latents. One shared decoder turns any latent into a complete stroke:
+   each layer decodes its current stroke (detached) only to sample features along it (what the stroke would
+   cover), adds them to the latent, then lets the strokes attend to each other (who covers what) and to the plan.
+   The output is the same decoder applied to the last latent, so every layer works on the stroke that will be
+   painted.
 
-Strokes get a pressure curve (start / end / middle radius and opacity) and an anchor anywhere along the curve
-(not just its midpoint), and their color starts from the locally averaged target instead of a single pixel.
+Strokes get a pressure curve (start / end / middle radius and opacity). The anchor is the middle of the stroke's
+chord (start and end lie on opposite sides of it) and the control point bends the curve by a bounded amount, so
+the stroke always runs past its anchor, and the placement map, the features read at the anchor and the color
+all describe the stroke that gets painted. (In `StrokePredictor` the anchor is the curve's midpoint, which made
+~30% of strokes double back on themselves; a symmetric chord can't.) Colors start from the target averaged along
+the stroke at the stroke's own scale: single pixels for thin strokes, up to ~33 px averages for wide ones.
 """
 
 import math
@@ -63,6 +68,12 @@ class PlanStrokePredictor(nn.Module):
         global_grid: side of the whole image's token grid.
         plan_slots: learned plan tokens (a summary of what the step should do, learned end to end).
         pressure: strokes with a middle radius / opacity (pressure curve, 16 engine params).
+        stroke_points: 'chord' (the anchor is the chord's middle, see the module docstring) or 'free' (all three
+            points are free offsets from the anchor; checkpoints from before this option. Unroll training moved
+            those strokes up to ~30 px away from their anchors, where their colors and features don't apply).
+        color_base: where a stroke's color starts, before the decoder's correction: 'scaled' (the target along the
+            stroke, averaged over about the stroke's width) or 'blur9' (always ~9 px averages; checkpoints from
+            before the option. That blurred the color of the thin late strokes on edges and detail).
     """
 
     IN_CHANNELS = StrokePredictor.IN_CHANNELS
@@ -88,6 +99,8 @@ class PlanStrokePredictor(nn.Module):
         stationary: bool = False,
         hard_gate: bool = False,
         pressure: bool = True,
+        stroke_points: str = "chord",
+        color_base: str = "scaled",
     ):
         super().__init__()
         self.num_strokes = num_strokes
@@ -97,6 +110,12 @@ class PlanStrokePredictor(nn.Module):
         self.stationary = stationary
         self.hard_gate = hard_gate
         self.pressure = pressure
+        if stroke_points not in ("chord", "free"):
+            raise ValueError(f"unknown stroke_points {stroke_points!r}")
+        self.stroke_points = stroke_points
+        if color_base not in ("scaled", "blur9"):
+            raise ValueError(f"unknown color_base {color_base!r}")
+        self.color_base = color_base
         self.in_channels = self.IN_CHANNELS + int(paintable_mask)
         self.view_tokens = view_tokens
         self.global_grid = global_grid
@@ -161,34 +180,51 @@ class PlanStrokePredictor(nn.Module):
 
         # Latent init from the features at the initial anchor + the target color at three scales
         point_dim = P + w2 + w3 + 9
-        self.init_proj = nn.Linear(point_dim, D)
+        self.init_proj = nn.Sequential(nn.LayerNorm(point_dim), nn.Linear(point_dim, D))
 
-        # Refinement: provisional shape -> where to look; strokes attend to each other and to the plan
-        self.geo_head = nn.Sequential(nn.Linear(D, D), nn.SiLU(), nn.Linear(D, 7))  # shift 2, p0 2, p2 2, log r 1
-        nn.init.zeros_(self.geo_head[-1].weight)
-        nn.init.zeros_(self.geo_head[-1].bias)
-        self.geo_pos = FourierPosition(D)
+        # Refinement: strokes look along their current curve, attend to each other and to the plan
         curve_dim = len(CURVE_T) * (P + w2)
         self.refine = nn.ModuleList()
         for _ in range(refine_layers):
             self.refine.append(nn.ModuleDict(dict(
-                pos=nn.Linear(3 * D + 1, D), feat=nn.Linear(curve_dim, D),
+                feat=nn.Sequential(nn.LayerNorm(curve_dim), nn.Linear(curve_dim, D)),
                 self_attn=TransformerBlock(D, heads), cross_attn=TransformerBlock(D, heads, cross=True),
             )))
 
-        # Output head: offsets 4, anchor t 1, radii 3, opacity 3, hardness 1, color 3, tools, (gate)
+        # Shared stroke decoder (latent -> stroke): anchor shift 2, point offsets 6, radii, opacity, hardness 1,
+        # color 3, tools, (gate)
         self.n_ends = 3 if pressure else 2
-        n_out = 4 + 1 + 2 * self.n_ends + 1 + 3 + num_tools + int(stroke_gate)
-        self.out_mlp = nn.Sequential(
-            nn.Linear(D + curve_dim + 3, 2 * D), nn.SiLU(), nn.Linear(2 * D, D), nn.SiLU(), nn.Linear(D, n_out),
+        n_out = 2 + 6 + 2 * self.n_ends + 1 + 3 + num_tools + int(stroke_gate)
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(D), nn.Linear(D, 2 * D), nn.SiLU(), nn.Linear(2 * D, D), nn.SiLU(), nn.Linear(D, n_out),
         )
-        nn.init.normal_(self.out_mlp[-1].weight, std=1e-3)
-        nn.init.zeros_(self.out_mlp[-1].bias)
+        nn.init.normal_(self.decoder[-1].weight, std=1e-3)  # starts as a dot at the initial anchor
+        nn.init.zeros_(self.decoder[-1].bias)
 
     # ------------------------------------------------------------------------------------------------
     _cond = StrokePredictor._cond
     uses_error_progress = StrokePredictor.uses_error_progress
     _encode = StrokePredictor._encode
+
+    def _base_color(self, colors: torch.Tensor, look: torch.Tensor, radii: torch.Tensor) -> torch.Tensor:
+        """
+        The target along the stroke `(B, N, 3)`, averaged over about the stroke's width: the three blur levels of
+        `colors` (1, ~9 and ~33 px at 128 px) mixed by the stroke's diameter in pixels, linearly in log size.
+        """
+        levels = _sample(colors, look).float().mean(2).unflatten(-1, (3, 3))  # (B, N, level, rgb)
+        if self.stroke_points == "free" or self.color_base == "blur9":
+            return levels[..., 1, :]
+        R = colors.shape[-1]
+        sizes = torch.tensor([1.0, _odd(9 * R / 128), _odd(33 * R / 128)], device=colors.device).log()
+        width = (2.0 * radii.detach().float().mean(-1) * (R - 1)).clamp(min=1.0).log().clamp(max=sizes[-1])
+        lo = (width.unsqueeze(-1) >= sizes[1:2]).long().squeeze(-1)  # 0: between 1 and 9 px, 1: 9 and 33 px
+        frac = ((width - sizes[lo]) / (sizes[lo + 1] - sizes[lo])).clamp(0.0, 1.0).unsqueeze(-1)
+        pick = lambda i: levels.gather(2, i.view(*i.shape, 1, 1).expand(*i.shape, 1, 3)).squeeze(2)
+        return (1.0 - frac) * pick(lo) + frac * pick(lo + 1)
+
+    @staticmethod
+    def _curve_t(device: torch.device) -> torch.Tensor:
+        return torch.tensor(CURVE_T, device=device)
 
     def _grid_positions(self, boxes: torch.Tensor, G: int) -> torch.Tensor:
         centers = (torch.arange(G, device=boxes.device, dtype=boxes.dtype) + 0.5) / G
@@ -208,14 +244,36 @@ class PlanStrokePredictor(nn.Module):
         cond = self._cond(progress, boxes[:, 2], error_progress)
         return self._tokens(self._encode(whole_inputs, cond)[3], boxes, self.global_grid, kind=0)
 
-    def _geometry(self, h: torch.Tensor, anchor0: torch.Tensor):
-        """Provisional shape read out of the latents: anchor, endpoints, log radius (and the raw head output)."""
-        g = self.geo_head(h).float()
-        anchor = anchor0 + 0.1 * torch.tanh(g[..., 0:2])
-        p0 = anchor + self.max_offset * torch.tanh(g[..., 2:4])
-        p2 = anchor + self.max_offset * torch.tanh(g[..., 4:6])
-        log_r = math.log(0.1) + g[..., 6:7]
-        return anchor, p0, p2, log_r, g
+    def _decode(self, h: torch.Tensor, anchor0: torch.Tensor, colors: torch.Tensor):
+        """
+        The stroke a latent describes: (anchor, points, radii, opacity, hardness, color, tool logits, raw gate logit).
+        The anchor is the initial anchor plus a small shift and the middle of the chord p0 -> p2 (half chord up to
+        max_offset); the control point is at most max_offset / 2 from it, so the curve passes within max_offset / 4
+        of the anchor. The color is a correction to the target along the stroke at about the stroke's width (see
+        `_base_color`; looked up at the detached stroke: where to look, not a gradient path). `colors`: the target
+        at 1, ~9 and ~33 px averages, stacked on channels.
+        """
+        out = self.decoder(h).float()
+        e = self.n_ends
+        shift, offsets, r_raw, a_raw, h_raw, c_raw, rest = out.split(
+            [2, 6, e, e, 1, 3, out.shape[-1] - 12 - 2 * e], dim=-1)
+        anchor = anchor0 + 0.1 * torch.tanh(shift)
+        off = self.max_offset * torch.tanh(offsets.unflatten(-1, (3, 2)))  # (B, N, 3, 2)
+        if self.stroke_points == "chord":
+            half = 0.5 * (off[..., 0, :] - off[..., 2, :])
+            points = torch.stack([anchor + half, anchor + 0.5 * off[..., 1, :], anchor - half], 2)
+            look = _curve(*points.detach().unbind(2), self._curve_t(h.device))
+        else:
+            points = anchor.unsqueeze(2) + off
+            look = anchor.detach().unsqueeze(2)
+        r_lo, r_hi = (math.log(r) for r in self.radius_range)
+        r_init = (math.log(0.1) - r_lo) / (r_hi - r_lo)  # start at radius ~0.1 view units
+        radii = torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
+        opacity = 0.05 + 0.95 * torch.sigmoid(a_raw)
+        tc = self._base_color(colors, look, radii).clamp(0.02, 0.98)
+        color = torch.sigmoid(torch.log(tc) - torch.log1p(-tc) + c_raw)
+        tool_logits, gate_raw = (rest[..., :-1], rest[..., -1]) if self.stroke_gate else (rest, None)
+        return anchor, points, radii, opacity, torch.sigmoid(h_raw), color, tool_logits, gate_raw
 
     def forward(
         self,
@@ -283,30 +341,30 @@ class PlanStrokePredictor(nn.Module):
         target_33 = _blur(target, _odd(33 * R / 128))
         colors = torch.cat([target, target_9, target_33], dim=1)
 
-        at0 = anchor0.unsqueeze(2)
+        at0 = anchor0.detach().unsqueeze(2)  # where to look (the anchor itself learns through the final stroke)
         point_feats = torch.cat([_sample(pixel, at0), _sample(d2, at0), _sample(m, at0), _sample(colors, at0)], -1)
         h = h + self.init_proj(point_feats[:, :, 0].to(h.dtype))
 
-        def curve_feats(anchor, p0, p2):
-            p1 = 2.0 * anchor - 0.5 * (p0 + p2)  # provisional: anchor at the midpoint
-            pts = _curve(p0, p1, p2, torch.tensor(CURVE_T, device=anchor.device, dtype=anchor.dtype))
-            return torch.cat([_sample(pixel, pts), _sample(d2, pts)], -1).flatten(2)  # (B, N, K * (P + w2))
+        t_curve = self._curve_t(inputs.device)
 
+        # Each layer decodes its current strokes only to look along them: detached there (as reference points in
+        # deformable DETR decoders). Through the sampling positions the gradient is the feature difference
+        # between neighbouring pixels, unbounded, and stroke -> sampled features -> latent -> stroke is a loop
+        # that blew up within ~100 teacher steps. The decoder learns through the final stroke below.
         for layer in self.refine:
-            anchor, p0, p2, log_r, _ = self._geometry(h, anchor0)
-            pos = torch.cat([self.geo_pos(torch.stack([anchor, p0, p2], 2)).flatten(2), log_r], -1)
-            h = h + layer["pos"](pos.to(h.dtype)) + layer["feat"](curve_feats(anchor, p0, p2).to(h.dtype))
+            with torch.no_grad():
+                points = self._decode(h, anchor0, colors)[1]
+            pts = _curve(*points.unbind(2), t_curve)
+            seen = torch.cat([_sample(pixel, pts), _sample(d2, pts)], -1).flatten(2)  # (B, N, K * (P + w2))
+            h = h + layer["feat"](seen.to(h.dtype))
             h = layer["self_attn"](h)
             h = layer["cross_attn"](h, context=tokens)
 
-        # Final stroke, decoded once from the last latent
-        anchor, gp0, gp2, _, g = self._geometry(h, anchor0)
-        color_base = _sample(target_9, anchor.unsqueeze(2))[:, :, 0]
-        out = self.out_mlp(torch.cat([h, curve_feats(anchor, gp0, gp2).to(h.dtype), color_base.to(h.dtype)], -1))
-
+        # The output: the same decoder on the last latent
+        anchor, points, radii, opacity, hardness, color, tool_logits, gate_raw = self._decode(h, anchor0, colors)
         gate_logit, gate_on = None, None
         if self.stroke_gate:  # start with every stroke on (sigmoid(3) = 0.95)
-            gate_logit, out = out[..., -1].float() + 3.0, out[..., :-1]
+            gate_logit = gate_raw + 3.0
             gate = torch.sigmoid(gate_logit)
             if self.training:
                 gate = gate + GATE_LEAK * (gate_logit - gate_logit.detach())
@@ -319,33 +377,12 @@ class PlanStrokePredictor(nn.Module):
                     gate_on = (gate_logit > 0).float()
                 gate = gate_on + (gate - gate.detach())
         else:
-            gate = torch.ones(out.shape[:-1], device=out.device)
-        out = out.float()
-        e = self.n_ends
-        offsets, t_raw, r_raw, a_raw, h_raw, c_raw, tool_logits = out.split(
-            [4, 1, e, e, 1, 3, out.shape[-1] - 9 - 2 * e], dim=-1)
+            gate = torch.ones(points.shape[:2], device=points.device)
 
-        # Endpoints: the provisional ones plus a correction (same tanh space); the control point makes
-        # B(anchor_t) = anchor, so the anchor can sit anywhere along the stroke, not only at its middle
-        p0 = anchor + self.max_offset * torch.tanh(g[..., 2:4] + offsets[..., 0:2])
-        p2 = anchor + self.max_offset * torch.tanh(g[..., 4:6] + offsets[..., 2:4])
-        anchor_t = 0.2 + 0.6 * torch.sigmoid(t_raw)
-        omt = 1.0 - anchor_t
-        p1 = (anchor - omt ** 2 * p0 - anchor_t ** 2 * p2) / (2.0 * anchor_t * omt)
-
-        r_lo, r_hi = (math.log(r) for r in self.radius_range)
-        r_init = (math.log(0.1) - r_lo) / (r_hi - r_lo)  # start at radius ~0.1 view units
-        radii = torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
-        opacity = 0.05 + 0.95 * torch.sigmoid(a_raw)
-        tc = color_base.float().clamp(0.02, 0.98)
-        color = torch.sigmoid(torch.log(tc) - torch.log1p(-tc) + c_raw)
-
-        strokes = Strokes(points=torch.stack([p0, p1, p2], dim=2), radii=radii, opacity=opacity,
-                          hardness=torch.sigmoid(h_raw), color=color)
+        strokes = Strokes(points=points, radii=radii, opacity=opacity, hardness=hardness, color=color)
         return StrokeOutput(
             strokes=strokes, tool_logits=tool_logits, anchors=anchor.float(), anchor_entropy=entropy,
             placement_logits=logits, gate=gate, gate_logit=gate_logit, samples=StrokeSamples(place_seed, gate_on),
-            anchor_t=anchor_t[..., 0],
         )
 
 
@@ -355,6 +392,8 @@ def build_model(config: dict) -> nn.Module:
     config = dict(config)
     arch = config.pop("arch", "unet")
     if arch == "plan":
+        config.setdefault("stroke_points", "free")  # plan checkpoints from before these options
+        config.setdefault("color_base", "blur9")
         return PlanStrokePredictor(**config)
     if arch == "unet":
         return StrokePredictor(**config)

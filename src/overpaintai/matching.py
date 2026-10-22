@@ -38,15 +38,15 @@ def stroke_features(s: Strokes, reverse: bool = False, weights: Dict[str, float]
 
 
 def matched_stroke_loss(
-    pred: Strokes, target: Strokes, weights: Dict[str, float] = None
+    pred: Strokes, target: Strokes, weights: Dict[str, float] = None, per_sample: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     L1 distance between predicted and target strokes under the best one-to-one assignment, taking the
     better of the two traversal directions per pair. Shapes `(B, N, ...)` and `(B, M, ...)`; with N != M,
     only min(N, M) pairs are matched (extra predictions are unsupervised by this term).
 
-    Returns the scalar loss (mean per-feature L1 of the matched pairs) and the assignment as a
-    `(2, B, K)` tensor of (prediction index, target index) pairs, K = min(N, M).
+    Returns the scalar loss (mean per-feature L1 of the matched pairs; `(B,)` per image with `per_sample`) and
+    the assignment as a `(2, B, K)` tensor of (prediction index, target index) pairs, K = min(N, M).
     """
     mid = pred.radii.shape[-1] == 3  # a predicted pressure curve is matched against the target's (or linear)
     f_pred = stroke_features(pred, weights=weights, with_mid=mid)
@@ -65,5 +65,5 @@ def matched_stroke_loss(
     cols = torch.stack(cols).to(cost.device)
     batch = torch.arange(cost.shape[0], device=cost.device).unsqueeze(1)
     matched = cost[batch, rows, cols]  # (B, K)
-    loss = matched.mean() / f_pred.shape[-1]
+    loss = (matched.mean(1) if per_sample else matched.mean()) / f_pred.shape[-1]
     return loss, torch.stack([rows, cols])

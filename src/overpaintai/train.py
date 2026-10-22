@@ -180,6 +180,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "with all strokes on must remove 2%% of the error left. Experimental: every cost tried "
                         "so far eventually switched all strokes off (off strokes get no gradient for position "
                         "and color, so turning them back on never pays off)")
+    g.add_argument("--placement-spread", type=float, default=0.0,
+                   help="Unroll: penalty for pairs of strokes whose placement maps nearly coincide (Bhattacharyya "
+                        "overlap above 0.5; logged as `overlap`, the mean over pairs), e.g. 1. Without it the "
+                        "plan model's strokes piled onto the same few pixels within a few hundred steps")
     g.add_argument("--no-relative-loss", action="store_true",
                    help="Unroll: plain loss instead of each image's loss relative to its loss at the start of "
                         "the batch (relative: deep canvases with little error left still get a strong signal)")
@@ -191,6 +195,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Teacher: predict one of the last K groups of N strokes (1 = the final, fully visible "
                         "strokes); 0 = any group, including the first strokes of a blank canvas")
     g.add_argument("--match-weight", type=float, default=1.0, help="Teacher: stroke-parameter loss weight")
+    g.add_argument("--teacher-relax", type=float, default=0.25,
+                   help="Teacher: the stroke terms (matching, heatmap, gates on) fade out per image once its step gets "
+                        "the pixels right with other strokes: weight = min(1, remaining / (relax x step error)), "
+                        "with the step error = the error of not painting at all. 0.25: full weight until 75%% of "
+                        "the step's error is gone, 0 when the result is exact. 0 disables (always full weight)")
     g.add_argument("--render-weight", type=float, default=1.0, help="Teacher: render loss weight")
     g.add_argument("--heatmap-weight", type=float, default=0.1,
                    help="Teacher: cross-entropy of placement maps against ground-truth stroke midpoints")
@@ -265,6 +274,18 @@ def lr_lambda(warmup: int, total: int, min_ratio: float):
         return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))
 
     return f
+
+
+def placement_overlap(logits: torch.Tensor, threshold: float = 0.5):
+    """
+    Overlap between the placement maps of a step's strokes, `logits` `(B, N, H*W)`: the Bhattacharyya coefficient
+    of each pair (1 = the same map, 0 = disjoint). Returns (mean over pairs, mean of the part above `threshold`).
+    """
+    sq = logits.float().softmax(-1).sqrt()
+    ov = sq @ sq.transpose(1, 2)
+    n = ov.shape[1]
+    pairs = ov[:, ~torch.eye(n, dtype=torch.bool, device=ov.device)]
+    return pairs.mean(), (pairs - threshold).clamp(min=0.0).mean()
 
 
 def box_mask(boxes: torch.Tensor, size: int) -> torch.Tensor:
@@ -364,7 +385,8 @@ class Trainer:
             )
             if plan:
                 self.model_config.update(arch="plan", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
-                                         plan_slots=args.plan_slots, pressure=not args.no_pressure)
+                                         plan_slots=args.plan_slots, pressure=not args.no_pressure,
+                                         stroke_points="chord", color_base="scaled")
         # Gated strokes must be able to vanish completely: no opacity floor in the engine then
         min_opacity = 0.0 if self.model_config.get("stroke_gate") else 0.05
         self.engine = DifferentiableCanvasEngine(
@@ -496,20 +518,35 @@ class Trainer:
         progress = torch.full((B,), j * N / M, device=self.device)
         out = self.painter.predict(batch.target, layer, boxes, progress)
         gt = views.from_engine_params(gt_params, self.engine)  # whole-image view: view = image coords
-        match_loss, assign = matched_stroke_loss(out.strokes, gt)
+        match_loss, assign = matched_stroke_loss(out.strokes, gt, per_sample=True)  # (B,)
 
         gated = views.Strokes(out.strokes.points, out.strokes.radii, out.strokes.opacity * out.gate.unsqueeze(-1),
                               out.strokes.hardness, out.strokes.color)
         params = views.to_engine_params(views.view_to_image(gated, boxes), self.engine)
         canvas = self.painter.composite(self.painter.render(layer, params, self.painter.tool_weights(out.tool_logits)))
         render_loss, terms = self.loss_fn(canvas, gt_canvas)
-        heat_loss = self.heatmap_loss(out.placement_logits, gt, assign, out.anchor_t, out.anchors)
-        gate_loss = (1.0 - out.gate).mean()  # every ground-truth stroke is real: matched strokes stay on
-        loss = (a.match_weight * match_loss + a.render_weight * render_loss + a.heatmap_weight * heat_loss
-                + 0.1 * gate_loss)
+        heat_loss = self.heatmap_loss(out.placement_logits, gt, assign)  # (B,)
+        gate_loss = (1.0 - out.gate).mean(-1)  # every ground-truth stroke is real: matched strokes stay on
+        # Different strokes that get the pixels right are not wrong: the stroke terms fade out per image as the
+        # step's pixel error goes to zero (relative to the error of not painting); the pixel loss always counts
+        with torch.no_grad():
+            if a.teacher_relax > 0:
+                left = (canvas - gt_canvas).abs().flatten(1).mean(1)
+                step = (self.painter.composite(layer) - gt_canvas).abs().flatten(1).mean(1)
+                relax = (left / (a.teacher_relax * step).clamp(min=1e-6)).clamp(max=1.0)
+            else:
+                relax = torch.ones(B, device=self.device)
+        loss = a.render_weight * render_loss + (
+            relax * (a.match_weight * match_loss + a.heatmap_weight * heat_loss + 0.1 * gate_loss)).mean()
+        if out.gate_logit is not None:
+            # Keep gate logits in range, as in unroll training. The gate's leaky gradient never fades, so the push
+            # towards "on" grew the logits without bound (and with them the stroke head's shared layers, until
+            # radii saturated at the minimum and teacher training blew up within a few hundred steps)
+            over = (out.gate_logit.abs() - GATE_LOGIT_RANGE).clamp(min=0.0)
+            loss = loss + 0.01 * (over * over).mean()
 
-        metrics = {"match": match_loss.detach(), "render": render_loss.detach(), "heatmap": heat_loss.detach(),
-                   "gate": out.gate.mean().detach()}
+        metrics = {"match": match_loss.mean().detach(), "render": render_loss.detach(),
+                   "heatmap": heat_loss.mean().detach(), "gate": out.gate.mean().detach(), "relax": relax.mean()}
         if len(self.tools) > 1:  # supervise tool choice on matched pairs
             b = torch.arange(B, device=self.device).unsqueeze(1)
             logits = out.tool_logits[b, assign[0]]
@@ -523,35 +560,24 @@ class Trainer:
             metrics["hardness"] = out.strokes.hardness.mean()
         return {"loss": loss, **metrics}
 
-    def heatmap_loss(self, logits: torch.Tensor, gt: "views.Strokes", assign: torch.Tensor,
-                     anchor_t: Optional[torch.Tensor] = None, anchors: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def heatmap_loss(self, logits: torch.Tensor, gt: "views.Strokes", assign: torch.Tensor) -> torch.Tensor:
         """
         Cross-entropy between each matched query's placement map `(B, N, R*R)` and a Gaussian around its
-        ground-truth stroke's curve midpoint B(0.5) (in view coordinates). Gives placement a direct, strong
-        gradient; soft-argmax alone barely moves a near-uniform map. Models whose anchor can sit anywhere along
-        the stroke (`anchor_t`) are pointed at the GT curve at their own t (or 1 - t: the GT may be reversed,
-        whichever is closer to the predicted anchor).
+        ground-truth stroke's curve midpoint B(0.5) (in view coordinates), per image `(B,)`. Gives placement a
+        direct, strong gradient; soft-argmax alone barely moves a near-uniform map.
         """
         B, N, RR = logits.shape
         R = int(math.isqrt(RR))
         b = torch.arange(B, device=logits.device).unsqueeze(1)
         p0, p1, p2 = gt.points[b, assign[1]].unbind(dim=2)  # matched GT strokes, (B, K, 2)
-        if anchor_t is None:
-            mid = 0.25 * p0 + 0.5 * p1 + 0.25 * p2
-        else:
-            t = anchor_t[b, assign[0]].detach().unsqueeze(-1)
-            fwd = (1 - t) ** 2 * p0 + 2 * t * (1 - t) * p1 + t ** 2 * p2
-            rev = t ** 2 * p0 + 2 * t * (1 - t) * p1 + (1 - t) ** 2 * p2
-            a = anchors[b, assign[0]].detach()
-            closer = ((fwd - a) ** 2).sum(-1, keepdim=True) <= ((rev - a) ** 2).sum(-1, keepdim=True)
-            mid = torch.where(closer, fwd, rev)
+        mid = 0.25 * p0 + 0.5 * p1 + 0.25 * p2
         u = torch.linspace(0.0, 1.0, R, device=logits.device)
         uv = torch.stack(torch.meshgrid(u, u, indexing="xy"), dim=-1).reshape(1, 1, RR, 2)
         sigma = self.args.heatmap_sigma / (R - 1)
         t = torch.exp(-((uv - mid.unsqueeze(2)) ** 2).sum(-1) / (2.0 * sigma * sigma))
         t = t / t.sum(-1, keepdim=True).clamp(min=1e-12)
         log_p = logits[b, assign[0]].log_softmax(dim=-1)
-        return -(t * log_p).sum(-1).mean()
+        return -(t * log_p).sum(-1).mean(-1)  # (B,)
 
     @torch.no_grad()
     def start_canvas(self, target: torch.Tensor, window: int):
@@ -605,7 +631,7 @@ class Trainer:
         B, S = target.shape[0], target.shape[-1]
         total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
         loss, weight_sum, entropy, hardness, gates, outside, gate_range, worse = 0.0, 0.0, [], [], [], [], [], []
-        soft_edges = []
+        soft_edges, overlap, crowding = [], [], []
         with torch.no_grad():
             pyramid = sharpness_pyramid(target) if a.hard_edge_reward > 0 else None
             start = self.painter.composite(layer)
@@ -652,6 +678,9 @@ class Trainer:
             entropy.append(res.output.anchor_entropy.mean().detach())
             hardness.append(res.output.strokes.hardness.mean().detach())
             gates.append(res.gate.mean())
+            mean_ov, crowd = placement_overlap(res.output.placement_logits)
+            overlap.append(mean_ov.detach())
+            crowding.append(crowd)
             if pyramid is not None:  # softness of visible strokes where the target is sharp around them
                 st = views.from_engine_params(res.params, self.engine)
                 vis = st.opacity.mean(-1).detach()
@@ -696,12 +725,15 @@ class Trainer:
             loss = loss + 0.01 * torch.stack(gate_range).mean()
         if soft_edges:
             loss = loss + a.hard_edge_reward * torch.stack(soft_edges).mean()
+        if a.placement_spread > 0:
+            loss = loss + a.placement_spread * torch.stack(crowding).mean()
         with torch.no_grad():
             final = self.painter.composite(layer)
             gain = psnr(final, target) - start_psnr  # (B,)
             metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean(),
                        "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr.mean(),
-                       "gate": mean_gate.detach(), "depth": depth.float().mean()}
+                       "gate": mean_gate.detach(), "depth": depth.float().mean(),
+                       "overlap": torch.stack(overlap).mean()}
             if outside:
                 metrics["outside"] = torch.stack(outside).mean().detach()
             if worse:

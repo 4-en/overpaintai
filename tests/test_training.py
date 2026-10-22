@@ -295,7 +295,35 @@ def test_plan_architecture_trains_in_teacher_and_unroll_mode(tmp_path):
 
     unroll = tmp_path / "unroll"
     main(TINY + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--tile-prob", "1", "--edge-loss",
-                 "--robust-loss", "--hard-edge-reward", "0.05", "--checkpoint-steps", "--epochs", "1",
-                 "--out", str(unroll)] + plan)
-    hist = torch.load(unroll / "last.pt", weights_only=False)["history"][-1]
-    assert "val_long_psnr" in hist and math.isfinite(hist["train_loss"])
+                 "--robust-loss", "--hard-edge-reward", "0.05", "--checkpoint-steps", "--placement-spread", "1",
+                 "--epochs", "1", "--out", str(unroll)] + plan)
+    ckpt = torch.load(unroll / "last.pt", weights_only=False)
+    hist = ckpt["history"][-1]
+    assert "val_long_psnr" in hist and math.isfinite(hist["train_loss"]) and 0 <= hist["train_overlap"] <= 1
+    assert ckpt["model_config"]["stroke_points"] == "chord"
+
+
+def test_placement_overlap_finds_strokes_on_the_same_spot():
+    from overpaintai.train import placement_overlap
+
+    logits = torch.full((1, 3, 64), -20.0)
+    logits[0, 0, 5] = logits[0, 1, 5] = logits[0, 2, 40] = 20.0  # strokes 0 and 1 on the same pixel
+    mean, crowd = placement_overlap(logits.requires_grad_())
+    assert abs(mean.item() - 1 / 3) < 1e-4 and abs(crowd.item() - 1 / 6) < 1e-4
+    flat = placement_overlap(torch.zeros(1, 3, 64))[0]  # identical uniform maps overlap fully
+    assert abs(flat.item() - 1.0) < 1e-4
+
+
+def test_teacher_stroke_terms_fade_once_the_pixels_are_right(tmp_path):
+    from overpaintai.train import Trainer, parse_args
+
+    pred, gt = _strokes(N=4, seed=3), _strokes(N=4, seed=4)
+    per, _ = matched_stroke_loss(pred, gt, per_sample=True)
+    total, _ = matched_stroke_loss(pred, gt)
+    assert per.shape == (pred.points.shape[0],) and torch.allclose(per.mean(), total)
+
+    trainer = Trainer(parse_args(TINY + ["--mode", "teacher", "--out", str(tmp_path / "t")]))
+    stats = trainer.train_step()
+    assert 0.0 <= stats["relax"] <= 1.0 and math.isfinite(stats["loss"])
+    off = Trainer(parse_args(TINY + ["--mode", "teacher", "--teacher-relax", "0", "--out", str(tmp_path / "o")]))
+    assert off.train_step()["relax"] == 1.0
