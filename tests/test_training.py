@@ -337,7 +337,7 @@ def test_joint_strokes_train_and_paint_with_the_harness(tmp_path):
     main(TINY + ["--mode", "teacher", "--joint-strokes", "--epochs", "1", "--out", str(teacher)])
     unroll = tmp_path / "unroll"
     main(TINY + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--joint-strokes", "--tile-prob", "1",
-                 "--checkpoint-steps", "--epochs", "1", "--out", str(unroll)])
+                 "--checkpoint-steps", "--start-mix", "touchup:1", "--epochs", "1", "--out", str(unroll)])
     ckpt = torch.load(unroll / "last.pt", weights_only=False)
     assert ckpt["model_config"]["joint_strokes"] and math.isfinite(ckpt["history"][-1]["train_loss"])
 

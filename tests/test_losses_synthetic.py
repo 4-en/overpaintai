@@ -103,3 +103,25 @@ def test_degraded_canvas_is_a_partial_painting_of_the_target():
         assert (start > 12).all(), kind  # close to the target overall ...
     layer = degraded_canvas(target, engine, gen, kinds=("missing",))
     assert (layer[:, 3] < 0.5).any()  # ... and "missing" leaves unpainted (transparent) areas
+
+
+def test_touchup_pairs_differ_from_their_target_only_in_small_places():
+    from overpaintai.degrade import touchup_pair
+
+    engine = DifferentiableCanvasEngine(canvas_size=64).eval()
+    gen = torch.Generator().manual_seed(0)
+    params, tools = random_strokes(engine, 8, 30, generator=gen)
+    target = render_targets(engine, params, tools, 64)
+    background = engine.create_background(8, 64, 64)
+    for add_share in (0.0, 1.0):
+        layer, new_target = touchup_pair(target, engine, gen, add_share=add_share)
+        assert layer.shape == (8, 4, 64, 64) and new_target.shape == target.shape
+        assert (layer[:, 3] == 1).all()  # a finished painting: nothing left unpainted
+        canvas = engine.composite(layer, background)
+        changed = ((canvas - new_target).abs().amax(1) > 0.1).float().mean((1, 2))
+        assert (changed < 0.25).all() and (changed > 0).any()  # local differences, most of the image is right
+        if add_share == 0.0:  # details on the canvas: the target is the original image
+            assert torch.equal(new_target, target)
+        else:  # details added to the target; the canvas is the (softened) original
+            assert ((new_target - target).abs().amax((1, 2, 3)) > 0.05).any()
+            assert (psnr(canvas, target) > 22).all()

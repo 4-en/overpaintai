@@ -6,16 +6,22 @@ The degradations are chosen to look like the mistakes of a stroke painting rathe
 damage: besides local blur, regions are repainted with rough strokes in the target's local colors (so the
 canvas really is a stroke painting there), shifted in color, flattened, left unpainted, or kept at a
 coarser level of detail.
+
+Touch-up pairs (`touchup_pair`) cover the other end: a nearly finished painting with a few small, sharp
+differences from its target (lines, shapes, hatching, dots, small fills and gradients, missing fine
+detail), so the model also practices precise local corrections on canvases where most of the image is
+already right.
 """
 
-from typing import Optional, Sequence
+import math
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.losses import _gaussian_blur
-from overpaintai.synthetic import random_strokes
+from overpaintai.synthetic import radius_to_param, random_strokes
 
 DEGRADATIONS = ("blur", "strokes", "color", "flatten", "missing", "lowres")
 
@@ -119,3 +125,147 @@ def degraded_canvas(
 
     return torch.cat([rgb.clamp(0.0, 1.0), alpha.clamp(0.0, 1.0)], dim=1)
 
+
+
+DETAILS = ("line", "shape", "hatch", "dots", "fill", "gradient")
+_SLOTS = 6  # strokes per stroke-based detail (unused slots are moved off the canvas)
+_OFF = 4.0  # coordinate of unused strokes: far outside the canvas, they paint nothing
+
+
+def _local_colors(target: torch.Tensor, xy: torch.Tensor, gen, subtle: torch.Tensor) -> torch.Tensor:
+    """
+    Detail colors `(B, n, 3)` at points `xy` `(B, n, 2)`: where `subtle`, the locally averaged target shifted a
+    little (mostly in brightness, like a stroke painting's own mistakes), elsewhere a random color.
+    """
+    B, n, _ = xy.shape
+    dev = target.device
+    smooth = _gaussian_blur(target, sigma=max(1.0, 0.02 * target.shape[-1]))
+    local = F.grid_sample(smooth, (xy * 2 - 1).unsqueeze(2), mode="bilinear", align_corners=True)
+    local = local.squeeze(-1).transpose(1, 2)
+    shade = torch.randn(B, n, 1, generator=gen, device=dev) * 0.12
+    hue = torch.randn(B, n, 3, generator=gen, device=dev) * 0.04
+    near = (local + shade + hue).clamp(0.0, 1.0)
+    return torch.where(subtle.unsqueeze(-1), near, _rand(gen, B, n, 3, device=dev))
+
+
+def _detail_strokes(engine, B: int, n: int, centers, sizes, colors, kind, gen) -> torch.Tensor:
+    """
+    Stroke params `(B, n * _SLOTS, 14)` for `n` details per image: each detail's kind index `kind` `(B, n)`
+    (into DETAILS) decides its strokes; region kinds (fill, gradient) get none.
+    """
+    dev = centers.device
+    S = engine.canvas_size
+    k = torch.arange(_SLOTS, device=dev).view(1, 1, _SLOTS).float()
+    c = centers.unsqueeze(2)  # (B, n, 1, 2)
+    size = sizes.view(B, n, 1, 1)
+    ang = _rand(gen, B, n, 1, device=dev) * 2 * math.pi
+    d = torch.stack([ang.cos(), ang.sin()], -1)  # (B, n, 1, 2) main direction
+    normal = torch.stack([-d[..., 1], d[..., 0]], -1)
+    thin = (0.4 + 1.6 * _rand(gen, B, n, 1, device=dev)) / (S - 1)  # line radius: 0.4..2 px
+
+    # line: a polyline of 2-4 connected segments that turn a little at each joint
+    turn = (_rand(gen, B, n, _SLOTS, device=dev) - 0.5) * 1.2
+    a = ang + turn.cumsum(-1)
+    step = torch.stack([a.cos(), a.sin()], -1) * size  # (B, n, slots, 2)
+    p0 = c + torch.cat([torch.zeros_like(step[:, :, :1]), step[:, :, :-1]], 2).cumsum(2)
+    line = (p0, p0 + step, thin.expand(-1, -1, _SLOTS), k < 2 + (_rand(gen, B, n, 1, device=dev) * 3).floor())
+    # shape: 1-3 short fat overlapping strokes (a blob)
+    jit = (_rand(gen, B, n, _SLOTS, 2, device=dev) - 0.5) * size * 0.5
+    seg = d * size * 0.3
+    shape = (c + jit - seg, c + jit + seg, (size[..., 0] * (0.2 + 0.3 * _rand(gen, B, n, _SLOTS, device=dev))),
+             k < 1 + (_rand(gen, B, n, 1, device=dev) * 3).floor())
+    # hatch: 3-6 parallel thin strokes
+    off = c + normal * (k.unsqueeze(-1) - 2.5) * size * 0.15
+    hatch = (off - d * size / 2, off + d * size / 2, thin.expand(-1, -1, _SLOTS),
+             k < 3 + (_rand(gen, B, n, 1, device=dev) * 4).floor())
+    # dots: up to 6 small dabs in a cluster
+    dot = c + (_rand(gen, B, n, _SLOTS, 2, device=dev) - 0.5) * size
+    dots = (dot, dot, thin.expand(-1, -1, _SLOTS) * 1.5, k < 3 + (_rand(gen, B, n, 1, device=dev) * 4).floor())
+
+    start, end, radius, used = [torch.zeros_like(x) for x in line]
+    for i, (s0, s1, r, u) in enumerate((line, shape, hatch, dots)):
+        pick = (kind == i).unsqueeze(-1)  # (B, n, 1)
+        start = torch.where(pick.unsqueeze(-1), s0, start)
+        end = torch.where(pick.unsqueeze(-1), s1, end)
+        radius = torch.where(pick, r, radius)
+        used = torch.where(pick, u, used)
+    used = used.bool() & (kind < 4).unsqueeze(-1)
+    off_canvas = torch.full_like(start, _OFF)
+    start = torch.where(used.unsqueeze(-1), start, off_canvas)
+    end = torch.where(used.unsqueeze(-1), end, off_canvas)
+    mid = 0.5 * (start + end) + normal * size * (_rand(gen, B, n, _SLOTS, 1, device=dev) - 0.5) * 0.3
+    r = radius_to_param(engine, radius).unsqueeze(-1).expand(-1, -1, -1, 2)
+    opacity = (0.75 + 0.25 * _rand(gen, B, n, 1, 1, device=dev)).expand(-1, -1, _SLOTS, 2)
+    hard = (0.5 + 0.5 * _rand(gen, B, n, 1, 1, device=dev)).expand(-1, -1, _SLOTS, 1)
+    rgb = colors.unsqueeze(2).expand(-1, -1, _SLOTS, -1)
+    params = torch.cat([start, mid, end, r, opacity, hard, rgb], -1)  # (B, n, slots, 14)
+    return params.reshape(B, n * _SLOTS, 14)
+
+
+def _region_details(B: int, S: int, n: int, centers, sizes, colors, kind, gen) -> torch.Tensor:
+    """Small fills and gradients as an RGBA layer `(B, 4, S, S)` (straight color, alpha)."""
+    dev = centers.device
+    yy = torch.linspace(0.0, 1.0, S, device=dev).view(1, 1, S, 1)
+    xx = torch.linspace(0.0, 1.0, S, device=dev).view(1, 1, 1, S)
+    cx, cy = centers[..., 0].view(B, n, 1, 1), centers[..., 1].view(B, n, 1, 1)
+    r = (sizes / 2).view(B, n, 1, 1)
+    aspect = 0.5 + _rand(gen, B, n, 1, 1, device=dev)
+    dist = torch.sqrt(((xx - cx) / (r * aspect)) ** 2 + ((yy - cy) * aspect / r) ** 2)
+    sharp = 6.0 + 30.0 * _rand(gen, B, n, 1, 1, device=dev)  # soft to crisp edges
+    mask = torch.sigmoid((1.0 - dist) * sharp) * (kind >= 4).view(B, n, 1, 1)  # (B, n, S, S)
+    ang = _rand(gen, B, n, 1, 1, device=dev) * 2 * math.pi
+    t = (((xx - cx) * ang.cos() + (yy - cy) * ang.sin()) / (2 * r) + 0.5).clamp(0.0, 1.0)
+    other = _rand(gen, B, n, 3, device=dev)
+    grad = (kind == 5).view(B, n, 1, 1, 1)
+    c0 = colors.view(B, n, 3, 1, 1)
+    col = torch.where(grad, c0 + t.unsqueeze(2) * (other.view(B, n, 3, 1, 1) - c0), c0.expand(-1, -1, -1, S, S))
+    rgb = torch.zeros(B, 3, S, S, device=dev)
+    alpha = torch.zeros(B, 1, S, S, device=dev)
+    for i in range(n):  # source over, one region after another
+        m = mask[:, i : i + 1]
+        a_new = m + alpha * (1 - m)
+        rgb = torch.where(a_new > 1e-6, (m * col[:, i] + (1 - m) * alpha * rgb) / a_new.clamp(min=1e-6), rgb)
+        alpha = a_new
+    return torch.cat([rgb, alpha], 1)
+
+
+@torch.no_grad()
+def touchup_pair(
+    target: torch.Tensor,
+    engine: DifferentiableCanvasEngine,
+    generator: Optional[torch.Generator] = None,
+    add_share: float = 0.5,
+    strength: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    A nearly finished painting and its target, `(paint layer (B, 4, S, S), target (B, 3, S, S))`: the target
+    slightly softened (like a stroke painting of it, not a pixel copy), with fine detail missing in a few small
+    regions, and a few small details (DETAILS, each 1.5-12% of the side, drawn with the engine's strokes; colors
+    either close to the image's or random). Per image, with probability `add_share` the details are added to the
+    target (the model must paint them), otherwise they sit on the canvas (the model must paint them away and
+    restore the image there). `strength` scales the number of details.
+    """
+    B, _, S, _ = target.shape
+    dev = target.device
+    gen = generator
+    base = _gaussian_blur(target, 0.3 + 0.7 * _rand(gen, 1, device=dev).item())
+    lost = region_masks(B, S, S, int(torch.randint(1, 4, (1,), generator=gen, device=dev).item()),
+                        size_range=(0.02, 0.1), gen=gen, device=dev)
+    base = base + lost * (_gaussian_blur(target, 1.0 + 2.0 * _rand(gen, 1, device=dev).item()) - base)
+
+    n = max(1, round(strength * int(torch.randint(2, 7, (1,), generator=gen, device=dev).item())))
+    centers = 0.05 + 0.9 * _rand(gen, B, n, 2, device=dev)
+    sizes = 0.015 * 8.0 ** _rand(gen, B, n, device=dev)  # 1.5..12% of the side, log-uniform
+    kind = torch.randint(0, len(DETAILS), (B, n), generator=gen, device=dev)
+    colors = _local_colors(target, centers, gen, _rand(gen, B, n, device=dev) < 0.5)
+    strokes = _detail_strokes(engine, B, n, centers, sizes, colors, kind, gen)
+    regions = _region_details(B, S, n, centers, sizes, colors, kind, gen)
+    detail = engine(regions, strokes)  # strokes over the regions, on a transparent layer
+    a = detail[:, 3:]
+    over = lambda img: img * (1 - a) + detail[:, :3] * a
+
+    add = (_rand(gen, B, 1, 1, 1, device=dev) < add_share)
+    canvas = torch.where(add, base, over(base))
+    new_target = torch.where(add, over(target), target)
+    layer = torch.cat([canvas.clamp(0.0, 1.0), torch.ones_like(canvas[:, :1])], dim=1)
+    return layer, new_target.clamp(0.0, 1.0)

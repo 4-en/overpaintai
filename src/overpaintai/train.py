@@ -37,7 +37,7 @@ from tqdm import tqdm
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
-from overpaintai.degrade import degraded_canvas
+from overpaintai.degrade import degraded_canvas, touchup_pair
 from overpaintai.losses import MultiScalePaintLoss, psnr, sharpness_pyramid, stroke_edge_sharpness
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
@@ -133,11 +133,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--start-mix", default="blank:1",
                    help="Unroll: start canvases per batch, as kind:weight pairs. 'blank' = empty canvas, "
                         "'warmup' = the model first paints 1..--rollout-max steps without gradients, "
-                        "'degraded' = the target with synthetic painting mistakes (see degrade.py). "
-                        "E.g. blank:0.4,warmup:0.3,degraded:0.3")
+                        "'degraded' = the target with synthetic painting mistakes (see degrade.py), "
+                        "'touchup' = a nearly finished painting with a few small differences from its target "
+                        "(lines, shapes, hatching, dots, small fills / gradients, missing fine detail), either "
+                        "painted on the canvas or added to the target (--touchup-add). "
+                        "E.g. blank:0.2,warmup:0.3,degraded:0.25,touchup:0.25")
     g.add_argument("--rollout-max", type=int, default=12,
                    help="Unroll: max warm-up steps (and steps a degraded start counts as already painted)")
     g.add_argument("--degrade-strength", type=float, default=1.0, help="Unroll: how much degraded starts deviate")
+    g.add_argument("--touchup-add", type=float, default=0.5,
+                   help="Unroll: share of touch-up starts whose details are added to the target (the model must paint "
+                        "them; the rest have them on the canvas, to be painted away)")
     g.add_argument("--detach-canvas", action="store_true", help="Unroll: no gradient through earlier steps")
     g.add_argument("--grad-through-inputs", action="store_true",
                    help="Unroll: also backprop through the canvas the model looks at (unstable: explodes "
@@ -438,7 +444,7 @@ class Trainer:
         self.start_kinds, weights = [], []
         for part in args.start_mix.split(","):
             kind, _, w = part.partition(":")
-            if kind.strip() not in ("blank", "warmup", "degraded"):
+            if kind.strip() not in ("blank", "warmup", "degraded", "touchup"):
                 raise SystemExit(f"--start-mix: unknown start kind {kind!r}")
             self.start_kinds.append(kind.strip())
             weights.append(float(w or 1.0))
@@ -589,7 +595,8 @@ class Trainer:
     @torch.no_grad()
     def start_canvas(self, target: torch.Tensor, window: int):
         """
-        Start paint layer for an unroll batch, per --start-mix: returns (layer, steps already "done", kind).
+        Start paint layer for an unroll batch, per --start-mix: returns (layer, steps already "done", kind, target);
+        the target changes only for touch-up starts whose details are added to it.
         Progress then runs from done / (done + window), so warm-up and degraded starts train later phases
         of a painting while keeping progress = fraction of the painting completed (as at inference).
         """
@@ -598,15 +605,18 @@ class Trainer:
         blank = self.engine.create_blank_paint_layer(B, S, S, self.device)
         kind = self.start_kinds[int(torch.multinomial(self.start_weights, 1, generator=self.gen).item())]
         if kind == "blank" or a.rollout_max < 1:
-            return blank, 0, kind
+            return blank, 0, kind, target
         done = int(torch.randint(1, a.rollout_max + 1, (1,), generator=self.gen, device=self.device).item())
         if kind == "degraded":
-            return degraded_canvas(target, self.engine, self.gen, strength=a.degrade_strength), done, kind
+            return degraded_canvas(target, self.engine, self.gen, strength=a.degrade_strength), done, kind, target
+        if kind == "touchup":  # nearly finished: counts as the longest warm-up
+            layer, target = touchup_pair(target, self.engine, self.gen, add_share=a.touchup_add)
+            return layer, a.rollout_max, kind, target
         layer = blank  # warmup: the current model paints `done` steps on its own
         for i in range(done):
             progress = torch.full((B,), i / (done + window), device=self.device)
             layer = self.painter.step(target, layer, progress).layer
-        return layer, done, kind
+        return layer, done, kind, target
 
     @torch.no_grad()
     def batch_start(self, window: int):
@@ -619,14 +629,14 @@ class Trainer:
         B = self.args.batch_size
         if self.pool is None:
             target = self.next_targets()
-            layer, done, _ = self.start_canvas(target, window)
+            layer, done, _, target = self.start_canvas(target, window)
             return target, layer, torch.full((B,), done, device=self.device), None
         slots, fresh = self.pool.draw(B, self.args.pool_reset, self.gen, self.args.pool_min_gain)
         target, layer, depth = self.pool.get(slots)
         n = int(fresh.sum())
         if n:
             new_target = self.next_targets()[:n]
-            new_layer, done, _ = self.start_canvas(new_target, window)
+            new_layer, done, _, new_target = self.start_canvas(new_target, window)
             target[fresh], layer[fresh], depth[fresh] = new_target, new_layer, done
         return target, layer, depth, slots
 
