@@ -103,11 +103,12 @@
           <button id="mask-clear" class="ghost">Clear</button>
           <label class="file-btn ghost">Upload mask<input id="mask-file" type="file" accept="image/*" hidden></label>
           <div class="seg">
-            <button id="gen-subject" title="Placeholder: soft centered ellipse">Subject*</button>
-            <button id="gen-face" title="Placeholder: soft ellipse in the upper middle">Face*</button>
+            <button id="gen-subject" title="Detect foreground subject">Subject</button>
+            <button id="gen-face" title="Detect human face">Face</button>
+            <button id="gen-people" title="Detect people / bodies">People</button>
           </div>
         </div>
-        <p class="hint">Bright mask areas get more and finer tiles. *Subject/face generation is a placeholder for now.</p>
+        <p class="hint">Bright mask areas get more and finer tiles.</p>
       </div>
 
       <div class="panel view">

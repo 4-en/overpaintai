@@ -108,6 +108,35 @@ def test_placeholder_auto_mask(client):
     assert c.post("/api/mask/auto", data={"mode": "x"}, files={"image": ("i.png", _png(), "image/png")}).status_code == 400
 
 
+def test_auto_mask_detection(client):
+    c, _ = client
+    # Image with high-contrast foreground subject
+    img = Image.new("RGB", (120, 100), (20, 20, 20))
+    from PIL import ImageDraw
+    ImageDraw.Draw(img).ellipse([35, 25, 85, 75], fill=(240, 210, 180))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    img_bytes = buf.getvalue()
+
+    # Subject mode detects foreground
+    r = c.post("/api/mask/auto", data={"mode": "subject"}, files={"image": ("s.png", img_bytes, "image/png")})
+    assert r.status_code == 200 and r.headers["x-placeholder"] == "false"
+    mask = Image.open(io.BytesIO(r.content))
+    assert mask.size == (120, 100) and mask.mode == "L"
+    assert mask.getpixel((60, 50)) > mask.getpixel((5, 5))
+
+    # People mode accepted
+    r_peop = c.post("/api/mask/auto", data={"mode": "people"}, files={"image": ("p.png", img_bytes, "image/png")})
+    assert r_peop.status_code == 200
+    m_peop = Image.open(io.BytesIO(r_peop.content))
+    assert m_peop.size == (120, 100) and m_peop.mode == "L"
+
+    # auto_importance helper function directly returns mask
+    from overpaintai.web.jobs import auto_importance
+    direct_mask = auto_importance(img, "subject")
+    assert direct_mask.size == (120, 100) and direct_mask.mode == "L"
+
+
 def _paint(c, ckpt, **extra):
     settings = {"checkpoint": ckpt, "size": 128, "whole_steps": 2, "rounds": 1, "max_tiles": 2, "min_tile": 0.25,
                 "threshold": 0.0, "num_stamps": 16, **extra}

@@ -218,6 +218,7 @@ function setupMaskEditor() {
   });
   $("gen-subject").addEventListener("click", () => generateMask("subject"));
   $("gen-face").addEventListener("click", () => generateMask("face"));
+  $("gen-people")?.addEventListener("click", () => generateMask("people"));
 }
 
 async function loadMaskImage(blob) {
@@ -243,13 +244,15 @@ async function loadMaskImage(blob) {
 
 async function generateMask(mode) {
   if (!state.imageFile) return setMessage("Open an image first.", true);
+  setMessage(`Detecting ${mode}...`);
   const form = new FormData();
   form.append("image", state.imageFile);
   form.append("mode", mode);
   const res = await fetch("/api/mask/auto", { method: "POST", body: form });
   if (!res.ok) return setMessage(`Mask generation failed: ${await res.text()}`, true);
   await loadMaskImage(await res.blob());
-  setMessage(`Generated a ${mode} mask (placeholder ellipse; a real detector comes later).`);
+  const fallback = res.headers.get("x-placeholder") === "true";
+  setMessage(fallback ? `No ${mode} detected clearly; generated a soft prior mask.` : `Generated ${mode} mask.`);
 }
 
 function maskBlob() {

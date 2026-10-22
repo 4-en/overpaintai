@@ -134,20 +134,15 @@ def checkpoint_defaults(path: Path) -> Dict:
             "stationary": "step_progress" in args and not args["step_progress"]}
 
 
-def auto_importance(img: Image.Image, mode: str) -> Image.Image:
+def auto_importance(img: Image.Image, mode: str, device: Optional[torch.device] = None) -> Image.Image:
     """
-    PLACEHOLDER for automatic importance masks (subject / face detection): returns a soft ellipse, wide and
-    centered for "subject", smaller and in the upper middle for "face". Replace with a real detector.
+    Automatic importance masks (subject / face / people detection) using lightweight local models:
+    BlazeFace for faces, MobileNetV3-LRASPP for people/foreground, and spectral saliency for general subjects.
     """
-    w, h = img.size
-    mask = Image.new("L", (w, h), 0)
-    draw = ImageDraw.Draw(mask)
-    if mode == "face":
-        cx, cy, rx, ry = 0.5 * w, 0.38 * h, 0.18 * w, 0.2 * h
-    else:
-        cx, cy, rx, ry = 0.5 * w, 0.5 * h, 0.32 * w, 0.4 * h
-    draw.ellipse([cx - rx, cy - ry, cx + rx, cy + ry], fill=255)
-    return mask.filter(ImageFilter.GaussianBlur(radius=0.08 * min(w, h)))
+    from overpaintai.web.detection import generate_auto_mask
+
+    mask, _ = generate_auto_mask(img, mode, device=device)
+    return mask
 
 
 def _encode_preview(canvas: torch.Tensor, wh) -> bytes:

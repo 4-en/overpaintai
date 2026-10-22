@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
+from overpaintai.web.detection import generate_auto_mask
 from overpaintai.web.jobs import JobManager, JobSettings, auto_importance, checkpoint_defaults, list_checkpoints
 
 STATIC = Path(__file__).parent / "static"
@@ -157,16 +158,22 @@ def create_app(runs_dir: str = "runs", device: str = None, out_dir: str = None) 
 
     @app.post("/api/mask/auto")
     async def mask_auto(image: UploadFile = File(...), mode: str = Form("subject")):
-        if mode not in ("subject", "face"):
-            raise HTTPException(400, "mode must be 'subject' or 'face'")
+        mode_clean = mode.strip().lower()
+        if mode_clean not in ("subject", "face", "people", "person"):
+            raise HTTPException(400, "mode must be 'subject', 'face', or 'people'")
         try:
             img = Image.open(io.BytesIO(await image.read()))
             img.load()
         except OSError as exc:
             raise HTTPException(400, f"invalid image: {exc}")
         buf = io.BytesIO()
-        auto_importance(img, mode).save(buf, format="PNG")
-        return Response(buf.getvalue(), media_type="image/png", headers={"X-Placeholder": "true"})
+        mask, is_fallback = generate_auto_mask(img, mode_clean, device=manager.device)
+        mask.save(buf, format="PNG")
+        return Response(
+            buf.getvalue(),
+            media_type="image/png",
+            headers={"X-Placeholder": "true" if is_fallback else "false"},
+        )
 
     return app
 
