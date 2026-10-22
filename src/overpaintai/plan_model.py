@@ -391,10 +391,16 @@ def build_model(config: dict) -> nn.Module:
     checkpoints from before the key existed, or 'plan' = `PlanStrokePredictor`)."""
     config = dict(config)
     arch = config.pop("arch", "unet")
+    joint = config.pop("joint_strokes", False)
     if arch == "plan":
         config.setdefault("stroke_points", "free")  # plan checkpoints from before these options
         config.setdefault("color_base", "blur9")
-        return PlanStrokePredictor(**config)
-    if arch == "unet":
-        return StrokePredictor(**config)
-    raise ValueError(f"unknown model architecture {arch!r}")
+        model = PlanStrokePredictor(**config)
+    elif arch == "unet":
+        model = StrokePredictor(**config)
+    else:
+        raise ValueError(f"unknown model architecture {arch!r}")
+    # How the model's strokes are rendered, not part of the network: each step's strokes as one order-independent
+    # operation (`DifferentiableCanvasEngine.forward_joint_step`) instead of one after another
+    model.joint_strokes = bool(joint)
+    return model

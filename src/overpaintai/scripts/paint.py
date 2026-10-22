@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from overpaintai.highres import (
-    STROKE_FORMAT, HighResPainter, config_from_checkpoint, load_checkpoint_model, load_padded,
+    STROKE_FORMAT, HighResPainter, config_from_checkpoint, load_checkpoint_model, load_padded, stroke_record,
 )
 from overpaintai.viz import to_uint8
 
@@ -28,12 +28,14 @@ def parse_args():
     p.add_argument("--whole-steps", type=int, default=None, help="Whole-image steps (default: training steps)")
     p.add_argument("--rounds", type=int, default=2, help="Tile rounds per level")
     p.add_argument("--max-tiles", type=int, default=32, help="Tiles per round")
+    p.add_argument("--tile-repeats", type=int, default=1, help="Passes over the same tiles before re-selecting")
     p.add_argument("--margin", type=float, default=0.25, help="Context margin per side (fraction of core)")
     p.add_argument("--threshold", type=float, default=0.015, help="Skip tiles with lower mean core error")
     p.add_argument("--min-tile", type=float, default=None,
                    help="Smallest tile core (fraction of the image); default: stop at the source's detail")
     p.add_argument("--no-tiles", action="store_true", help="Only the whole-image steps")
     p.add_argument("--no-fade", action="store_true", help="Keep strokes at tile edges unfaded")
+    p.add_argument("--grid-tiles", action="store_true", help="Place tiles on a half-tile grid, not centered on the error")
     p.add_argument("--importance", default=None, help="Grayscale mask: bright areas get more / finer tiles")
     p.add_argument("--importance-gain", type=float, default=2.0)
     p.add_argument("--num-stamps", type=int, default=32, help="Curve samples per stroke when rendering")
@@ -64,10 +66,12 @@ def main():
         whole_steps=args.whole_steps,
         rounds_per_level=0 if args.no_tiles else args.rounds,
         max_tiles=args.max_tiles,
+        tile_repeats=args.tile_repeats,
         margin=args.margin,
         error_threshold=args.threshold,
         min_core=args.min_tile,
         fade=not args.no_fade,
+        centered_tiles=not args.grid_tiles,
         importance_gain=args.importance_gain,
     )
     painter = HighResPainter(model, args.size, view_res, tool, args.num_stamps, cfg, device=device)
@@ -93,7 +97,7 @@ def main():
         for i, (label, canvas) in enumerate(result.snapshots):
             name = label.replace(" ", "_").replace("/", "-")
             Image.fromarray(to_uint8(canvas[crop][0])).save(out / f"stage_{i}_{name}.png")
-    torch.save({"strokes": torch.cat(result.strokes), "size": args.size, "content_wh": wh,
+    torch.save({**stroke_record(result), "size": args.size, "content_wh": wh,
                 "format": STROKE_FORMAT}, out / "strokes.pt")
     (out / "stats.json").write_text(json.dumps({"args": vars(args), "stages": result.stats}, indent=2))
     print(f"-> {out}/final.png ({result.stats[-1]['strokes']} strokes, PSNR {result.stats[-1]['psnr']:.2f} dB)")

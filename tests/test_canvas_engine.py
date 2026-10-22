@@ -180,3 +180,105 @@ def test_pressure_curve_defaults_to_linear_and_can_swell():
 
     reversed_swell = reverse_strokes(swell)
     assert torch.allclose(out, engine.forward_single_step(layer, reversed_swell), atol=1e-4)
+
+
+def _premult(layer):
+    return torch.cat([layer[:, :3] * layer[:, 3:], layer[:, 3:]], 1)
+
+
+def test_joint_step_is_order_independent_and_merges_strokes():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25, min_opacity=0.0).eval()
+    torch.manual_seed(1)
+    layer = engine(engine.create_blank_paint_layer(2, SIZE, SIZE), torch.rand(2, 3, 16))  # some paint below
+    strokes = torch.rand(2, 5, 16)
+    tools = torch.zeros(2, 5, engine.NUM_TOOLS)
+    tools[..., 0], tools[:, 3, 0], tools[:, 3, 1] = 1.0, 0.0, 1.0  # one dry brush stroke among them
+    out = engine(layer, strokes, tools, joint=5)
+    perm = torch.tensor([3, 0, 4, 2, 1])
+    assert torch.allclose(out, engine(layer, strokes[:, perm], tools[:, perm], joint=5), atol=1e-5)
+    # a single stroke renders as before, for every tool (premultiplied: the RGB of near-transparent pixels is
+    # numerically unstable either way)
+    for tool in range(engine.NUM_TOOLS):
+        one = torch.zeros(2, 1, engine.NUM_TOOLS)
+        one[..., tool] = 1.0
+        assert torch.allclose(_premult(engine(layer, strokes[:, :1], one, joint=1)),
+                              _premult(engine(layer, strokes[:, :1], one)), atol=1e-5), tool
+
+    # two overlapping strokes of the same color at half opacity: one coat (max), not two (source over twice)
+    blank = engine.create_blank_paint_layer(1, SIZE, SIZE)
+    bar = lambda x0, x1, a, rgb: [x0, 0.5, (x0 + x1) / 2, 0.5, x1, 0.5, 0.4, 0.4, a, a, 1.0, *rgb]
+    same = torch.tensor([[bar(0.1, 0.6, 0.5, (1, 0, 0)), bar(0.4, 0.9, 0.5, (1, 0, 0))]])
+    mid = (slice(None), 3, SIZE // 2, SIZE // 2)
+    assert abs(engine(blank, same, joint=2)[mid].item() - 0.5) < 1e-3
+    assert abs(engine(blank, same)[mid].item() - 0.75) < 1e-3
+    # different colors where they overlap: coverage-weighted mean, whichever comes first
+    mixed = torch.tensor([[bar(0.1, 0.6, 1.0, (1, 0, 0)), bar(0.4, 0.9, 1.0, (0, 0, 1))]])
+    rgb = engine(blank, mixed, joint=2)[0, :3, SIZE // 2, SIZE // 2]
+    assert torch.allclose(rgb, torch.tensor([0.5, 0.0, 0.5]), atol=1e-3)
+
+
+def test_joint_groups_and_checkpointing():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25).train()
+    raw = torch.randn(2, 6, 16)
+
+    def run(checkpoint_strokes):
+        r = raw.clone().requires_grad_(True)
+        out = engine(engine.create_blank_paint_layer(2, SIZE, SIZE), torch.sigmoid(r), joint=4,
+                     checkpoint_strokes=checkpoint_strokes)
+        engine.composite(out).mean().backward()
+        return out.detach(), r.grad
+
+    (out, grad), (out_c, grad_c) = run(False), run(True)
+    assert torch.allclose(out, out_c, atol=1e-6) and torch.allclose(grad, grad_c, atol=1e-6)
+    assert (grad.abs().sum(-1) > 0).all()  # every stroke gets a gradient
+    # groups of 4 then 2: the same as rendering the two groups one after another
+    s = torch.sigmoid(raw)
+    blank = engine.create_blank_paint_layer(2, SIZE, SIZE)
+    two = engine(engine(blank, s[:, :4], joint=4), s[:, 4:], joint=2)
+    assert torch.allclose(out, two, atol=1e-6)
+
+
+def test_joint_smudge_blur_and_eraser_only_edit_the_canvas_before_the_step():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.25, min_opacity=0.0).eval()
+    torch.manual_seed(2)
+    layer = engine(engine.create_blank_paint_layer(2, SIZE, SIZE), torch.rand(2, 6, 16))
+    strokes = torch.rand(2, 5, 16)
+    tools = torch.eye(engine.NUM_TOOLS)[[0, 2, 3, 4, 2]].expand(2, -1, -1)  # paint, 2 smudges, blur, eraser
+    out = engine(layer, strokes, tools, joint=5)
+    perm = torch.tensor([4, 2, 0, 3, 1])
+    assert torch.allclose(out, engine(layer, strokes[:, perm], tools[:, perm], joint=5), atol=1e-5)
+    # the step's paint lands on top, unsmudged, unblurred, unerased: the same as editing first, painting after
+    edits = engine(layer, strokes[:, 1:], tools[:, 1:], joint=4)
+    assert torch.allclose(_premult(out), _premult(engine(edits, strokes[:, :1], tools[:, :1], joint=1)), atol=1e-5)
+    # each smudge reads the canvas before the step, not the other smudge's result: the changes add up
+    one, two = (engine(layer, strokes[:, k : k + 1], tools[:, k : k + 1], joint=1) for k in (1, 4))
+    both = engine(layer, strokes[:, [1, 4]], tools[:, [1, 4]], joint=2)
+    expected = (_premult(one) + _premult(two) - _premult(layer)).clamp(0, 1)
+    assert (_premult(both) - expected).abs().max() < 1e-4
+
+
+def test_joint_soft_strokes_side_by_side_leave_no_seam():
+    engine = DifferentiableCanvasEngine(canvas_size=128, min_opacity=0.0).eval()
+    blank = engine.create_blank_paint_layer(1, 128, 128)
+    bar = lambda y, a: [0.1, y, 0.5, y, 0.9, y, 0.08, 0.08, a, a, 0.0, 0.8, 0.2, 0.2]  # soft, radius ~8 px
+    rows = slice(57, 71)  # between the two stroke centres (one radius apart)
+    s = torch.tensor([[bar(0.45, 1.0), bar(0.515, 1.0)]])
+    # full opacity: the soft edges fill the gap as if painted one after another (max coverage left a pale seam)
+    assert torch.allclose(engine(blank, s, joint=2)[0, 3, rows], engine(blank, s)[0, 3, rows], atol=1e-4)
+    # half opacity on the same spot: still one coat, not two
+    same = torch.tensor([[bar(0.5, 0.5), bar(0.5, 0.5)]])
+    assert abs(engine(blank, same, joint=2)[0, 3, 63, 64].item() - 0.5) < 0.01
+
+
+def test_joint_gradients_stay_finite_in_the_far_tails_of_soft_strokes():
+    engine = DifferentiableCanvasEngine(canvas_size=128, min_opacity=0.0).train()
+    blank = engine.create_blank_paint_layer(1, 128, 128)
+    # soft dots whose tails reach ~1e-25 .. 1e-45 across the canvas (squares and reciprocals of that under- /
+    # overflow in float32): any NaN or inf there makes the whole gradient unusable
+    dot = lambda x, y, rgb: [x, y, x, y, x, y, 0.01, 0.01, 1.0, 1.0, 0.0, *rgb, 0.01, 1.0]
+    raw = torch.tensor([[dot(0.2, 0.2, (0.9, 0.1, 0.1)), dot(0.3, 0.25, (0.1, 0.1, 0.9))]]).logit(eps=1e-4)
+    for x in range(1, 8):  # sweep the tail distance
+        r = (raw + torch.tensor([0.0] * 16).index_fill(0, torch.tensor([0, 2, 4]), 0.1 * x)).requires_grad_(True)
+        out = engine(blank, torch.sigmoid(r), joint=2)
+        engine.composite(out).mean().backward()
+        assert r.grad.isfinite().all(), x

@@ -5,7 +5,8 @@ The model always works on views resampled to its working resolution R, so a larg
 way the README's "High-Resolution Inference Harness" describes:
   1. whole-image steps on the downscaled image (blocking in),
   2. levels of square tiles (core size 1/2, 1/4, ... of the image), each round picking the tiles with the
-     highest (optionally importance-weighted) error, with non-maximum suppression,
+     highest (optionally importance-weighted) error, with non-maximum suppression; tiles sit at any pixel
+     offset, centered on the error (or, optionally, on a half-tile grid),
   3. every tile view = its core plus a context margin; strokes anchored outside the core, or reaching past
      what the view shows, are faded out smoothly (never clipped) so tiles don't paint blind,
   4. strokes are rendered only into a square crop of the canvas around their bounding box, which gives the
@@ -38,9 +39,12 @@ class HighResConfig:
     tile_progress: float = 6 / 7  # progress fed to tile steps (training uses k/total for its tile step)
     rounds_per_level: int = 2  # tile rounds per level
     max_tiles: int = 32  # tiles per round (one batch)
+    tile_repeats: int = 1  # passes over the same selected tiles before re-selecting
     margin: float = 0.25  # context margin on each side of a tile core, as a fraction of the core size
     error_threshold: float = 0.015  # tiles whose mean core error is below this are skipped
     nms_iou: float = 0.3  # candidate cores overlapping a chosen one more than this are suppressed
+    centered_tiles: bool = True  # tiles at any offset, centered on the error; False: on a half-tile grid
+    center_sigma: float = 0.25  # centered tiles: Gaussian error weight over the core, sigma as a core fraction
     detail_limit: float = 1.0  # stop once a view would have fewer than R * detail_limit source pixels
     min_core: Optional[float] = None  # explicit smallest core size (overrides the source-detail stop)
     scale_clamp: Tuple[float, float] = (0.3, 1.0)  # view-size range fed to the model (trained range)
@@ -55,7 +59,8 @@ class PaintResult:
     canvas: torch.Tensor  # (1, 3, S, S)
     snapshots: List[Tuple[str, torch.Tensor]] = field(default_factory=list)  # (label, canvas)
     stats: List[Dict] = field(default_factory=list)
-    strokes: List[torch.Tensor] = field(default_factory=list)  # engine-independent stroke records
+    strokes: List[torch.Tensor] = field(default_factory=list)  # engine-independent stroke records, one per render
+    joint: bool = False  # each record was rendered as one order-independent operation (joint-stroke models)
 
 
 class PaintCancelled(Exception):
@@ -169,8 +174,11 @@ class CropRenderer:
         return self.engine.composite(layer, self.background)
 
     @torch.no_grad()
-    def render(self, layer: torch.Tensor, strokes: views.Strokes) -> torch.Tensor:
-        """Renders image-space strokes `(1, N)` in order onto `layer` (in place) and returns it."""
+    def render(self, layer: torch.Tensor, strokes: views.Strokes, joint: bool = False) -> torch.Tensor:
+        """
+        Renders image-space strokes `(1, N)` in order onto `layer` (in place) and returns it; with `joint`, as
+        one order-independent operation (`DifferentiableCanvasEngine.forward_joint_step`).
+        """
         if strokes.radii.shape[1] == 0:
             return layer
         S = self.S
@@ -189,15 +197,16 @@ class CropRenderer:
         n = min(S, max(x1 - x0, y1 - y0) + 1)
         stamps = self._stamps_for(strokes)
         if n <= self.max_crop:
-            self._render_square(layer, strokes, min(x0, S - n), min(y0, S - n), n, stamps)
+            self._render_square(layer, strokes, min(x0, S - n), min(y0, S - n), n, stamps, joint)
         else:  # split huge footprints into squares (the last ones may reach past the canvas: padded)
             m = self.max_crop
             for py in range(y0, y1 + 1, m):
                 for px in range(x0, x1 + 1, m):
-                    self._render_square(layer, strokes, px, py, m, stamps)
+                    self._render_square(layer, strokes, px, py, m, stamps, joint)
         return layer
 
-    def _render_square(self, layer: torch.Tensor, strokes: views.Strokes, x0: int, y0: int, n: int, stamps: int):
+    def _render_square(self, layer: torch.Tensor, strokes: views.Strokes, x0: int, y0: int, n: int, stamps: int,
+                       joint: bool = False):
         """Renders `strokes` into the n x n square at pixel (x0, y0); parts outside the canvas are padding."""
         S = self.S
         box = torch.tensor([[x0 / (S - 1), y0 / (S - 1), (n - 1) / (S - 1)]], device=self.device)
@@ -216,7 +225,8 @@ class CropRenderer:
         else:
             crop = layer.new_zeros((1, 4, n, n))
             crop[:, :, :h, :w] = layer[:, :, y0 : y0 + h, x0 : x0 + w]
-        layer[:, :, y0 : y0 + h, x0 : x0 + w] = eng(crop, params, tools)[:, :, :h, :w]  # in place (no autograd)
+        out = eng(crop, params, tools, joint=params.shape[1] if joint else 0)
+        layer[:, :, y0 : y0 + h, x0 : x0 + w] = out[:, :, :h, :w]  # in place (no autograd)
 
 
 STROKE_FORMAT = "points(6), radii(2), opacity(2), hardness, color(3), mid radius, mid opacity; image coords"
@@ -249,6 +259,27 @@ def unpack_strokes(t: torch.Tensor) -> views.Strokes:
                          opacity=t[..., [8, 9, 15]], hardness=t[..., 10:11], color=t[..., 11:14])
 
 
+def stroke_groups(record: Dict, chunk: int = 16) -> List[Tuple[int, bool]]:
+    """
+    (count, joint) of each rendered group of a `strokes.pt` record, in painting order: one per whole-image step
+    or tile. Records from before groups were saved: chunks of `chunk`, rendered one stroke after another.
+    """
+    if "groups" in record:
+        return [(int(n), bool(j)) for n, j in zip(record["groups"], record["joint"])]
+    N = record["strokes"].shape[0]
+    return [(min(chunk, N - i), False) for i in range(0, N, chunk)]
+
+
+def stroke_record(result: PaintResult, prior: Optional[Dict] = None) -> Dict:
+    """The `strokes.pt` stroke fields of a painting (continuing `prior`'s record): strokes, groups, joint."""
+    new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, 16)
+    groups = [(t.shape[0], result.joint) for t in result.strokes]
+    if prior is not None:
+        new = torch.cat([pad_strokes(prior["strokes"]), new])  # the whole history
+        groups = stroke_groups(prior) + groups
+    return {"strokes": new, "groups": [n for n, _ in groups], "joint": [j for _, j in groups]}
+
+
 def render_strokes(
     strokes: torch.Tensor,
     canvas_size: int,
@@ -261,8 +292,12 @@ def render_strokes(
     chunk: int = 16,
     on_progress: Optional[Callable[[float], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
+    groups: Optional[List[Tuple[int, bool]]] = None,
 ) -> torch.Tensor:
     """
+    `groups`: (count, joint) per recorded render (`stroke_groups`); default: chunks of `chunk`, one stroke after
+    another.
+
     Re-renders recorded strokes (`pack_strokes` format, coordinates of the square `canvas_size` canvas with
     `content_wh` content) so that the content's longer side is `output_side` px. Strokes are
     resolution-independent, so this is a real upscale: hard edges stay one pixel wide at the new size.
@@ -277,12 +312,16 @@ def render_strokes(
     strokes = strokes.to(renderer.device).float()
     layer = renderer.blank()
     N = strokes.shape[0]
-    for i in range(0, N, chunk):  # chunks follow the recording (<= 16 strokes per tile), keeping crops local
-        renderer.render(layer, unpack_strokes(strokes[i : i + chunk]))
+    if groups is None:
+        groups = stroke_groups({"strokes": strokes}, chunk)
+    i = 0
+    for g, (n, joint) in enumerate(groups):  # groups follow the recording (one per step / tile), keeping crops local
+        renderer.render(layer, unpack_strokes(strokes[i : i + n]), joint)
+        i += n
         if should_stop is not None and should_stop():
             raise PaintCancelled()
-        if on_progress is not None and (i // chunk) % 20 == 0:
-            on_progress(min(1.0, (i + chunk) / max(N, 1)))
+        if on_progress is not None and g % 20 == 0:
+            on_progress(min(1.0, i / max(N, 1)))
     out_w, out_h = round(w * S / canvas_size), round(h * S / canvas_size)
     return renderer.composite(layer)[:, :, :out_h, :out_w]
 
@@ -326,6 +365,7 @@ class HighResPainter:
         self.device = device or next(model.parameters()).device
         self.min_radius, self.max_radius = radius_limits(model, size)
         self.renderer = CropRenderer(size, num_stamps, self.min_radius, self.max_radius, self.device, tool)
+        self.joint = bool(getattr(model, "joint_strokes", False))  # each step / tile as one operation
         self.engine = self.renderer.engine
         self.background = self.renderer.background
 
@@ -333,7 +373,7 @@ class HighResPainter:
         return self.renderer.composite(layer)
 
     def render(self, layer: torch.Tensor, strokes: views.Strokes) -> torch.Tensor:
-        return self.renderer.render(layer, strokes)
+        return self.renderer.render(layer, strokes, self.joint)
 
     # --- model ------------------------------------------------------------------------------------
     def _autocast(self):
@@ -388,9 +428,49 @@ class HighResPainter:
 
     def select_tiles(self, err: torch.Tensor, core: float) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Picks up to `max_tiles` core windows of side `core` (stride core/2) with the highest mean error,
-        with greedy non-maximum suppression. Returns cores `(T, 3)` and their scores `(T,)`.
+        Picks up to `max_tiles` core windows of side `core` with the highest error, with greedy non-maximum
+        suppression. Returns cores `(T, 3)` and their ranking scores `(T,)`, highest first.
         """
+        if self.cfg.centered_tiles:
+            return self._select_centered(err, core)
+        return self._select_grid(err, core)
+
+    def _select_centered(self, err: torch.Tensor, core: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Windows at every pixel offset, scored by their Gaussian-weighted error (so the best window has the
+        error in its middle, away from the faded core edge). Windows whose plain mean error is below the
+        threshold are skipped. The whole score map is moved to the CPU once, so picking costs no GPU syncs.
+        """
+        A = err.shape[-1]
+        k = max(1, round(core * A))
+        x = torch.arange(k, device=err.device, dtype=err.dtype) - (k - 1) / 2
+        g = torch.exp(-0.5 * (x / max(1e-3, self.cfg.center_sigma * k)) ** 2)
+        g = g / g.sum()
+        scores = F.conv2d(F.conv2d(err, g.view(1, 1, 1, k)), g.view(1, 1, k, 1))[0, 0]  # (n, n), separable
+        c = F.pad(err[0, 0].double().cumsum(0).cumsum(1), (1, 0, 1, 0))  # integral image
+        mean = (c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]) / (k * k)
+        scores = torch.where(mean >= self.cfg.error_threshold, scores, -math.inf).cpu().numpy()
+        # offsets (dy, dx) from a chosen window whose overlap with it exceeds nms_iou (same-size squares)
+        d = k - np.abs(np.arange(-k + 1, k))
+        inter = d[:, None] * d[None, :]
+        suppress = inter / (2 * k * k - inter) > self.cfg.nms_iou  # (2k-1, 2k-1)
+        n = scores.shape[0]
+        chosen, chosen_scores = [], []
+        while len(chosen) < self.cfg.max_tiles:
+            i = int(scores.argmax())
+            yi, xi = divmod(i, n)
+            if not np.isfinite(scores[yi, xi]):
+                break
+            chosen.append((xi / A, yi / A, k / A))
+            chosen_scores.append(float(scores[yi, xi]))
+            y0, x0 = max(0, yi - k + 1), max(0, xi - k + 1)
+            y1, x1 = min(n, yi + k), min(n, xi + k)
+            region = scores[y0:y1, x0:x1]
+            region[suppress[y0 - yi + k - 1 : y1 - yi + k - 1, x0 - xi + k - 1 : x1 - xi + k - 1]] = -np.inf
+        return torch.tensor(chosen, device=err.device).view(-1, 3), torch.tensor(chosen_scores)
+
+    def _select_grid(self, err: torch.Tensor, core: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Windows on a half-tile grid (stride core/2), scored by their mean error."""
         A = err.shape[-1]
         k = max(1, round(core * A))
         stride = max(1, k // 2)
@@ -481,7 +561,7 @@ class HighResPainter:
         cfg, A = self.cfg, min(self.cfg.analysis_res, self.S)
         t0 = time.time()
         layer = self.renderer.blank() if initial_layer is None else initial_layer.to(self.device).float().clone()
-        result = PaintResult(layer=layer, canvas=self.composite(layer))
+        result = PaintResult(layer=layer, canvas=self.composite(layer), joint=self.joint)
         target_a = F.interpolate(target, size=(A, A), mode="area")
         weight_a = torch.ones(1, 1, A, A, device=self.device)
         if valid is not None:
@@ -539,21 +619,22 @@ class HighResPainter:
                 if cores.shape[0] == 0:
                     break
                 boxes = self.view_boxes(cores)
-                g = self.global_tokens(target, result.layer, cfg.tile_progress).expand(cores.shape[0], -1, -1)
-                out = self.predict(target, result.layer, boxes, cfg.tile_progress, global_tokens=g, cores=cores)
-                img = views.view_to_image(out.strokes, boxes)
-                factor = out.gate  # stroke gate x edge fade
-                keep = torch.ones_like(factor, dtype=torch.bool)
-                if cfg.fade:
-                    fade = self.fade(out.strokes, out.anchors, cores, boxes)
-                    factor, keep = factor * fade, fade > 0.1
-                opacity = img.opacity * factor.unsqueeze(-1)
-                keep = keep & (opacity.amax(-1) > ACTIVE_OPACITY)  # invisible strokes are not rendered at all
-                for t in range(cores.shape[0]):  # highest-error tile first
-                    tile = self._visible(img, opacity, keep, t)
-                    result.layer = self.render(result.layer, tile)
-                    result.strokes.append(pack_strokes(tile).cpu())
-                    n_strokes += tile.radii.shape[1]
+                for _ in range(max(1, cfg.tile_repeats)):  # same tiles, each pass sees the previous one's paint
+                    g = self.global_tokens(target, result.layer, cfg.tile_progress).expand(cores.shape[0], -1, -1)
+                    out = self.predict(target, result.layer, boxes, cfg.tile_progress, global_tokens=g, cores=cores)
+                    img = views.view_to_image(out.strokes, boxes)
+                    factor = out.gate  # stroke gate x edge fade
+                    keep = torch.ones_like(factor, dtype=torch.bool)
+                    if cfg.fade:
+                        fade = self.fade(out.strokes, out.anchors, cores, boxes)
+                        factor, keep = factor * fade, fade > 0.1
+                    opacity = img.opacity * factor.unsqueeze(-1)
+                    keep = keep & (opacity.amax(-1) > ACTIVE_OPACITY)  # invisible strokes are not rendered at all
+                    for t in range(cores.shape[0]):  # highest-error tile first
+                        tile = self._visible(img, opacity, keep, t)
+                        result.layer = self.render(result.layer, tile)
+                        result.strokes.append(pack_strokes(tile).cpu())
+                        n_strokes += tile.radii.shape[1]
                 level_tiles += cores.shape[0]
                 progress({"stage": label, "kind": "tiles", "round": rnd + 1, "rounds": cfg.rounds_per_level,
                           "tiles": int(cores.shape[0])}, cfg.whole_steps + level * cfg.rounds_per_level + rnd + 1)

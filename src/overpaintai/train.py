@@ -103,6 +103,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "(stationary: the same model fits any number of steps; needed for the canvas pool)")
     g.add_argument("--soft-gate", action="store_true",
                    help="New models: stroke gate as a dimmer in [0, 1] instead of on / off")
+    g.add_argument("--joint-strokes", action="store_true",
+                   help="New models: render each step's strokes as one order-independent operation (per pixel the "
+                        "max coverage, colors mixed by coverage) instead of one after another; overlapping strokes "
+                        "of a step merge seamlessly. Stored in the checkpoint, the harness renders the same way. "
+                        "Works with --init-from a sequential model")
 
     g = p.add_argument_group("painting / loss")
     g.add_argument("--steps", type=int, default=6, help="K whole-image painting steps (unroll + validation)")
@@ -387,6 +392,8 @@ class Trainer:
                 self.model_config.update(arch="plan", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
                                          plan_slots=args.plan_slots, pressure=not args.no_pressure,
                                          stroke_points="chord", color_base="scaled")
+            if args.joint_strokes:
+                self.model_config["joint_strokes"] = True
         # Gated strokes must be able to vanish completely: no opacity floor in the engine then
         min_opacity = 0.0 if self.model_config.get("stroke_gate") else 0.05
         self.engine = DifferentiableCanvasEngine(
@@ -512,7 +519,7 @@ class Trainer:
         with torch.no_grad():
             layer = self.engine(blank, batch.params[:, : j * N], batch.tools[:, : j * N]) if j > 0 else blank
             gt_params, gt_tools = batch.params[:, j * N : (j + 1) * N], batch.tools[:, j * N : (j + 1) * N]
-            gt_canvas = self.painter.composite(self.engine(layer, gt_params, gt_tools))
+            gt_canvas = self.painter.composite(self.engine(layer, gt_params, gt_tools, joint=self.painter.joint))
 
         boxes = views.whole_image_boxes(B, self.device)
         progress = torch.full((B,), j * N / M, device=self.device)
@@ -799,6 +806,7 @@ class Trainer:
         self.global_step += 1
         stats = {k: float(v.detach()) if torch.is_tensor(v) else float(v) for k, v in result.items()}
         stats["grad_norm"] = float(grad_norm)
+        stats["skipped"] = float(not torch.isfinite(grad_norm))  # non-finite gradient: no update
         stats["lr"] = self.scheduler.get_last_lr()[0]
         return stats
 
@@ -1013,9 +1021,11 @@ class Trainer:
                 val_txt += (f" | {a.val_long_steps} steps {row['val_long_psnr']:.2f} dB (drift "
                             f"{row['val_long_drift']:.2f}, {row['val_long_end_strokes']:.1f} strokes/step at the end)")
             preview_txt = f" | preview {row['preview_psnr']:.2f} dB" if "preview_psnr" in row else ""
+            skipped = round(sums.get("skipped", 0.0))
+            skip_txt = f" | WARNING: {skipped}/{self.steps_per_epoch} steps skipped (non-finite gradients)" if skipped else ""
             tqdm.write(f"epoch {epoch + 1}: train loss {row['train_loss']:.4f}, PSNR {row['train_psnr']:.2f} dB, "
                        f"entropy {row['train_entropy']:.2f}, hardness {row['train_hardness']:.2f}"
-                       f"{val_txt}{preview_txt} | {row['time']:.0f}s")
+                       f"{val_txt}{preview_txt} | {row['time']:.0f}s{skip_txt}")
         metric = f"{a.val_long_steps}-step val PSNR" if a.val_long_steps > 0 else "val PSNR"
         print(f"done: best {metric} {self.best_psnr:.2f} dB -> {self.out / 'best.pt'}")
 

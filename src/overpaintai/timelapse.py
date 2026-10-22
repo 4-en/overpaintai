@@ -6,11 +6,11 @@ resolution and encodes the frames to MP4 with ffmpeg.
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from overpaintai.highres import CropRenderer, unpack_strokes
+from overpaintai.highres import CropRenderer, stroke_groups, unpack_strokes
 
 
 def stroke_schedule(n_strokes: int, n_frames: int, gamma: float = 1.8) -> list:
@@ -37,6 +37,7 @@ def render_timelapse(
     on_progress: Optional[Callable[[float], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     gamma: float = 1.8,
+    groups: Optional[List[Tuple[int, bool]]] = None,
 ) -> Path:
     """
     Args:
@@ -46,6 +47,8 @@ def render_timelapse(
         max_side: longer side of the video in pixels (strokes are re-rendered at that resolution).
         on_progress: called with the fraction of frames done.
         should_stop: checked every frame; returning True aborts (raises InterruptedError).
+        groups: (count, joint) per recorded render (`highres.stroke_groups`); default: chunks of 16, one stroke
+            after another. A joint group (one order-independent operation) only appears as a whole.
     """
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not installed (needed to encode the video)")
@@ -74,13 +77,18 @@ def render_timelapse(
 
     try:
         layer = renderer.blank()
-        done = 0
-        chunk = 16  # tiles' strokes are stored in groups of <= 16: rendering them together keeps crops local
+        done = 0  # strokes rendered
+        if groups is None:  # tiles' strokes are stored in groups of <= 16: rendering them together keeps crops local
+            groups = stroke_groups({"strokes": strokes})
+        g, g_done = 0, 0  # current group, strokes of it rendered
         for f, target_count in enumerate(schedule):
-            while done < target_count:
-                n = min(chunk - done % chunk, target_count - done)
-                renderer.render(layer, unpack_strokes(strokes[done : done + n]))
-                done += n
+            while done < target_count and g < len(groups):
+                size, joint = groups[g]
+                n = size - g_done if joint else min(size - g_done, target_count - done)
+                renderer.render(layer, unpack_strokes(strokes[done : done + n]), joint)
+                done, g_done = done + n, g_done + n
+                if g_done == size:
+                    g, g_done = g + 1, 0
             write(layer)
             if should_stop is not None and should_stop():
                 raise InterruptedError("video export cancelled")

@@ -60,6 +60,8 @@ class Painter:
         self.checkpoint_strokes = checkpoint_strokes
         self.gumbel_tau = gumbel_tau
         self.grad_through_inputs = grad_through_inputs
+        # Joint models: each view's N strokes are one order-independent operation (0 = one after another)
+        self.joint = model.num_strokes if getattr(model, "joint_strokes", False) else 0
         self._background = {}
 
     def background(self, B: int, S: int, device: torch.device) -> torch.Tensor:
@@ -123,7 +125,7 @@ class Painter:
             return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e, samples=samples)
 
     def render(self, layer: torch.Tensor, params: torch.Tensor, tool_w: torch.Tensor) -> torch.Tensor:
-        return self.engine(layer, params, tool_w, checkpoint_strokes=self.checkpoint_strokes)
+        return self.engine(layer, params, tool_w, checkpoint_strokes=self.checkpoint_strokes, joint=self.joint)
 
     def step(
         self,
@@ -138,7 +140,7 @@ class Painter:
         """
         One painting step. `boxes` is (B, 3) for one view per image (default: whole image), or (B, T, 3)
         for T tile views per image; tiles get the global tokens of the whole image and their strokes are
-        rendered in tile order onto the same canvas.
+        rendered in tile order onto the same canvas (joint models: one operation per tile).
 
         `cores` (same shape as `boxes`) restricts painting to a core inside each view, with the rest as
         context: the model gets it as its paintable mask, and strokes anchored outside the core or reaching

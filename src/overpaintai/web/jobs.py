@@ -25,8 +25,9 @@ from overpaintai.highres import (
     config_from_checkpoint,
     load_checkpoint_model,
     load_padded,
-    pad_strokes,
     render_strokes,
+    stroke_groups,
+    stroke_record,
 )
 from overpaintai.timelapse import render_timelapse
 from overpaintai.viz import to_uint8
@@ -42,17 +43,20 @@ class JobSettings:
     whole_steps: Optional[int] = None  # None: as trained
     rounds: int = 2
     max_tiles: int = 32
+    tile_repeats: int = 1
     min_tile: Optional[float] = None  # None: stop at the source image's detail
     threshold: float = 0.015
     margin: float = 0.25
     fade: bool = True
+    centered_tiles: bool = True
     importance_gain: float = 2.0
     num_stamps: int = 32
     tiles: bool = True
 
     def validate(self):
         self.size = int(min(4096, max(128, self.size)))
-        self.rounds = int(min(8, max(1, self.rounds)))
+        self.rounds = int(min(64, max(1, self.rounds)))
+        self.tile_repeats = int(min(16, max(1, self.tile_repeats)))
         self.max_tiles = int(min(256, max(1, self.max_tiles)))
         self.num_stamps = int(min(128, max(8, self.num_stamps)))
         if self.whole_steps is not None:
@@ -277,10 +281,12 @@ class JobManager:
             whole_steps=s.whole_steps,
             rounds_per_level=s.rounds if s.tiles else 0,
             max_tiles=s.max_tiles,
+            tile_repeats=s.tile_repeats,
             margin=s.margin,
             error_threshold=s.threshold,
             min_core=s.min_tile,
             fade=s.fade,
+            centered_tiles=s.centered_tiles,
             importance_gain=s.importance_gain,
         )
         painter = HighResPainter(model, s.size, view_res, tool, s.num_stamps, cfg, device=self.device)
@@ -290,11 +296,11 @@ class JobManager:
             importance, _, _, _ = load_padded(job.mask_bytes, s.size, self.device, mode="L")
             importance = importance * valid
 
-        initial_layer, prior_strokes, whole_done = None, None, 0
+        initial_layer, prior, whole_done = None, None, 0
         if job.parent is not None:  # continue a finished painting
             parent = self.jobs[job.parent]
             initial_layer = torch.load(parent.out_dir / "layer.pt", map_location=self.device).float()
-            prior_strokes = torch.load(parent.out_dir / "strokes.pt", weights_only=False)["strokes"]
+            prior = torch.load(parent.out_dir / "strokes.pt", weights_only=False)
             whole_done = parent.whole_done
 
         levels = [f"1/{round(1 / c)}" for c in painter.core_sizes(src_side)] if s.tiles else []
@@ -332,10 +338,9 @@ class JobManager:
         torch.save(result.layer.half().cpu(), out / "layer.pt")
         Image.fromarray(to_uint8(result.canvas[0, :, :h, :w])).save(out / "final.png")
         Image.fromarray(to_uint8(target[0, :, :h, :w])).save(out / "target.png")
-        new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, 16)
-        strokes = new if prior_strokes is None else torch.cat([pad_strokes(prior_strokes), new])  # the whole history
-        job.total_strokes = int(strokes.shape[0])
-        torch.save({"strokes": strokes, "size": s.size, "content_wh": wh, "num_stamps": s.num_stamps,
+        record = stroke_record(result, prior)  # the whole history
+        job.total_strokes = int(record["strokes"].shape[0])
+        torch.save({**record, "size": s.size, "content_wh": wh, "num_stamps": s.num_stamps,
                     "min_radius": painter.min_radius, "max_radius": painter.max_radius,
                     "format": STROKE_FORMAT}, out / "strokes.pt")
         (out / "stats.json").write_text(json.dumps({"settings": asdict(s), "stages": result.stats}, indent=2))
@@ -358,7 +363,7 @@ class JobManager:
             data["strokes"], data["size"], tuple(data["content_wh"]), job.out_dir / "timelapse.mp4",
             duration=job.video_duration, max_side=job.video_max_side, num_stamps=data.get("num_stamps", 32),
             min_radius=data.get("min_radius", 1e-4), max_radius=data.get("max_radius", 0.75), device=self.device,
-            on_progress=on_progress, should_stop=lambda: job.cancel_requested,
+            on_progress=on_progress, should_stop=lambda: job.cancel_requested, groups=stroke_groups(data),
         )
 
     @torch.no_grad()
@@ -376,7 +381,7 @@ class JobManager:
             data["strokes"], data["size"], tuple(data["content_wh"]), job.export_side,
             num_stamps=data.get("num_stamps", 32), min_radius=data.get("min_radius", 1e-4),
             max_radius=data.get("max_radius", 0.75), device=self.device,
-            on_progress=on_progress, should_stop=lambda: job.cancel_requested,
+            on_progress=on_progress, should_stop=lambda: job.cancel_requested, groups=stroke_groups(data),
         )
         arr = to_uint8(img[0])
         del img

@@ -24,8 +24,8 @@ const state = {
 // ---------------------------------------------------------------------------------------------------
 // Settings (persisted per browser)
 // ---------------------------------------------------------------------------------------------------
-const SETTING_IDS = ["size-preset", "size-custom", "whole-steps", "tiles", "rounds", "max-tiles", "min-tile",
-  "threshold", "margin", "fade", "importance-gain", "num-stamps"];
+const SETTING_IDS = ["size-preset", "size-custom", "whole-steps", "tiles", "rounds", "max-tiles", "tile-repeats", "min-tile",
+  "threshold", "margin", "fade", "centered-tiles", "importance-gain", "num-stamps"];
 
 function saveSettings() {
   const values = {};
@@ -58,10 +58,12 @@ function collectSettings() {
     tiles: $("tiles").checked,
     rounds: num("rounds"),
     max_tiles: num("max-tiles"),
+    tile_repeats: num("tile-repeats"),
     min_tile: num("min-tile"),
     threshold: num("threshold"),
     margin: num("margin"),
     fade: $("fade").checked,
+    centered_tiles: $("centered-tiles").checked,
     importance_gain: num("importance-gain"),
     num_stamps: num("num-stamps"),
   };

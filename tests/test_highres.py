@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from overpaintai import views
@@ -31,9 +32,11 @@ def test_crop_render_matches_full_canvas_render():
     assert cropped[..., :20, :20].abs().max() < 1e-6  # nothing (beyond soft tails) outside the footprint
 
 
-def test_tile_selection_prefers_error_and_suppresses_overlap():
+@pytest.mark.parametrize("centered", [True, False])
+def test_tile_selection_prefers_error_and_suppresses_overlap(centered):
     painter = HighResPainter(_model(), size=64, view_res=16, autocast=None,
-                             config=HighResConfig(max_tiles=3, error_threshold=0.01, nms_iou=0.1))
+                             config=HighResConfig(max_tiles=3, error_threshold=0.01, nms_iou=0.1,
+                                                  centered_tiles=centered))
     err = torch.zeros(1, 1, 64, 64)
     err[..., 40:56, 8:24] = 1.0  # one hot spot, bottom left
     cores, scores = painter.select_tiles(err, core=0.25)
@@ -44,6 +47,19 @@ def test_tile_selection_prefers_error_and_suppresses_overlap():
         for j in range(i):
             assert painter._iou(cores[i].tolist(), cores[j].tolist()) <= 0.1 + 1e-6
 
+
+
+def test_centered_tiles_put_the_error_in_the_middle():
+    painter = HighResPainter(_model(), size=64, view_res=16, autocast=None,
+                             config=HighResConfig(max_tiles=4, error_threshold=0.001))
+    err = torch.zeros(1, 1, 64, 64)
+    err[..., 37:40, 21:24] = 1.0  # small spot centered at pixel (22, 38), off the half-tile grid
+    cores, _ = painter.select_tiles(err, core=0.25)
+    x, y, s = (v * 64 for v in cores[0].tolist())
+    assert abs(x + s / 2 - 22.5) <= 1 and abs(y + s / 2 - 38.5) <= 1
+    for i in range(cores.shape[0]):  # the others still overlap the spot, but within the NMS limit
+        for j in range(i):
+            assert painter._iou(cores[i].tolist(), cores[j].tolist()) <= painter.cfg.nms_iou + 1e-6
 
 def test_view_boxes_keep_size_inside_image():
     painter = HighResPainter(_model(), size=64, view_res=16, autocast=None, config=HighResConfig(margin=0.25))
@@ -74,6 +90,19 @@ def test_paint_runs_whole_and_tile_levels():
     assert result.canvas.shape == (1, 3, 64, 64)
     assert sum(r.shape[0] for r in result.strokes) == result.stats[-1]["strokes"] > 8
 
+
+
+def test_tile_repeats_paint_the_same_tiles_again():
+    target, valid = torch.rand(1, 3, 64, 64), torch.ones(1, 1, 64, 64)
+    counts = []
+    for repeats in (1, 3):
+        cfg = HighResConfig(whole_steps=0, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.5,
+                            tile_repeats=repeats)
+        painter = HighResPainter(_model(), size=64, view_res=16, config=cfg, autocast=None)
+        result = painter.paint(target, source_side=64, valid=valid, log=lambda *_: None)
+        assert result.stats[-1]["tiles"] == 2  # tiles counted once, however often they are painted
+        counts.append(len(result.strokes))
+    assert counts == [2, 6]  # one stroke record per tile per pass
 
 def test_paint_reports_progress_stages_and_can_be_cancelled():
     import pytest

@@ -327,3 +327,28 @@ def test_teacher_stroke_terms_fade_once_the_pixels_are_right(tmp_path):
     assert 0.0 <= stats["relax"] <= 1.0 and math.isfinite(stats["loss"])
     off = Trainer(parse_args(TINY + ["--mode", "teacher", "--teacher-relax", "0", "--out", str(tmp_path / "o")]))
     assert off.train_step()["relax"] == 1.0
+
+
+def test_joint_strokes_train_and_paint_with_the_harness(tmp_path):
+    from overpaintai.highres import HighResConfig, HighResPainter, load_checkpoint_model, render_strokes, stroke_groups
+    from overpaintai.highres import stroke_record
+
+    teacher = tmp_path / "teacher"
+    main(TINY + ["--mode", "teacher", "--joint-strokes", "--epochs", "1", "--out", str(teacher)])
+    unroll = tmp_path / "unroll"
+    main(TINY + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--joint-strokes", "--tile-prob", "1",
+                 "--checkpoint-steps", "--epochs", "1", "--out", str(unroll)])
+    ckpt = torch.load(unroll / "last.pt", weights_only=False)
+    assert ckpt["model_config"]["joint_strokes"] and math.isfinite(ckpt["history"][-1]["train_loss"])
+
+    model, _ = load_checkpoint_model(str(unroll / "last.pt"), torch.device("cpu"))
+    cfg = HighResConfig(whole_steps=2, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.25)
+    painter = HighResPainter(model, size=64, view_res=16, config=cfg, autocast=None)
+    assert painter.joint
+    result = painter.paint(torch.rand(1, 3, 64, 64), source_side=64, log=lambda *_: None)
+    record = stroke_record(result)
+    groups = stroke_groups(record)
+    assert len(groups) == len(result.strokes) and all(j for _, j in groups)
+    redrawn = render_strokes(record["strokes"], 64, (64, 64), 64, min_radius=painter.min_radius,
+                             max_radius=painter.max_radius, groups=groups)
+    assert (redrawn - result.canvas).abs().mean() < 0.01

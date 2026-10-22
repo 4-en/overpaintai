@@ -534,36 +534,18 @@ class DifferentiableCanvasEngine(nn.Module):
                 tool_weights = F.one_hot(idx, num_classes=self.NUM_TOOLS).to(raw_cont.dtype)
         return stroke_params, tool_weights
 
-    def forward_single_step(
-        self,
-        paint_layer: torch.Tensor,
-        stroke_params: torch.Tensor,
-        tool_weights: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def _brush(self, stroke_params: torch.Tensor, H: int, W: int, with_shape: bool = False):
         """
-        Applies a single stroke per batch item onto the transparent RGBA `paint_layer` `(B, 4, H, W)`.
-        
-        Args:
-            paint_layer: (B, 4, H, W) RGBA tensor in [0, 1]
-            stroke_params: (B, 14) tensor in [0, 1]:
-                [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B]
-            tool_weights: (B, 5) weights over tools:
-                [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
+        Decodes `(B, 14 | 16)` stroke params and evaluates the brush mask `(B, 1, H, W)` (profile x opacity).
+        Returns (brush_mask, rgb (B, 3, 1, 1), hardness (B, 1, 1, 1), smudge ctrl (B, 12), curve samples
+        bx, by (B, S, 1, 1), edge sharpness); `with_shape` appends the mask at full opacity, i.e. the brush shape
+        alone (B, 1, H, W).
         """
-        B, C, H, W = paint_layer.shape
-        assert C == 4, f"Expected 4-channel RGBA paint_layer (B, 4, H, W), got shape {tuple(paint_layer.shape)}"
-        n_params = stroke_params.shape[-1]
+        B, n_params = stroke_params.shape
         assert n_params in (self.NUM_CONT_PARAMS, self.NUM_PRESSURE_PARAMS), (
             f"Expected {self.NUM_CONT_PARAMS} or {self.NUM_PRESSURE_PARAMS} continuous stroke params, got {n_params}"
         )
-        device = paint_layer.device
-        self._update_spatial_buffers(H, W, device)
-
-        if tool_weights is None:
-            tool_weights = torch.zeros(B, self.NUM_TOOLS, device=device, dtype=paint_layer.dtype)
-            tool_weights[:, 0] = 1.0
-
-        # 1. Unpack normalized stroke parameters (14 params)
+        # 1. Unpack normalized stroke parameters
         p = stroke_params.view(B, n_params, 1, 1, 1)
         x0, y0 = p[:, 0], p[:, 1]
         x1, y1 = p[:, 2], p[:, 3]
@@ -597,6 +579,38 @@ class DifferentiableCanvasEngine(nn.Module):
         # sigmoid(k * x) rises from 0.1 to 0.9 over 2*ln(9)/k; one pixel is 1/(N-1) in grid units.
         edge_sharpness = 2.0 * math.log(9.0) * (max(H, W) - 1) / self.hard_edge_px
         brush_mask = self._stroke_mask(bx, by, rt, at, hardness, edge_sharpness)
+        ctrl = torch.cat([p[:, 0:6].view(B, 6)] + [v.view(B, 1) for v in (r0, r2, a0, a2, r1, a1)], dim=1)
+        out = (brush_mask, stroke_rgb, hardness, ctrl, bx, by, edge_sharpness)
+        if with_shape:
+            out += (self._stroke_mask(bx, by, rt, torch.ones_like(at), hardness, edge_sharpness),)
+        return out
+
+    def forward_single_step(
+        self,
+        paint_layer: torch.Tensor,
+        stroke_params: torch.Tensor,
+        tool_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Applies a single stroke per batch item onto the transparent RGBA `paint_layer` `(B, 4, H, W)`.
+        
+        Args:
+            paint_layer: (B, 4, H, W) RGBA tensor in [0, 1]
+            stroke_params: (B, 14) tensor in [0, 1]:
+                [x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B]
+            tool_weights: (B, 5) weights over tools:
+                [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
+        """
+        B, C, H, W = paint_layer.shape
+        assert C == 4, f"Expected 4-channel RGBA paint_layer (B, 4, H, W), got shape {tuple(paint_layer.shape)}"
+        device = paint_layer.device
+        self._update_spatial_buffers(H, W, device)
+
+        if tool_weights is None:
+            tool_weights = torch.zeros(B, self.NUM_TOOLS, device=device, dtype=paint_layer.dtype)
+            tool_weights[:, 0] = 1.0
+
+        brush_mask, stroke_rgb, hardness, ctrl, bx, by, edge_sharpness = self._brush(stroke_params, H, W)
 
         # 5. Tool weights unpacking: [Paint, Dry/Chalk, Smudge, Blur/Blend, Eraser]
         w = tool_weights.view(B, self.NUM_TOOLS, 1, 1, 1)
@@ -606,41 +620,137 @@ class DifferentiableCanvasEngine(nn.Module):
         blur_mask = (w_blur * brush_mask).clamp(0.0, 1.0)
         eraser_mask = (w_eraser * brush_mask).clamp(0.0, 1.0)
 
+        # Tools whose weight is zero everywhere are skipped when no gradient needs them (e.g. paint-only
+        # inference): the result is the same up to float rounding, and each skipped step saves several
+        # full-canvas passes per stroke.
+        need_all = tool_weights.requires_grad
+        smudges = []
+        if need_all or bool((w_smudge > 0).any()):
+            smudges.append((ctrl, bx, by, hardness.view(B), w_smudge.view(B), edge_sharpness))
+        blur_mask = blur_mask if need_all or bool((w_blur > 0).any()) else None
+        return self._apply_tools(paint_layer, paint_mask, stroke_rgb, smudges, blur_mask, eraser_mask)
+
+    def forward_joint_step(
+        self,
+        paint_layer: torch.Tensor,
+        stroke_params: torch.Tensor,
+        tool_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Applies K strokes per batch item `(B, K, 14 | 16)` as one operation, independent of their order:
+          1. smudge, blur and eraser edit the canvas as it was before the step, never this step's paint: every
+             smudge stroke smears that canvas on its own and their changes add up; blur and eraser make one pass
+             each with the max of their strokes' masks (blur first, both from the same canvas)
+          2. paint goes on top: per pixel, the coverage is the union of the strokes' brush shapes (as if painted
+             one after another: soft edges side by side fill the gap) times their shape-weighted mean opacity
+             (strokes on the same spot don't build up), and the color the coverage-weighted mean of their colors;
+             that one layer is then painted "source over". Overlapping strokes of the same color merge seamlessly
+             (no darker overlap, no pale seam between soft edges), different colors blend.
+        A single paint stroke renders exactly as `forward_single_step` (up to float rounding); a single smudge,
+        blur or eraser stroke too, except that the step's paint is not smudged / blurred / erased.
+        """
+        B, C, H, W = paint_layer.shape
+        assert C == 4, f"Expected 4-channel RGBA paint_layer (B, 4, H, W), got shape {tuple(paint_layer.shape)}"
+        _, K, n_params = stroke_params.shape
+        device = paint_layer.device
+        self._update_spatial_buffers(H, W, device)
+
+        if tool_weights is None:
+            tool_weights = torch.zeros(B, K, self.NUM_TOOLS, device=device, dtype=paint_layer.dtype)
+            tool_weights[..., 0] = 1.0
+
+        # All K strokes' masks in one batch of B * K
+        brush, rgb, hardness, ctrl, bx, by, edge_sharpness, shape = self._brush(
+            stroke_params.reshape(B * K, n_params), H, W, with_shape=True)
+        brush, shape = brush.view(B, K, H, W), shape.view(B, K, H, W)
+        w = tool_weights.view(B, K, self.NUM_TOOLS, 1, 1)
+        w_paint, w_dry, w_smudge, w_blur, w_eraser = w.unbind(2)
+
+        # Paint coverage: the brush shapes add up like strokes painted one after another (soft edges next to each
+        # other fill the gap between them), times the shapes' weighted mean opacity (paint mask / shape: opacity,
+        # pressure and dry-brush grain), so strokes on the same spot don't build up: two at 0.5 give 0.5
+        paint = (w_paint * brush + w_dry * (brush * self.paper_grain[:, 0])).clamp(0.0, 1.0)  # (B, K, H, W)
+        shape = ((w_paint + w_dry) * shape).clamp(0.0, 1.0)
+        shape_sum = shape.sum(1, keepdim=True)
+        union = 1.0 - (1.0 - shape).prod(1, keepdim=True)
+        weight = paint.sum(1, keepdim=True)
+        # Denominators at least 1e-6 (invisible below): the gradient of a / b has b^2 in it, which underflows to 0
+        # in the far tails of soft strokes (b ~ 1e-25) and turned the whole backward pass NaN
+        safe = lambda x: x.clamp(min=1e-6)
+        paint_mask = (union * weight / safe(shape_sum)).clamp(0.0, 1.0)
+        paint_rgb = torch.einsum("bkhw,bkc->bchw", paint, rgb.view(B, K, 3)) / safe(weight)
+
+        # 1. Edits of the canvas before the step, in premultiplied RGBA: each one's change from that canvas
+        need_all = tool_weights.requires_grad
+        base = torch.cat([paint_layer[:, :3] * paint_layer[:, 3:4], paint_layer[:, 3:4]], dim=1)
+        delta = None
+        smudging = [k for k, on in enumerate((w_smudge.view(B, K) > 0).any(0).tolist()) if on or need_all]
+        if smudging:  # all smudge strokes in one batch, each on its own copy of the canvas
+            n = len(smudging)
+            i = (torch.tensor(smudging, device=device).view(n, 1) + K * torch.arange(B, device=device)).flatten()
+            rep = base.repeat(n, 1, 1, 1)  # stroke-major, like i
+            smeared = self._smudge(rep, ctrl[i], bx[i], by[i], hardness.view(B * K)[i],
+                                   w_smudge.view(B, K).t()[smudging].flatten(), edge_sharpness)
+            delta = (smeared - rep).view(n, B, 4, H, W).sum(0)
+        if need_all or bool((w_blur > 0).any()):
+            blur_mask = (w_blur * brush).clamp(0.0, 1.0).amax(1, keepdim=True)
+            blurred = blur_mask * (self._gaussian_blur_rgba(base) - base)
+            delta = blurred if delta is None else delta + blurred
+        layer = paint_layer
+        if delta is not None:
+            edited = base + delta
+            a = edited[:, 3:4].clamp(0.0, 1.0)
+            rgb = torch.where(a > 1e-5, (edited[:, :3] / (a + 1e-6)).clamp(0.0, 1.0), paint_layer[:, :3])
+            layer = torch.cat([rgb, a], dim=1)
+        if need_all or bool((w_eraser > 0).any()):
+            eraser_mask = (w_eraser * brush).clamp(0.0, 1.0).amax(1, keepdim=True)
+            a = layer[:, 3:4] * (1.0 - eraser_mask)
+            layer = torch.cat([torch.where(a > 1e-5, layer[:, :3], torch.zeros_like(a)), a], dim=1)
+
+        # 2. Paint on top
+        return self._apply_tools(layer, paint_mask, paint_rgb, [], None, None)
+
+    def _apply_tools(
+        self,
+        paint_layer: torch.Tensor,
+        paint_mask: torch.Tensor,
+        paint_rgb: torch.Tensor,
+        smudges: list,
+        blur_mask: Optional[torch.Tensor],
+        eraser_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Paints `paint_rgb` (B, 3, 1 | H, 1 | W) with coverage `paint_mask` (B, 1, H, W), runs the `smudges`
+        (`_smudge` arguments after the canvas) in order, blurs under `blur_mask` and erases under `eraser_mask`
+        (None: skipped).
+        """
         # 6. STEP A: Paint Deposition via Porter-Duff "Source Over" on RGBA
         c_rgb = paint_layer[:, :3]
         c_a = paint_layer[:, 3:4]
 
         a_after_paint = paint_mask + c_a * (1.0 - paint_mask)
-        rgb_num = paint_mask * stroke_rgb + (1.0 - paint_mask) * c_a * c_rgb
+        rgb_num = paint_mask * paint_rgb + (1.0 - paint_mask) * c_a * c_rgb
         rgb_after_paint = torch.where(
             a_after_paint > 1e-5,
             rgb_num / (a_after_paint + 1e-6),
             c_rgb,
         )
 
-        # Tools whose weight is zero everywhere are skipped when no gradient needs them (e.g. paint-only
-        # inference): the result is the same up to float rounding, and each skipped step saves several
-        # full-canvas passes per stroke.
-        need_all = tool_weights.requires_grad
-
         # 7. STEP B: Smudge / Push — dab-sequential paint transport in premultiplied RGBA
-        if need_all or bool((w_smudge > 0).any()):
+        a_after_smudge, rgb_after_smudge = a_after_paint, rgb_after_paint
+        if smudges:
             premult_rgba = torch.cat([rgb_after_paint * a_after_paint, a_after_paint], dim=1)
-            ctrl = torch.cat([p[:, 0:6].view(B, 6)] + [v.view(B, 1) for v in (r0, r2, a0, a2, r1, a1)], dim=1)
-            premult_rgba = self._smudge(
-                premult_rgba, ctrl, bx, by, hardness.view(B), w_smudge.view(B), edge_sharpness
-            )
+            for args in smudges:
+                premult_rgba = self._smudge(premult_rgba, *args)
             a_after_smudge = premult_rgba[:, 3:4].clamp(0.0, 1.0)
             rgb_after_smudge = torch.where(
                 a_after_smudge > 1e-5,
                 (premult_rgba[:, :3] / (a_after_smudge + 1e-6)).clamp(0.0, 1.0),
                 rgb_after_paint,
             )
-        else:
-            a_after_smudge, rgb_after_smudge = a_after_paint, rgb_after_paint
 
         # 8. STEP C: In-Place Isotropic Blur / Blend Tool
-        if need_all or bool((w_blur > 0).any()):
+        if blur_mask is not None:
             post_smudge_premult = torch.cat([rgb_after_smudge * a_after_smudge, a_after_smudge], dim=1)
             blurred_post_smudge = self._gaussian_blur_rgba(post_smudge_premult)
             blended_blur_premult = (1.0 - blur_mask) * post_smudge_premult + blur_mask * blurred_post_smudge
@@ -655,8 +765,11 @@ class DifferentiableCanvasEngine(nn.Module):
             a_after_blur, rgb_after_blur = a_after_smudge, rgb_after_smudge
 
         # 9. STEP D: True Subtractive Eraser (supports both soft and hard erasing via `hardness`)
-        a_final = a_after_blur * (1.0 - eraser_mask)
-        rgb_final = torch.where(a_final > 1e-5, rgb_after_blur, torch.zeros_like(rgb_after_blur))
+        if eraser_mask is not None:
+            a_final = a_after_blur * (1.0 - eraser_mask)
+            rgb_final = torch.where(a_final > 1e-5, rgb_after_blur, torch.zeros_like(rgb_after_blur))
+        else:
+            a_final, rgb_final = a_after_blur, rgb_after_blur
 
         return torch.cat([rgb_final, a_final], dim=1).clamp(0.0, 1.0)
 
@@ -666,28 +779,35 @@ class DifferentiableCanvasEngine(nn.Module):
         stroke_sequence: torch.Tensor,
         tool_weights_sequence: Optional[torch.Tensor] = None,
         checkpoint_strokes: bool = False,
+        joint: int = 0,
     ) -> torch.Tensor:
         """
         Unrolls K sequential strokes onto the RGBA `paint_layer` `(B, 4, H, W)`.
 
-        With `checkpoint_strokes=True` (and autograd enabled), only the paint layer between strokes is
-        kept for backward and each stroke is recomputed during backward: memory stops growing with the
-        per-stroke intermediates, at the cost of roughly one extra forward pass.
+        With `joint` > 0, consecutive groups of `joint` strokes (the last one may be shorter) are each applied
+        as one order-independent operation (`forward_joint_step`) instead of one stroke after another.
+
+        With `checkpoint_strokes=True` (and autograd enabled), only the paint layer between strokes (groups)
+        is kept for backward and each stroke (group) is recomputed during backward: memory stops growing with
+        the per-stroke intermediates, at the cost of roughly one extra forward pass.
         """
         if stroke_sequence.dim() == 2:
             return self.forward_single_step(paint_layer, stroke_sequence, tool_weights_sequence)
 
         B, K, _ = stroke_sequence.shape
         use_ckpt = checkpoint_strokes and torch.is_grad_enabled()
+        size = joint if joint > 0 else 1
+        step = self.forward_joint_step if joint > 0 else self.forward_single_step
         curr_layer = paint_layer
-        for k in range(K):
-            tw_k = tool_weights_sequence[:, k] if tool_weights_sequence is not None else None
+        for k in range(0, K, size):
+            s_k = stroke_sequence[:, k : k + size] if joint > 0 else stroke_sequence[:, k]
+            tw_k = None
+            if tool_weights_sequence is not None:
+                tw_k = tool_weights_sequence[:, k : k + size] if joint > 0 else tool_weights_sequence[:, k]
             if use_ckpt:
-                curr_layer = checkpoint(
-                    self.forward_single_step, curr_layer, stroke_sequence[:, k], tw_k, use_reentrant=False
-                )
+                curr_layer = checkpoint(step, curr_layer, s_k, tw_k, use_reentrant=False)
             else:
-                curr_layer = self.forward_single_step(curr_layer, stroke_sequence[:, k], tw_k)
+                curr_layer = step(curr_layer, s_k, tw_k)
         return curr_layer
 
 
