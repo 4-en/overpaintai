@@ -20,6 +20,10 @@ from overpaintai.views import Strokes, view_grid
 
 
 GATE_LEAK = 0.02  # minimum gradient of the stroke gate w.r.t. its logit in training
+# Stroke colours start from the target colour clamped to [COLOR_EPS, 1 - COLOR_EPS] (in logit space). At 0.02 the
+# base could not reach flat fills with a channel near 0 or 1 (e.g. sky blue, B = 1.0): the leftover error made
+# joint models alternate between washing such areas lighter and repainting them
+COLOR_EPS = 0.005
 GATE_LOGIT_RANGE = 6.0  # logits beyond +-this are pulled back (sigmoid(-6) = 0.0025: off, but recoverable)
 
 
@@ -421,7 +425,7 @@ class StrokePredictor(nn.Module):
         radii = torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
         opacity = 0.05 + 0.95 * torch.sigmoid(a_raw)
         hardness = torch.sigmoid(h_raw)
-        tc = target_color.clamp(0.02, 0.98)
+        tc = target_color.clamp(COLOR_EPS, 1.0 - COLOR_EPS)
         color = torch.sigmoid(torch.log(tc) - torch.log1p(-tc) + c_raw)
 
         strokes = Strokes(

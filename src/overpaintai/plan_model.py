@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from overpaintai.model import (
-    GATE_LEAK, FourierPosition, Stage, StrokeOutput, StrokePredictor, StrokeSamples, TransformerBlock, _gumbel,
+    COLOR_EPS, GATE_LEAK, FourierPosition, Stage, StrokeOutput, StrokePredictor, StrokeSamples, TransformerBlock, _gumbel,
     _groups,
 )
 from overpaintai.views import Strokes, view_grid
@@ -270,7 +270,7 @@ class PlanStrokePredictor(nn.Module):
         r_init = (math.log(0.1) - r_lo) / (r_hi - r_lo)  # start at radius ~0.1 view units
         radii = torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
         opacity = 0.05 + 0.95 * torch.sigmoid(a_raw)
-        tc = self._base_color(colors, look, radii).clamp(0.02, 0.98)
+        tc = self._base_color(colors, look, radii).clamp(COLOR_EPS, 1.0 - COLOR_EPS)
         color = torch.sigmoid(torch.log(tc) - torch.log1p(-tc) + c_raw)
         tool_logits, gate_raw = (rest[..., :-1], rest[..., -1]) if self.stroke_gate else (rest, None)
         return anchor, points, radii, opacity, torch.sigmoid(h_raw), color, tool_logits, gate_raw
