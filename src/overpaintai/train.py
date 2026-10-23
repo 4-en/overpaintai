@@ -317,7 +317,7 @@ def placement_overlap(logits: torch.Tensor, threshold: float = 0.5):
     Overlap between the placement maps of a step's strokes, `logits` `(B, N, H*W)`: the Bhattacharyya coefficient
     of each pair (1 = the same map, 0 = disjoint). Returns (mean over pairs, mean of the part above `threshold`).
     """
-    sq = logits.float().softmax(-1).sqrt()
+    sq = (0.5 * logits.float().log_softmax(-1)).exp()  # sqrt(softmax), with a finite gradient where p underflows to 0
     ov = sq @ sq.transpose(1, 2)
     n = ov.shape[1]
     pairs = ov[:, ~torch.eye(n, dtype=torch.bool, device=ov.device)]

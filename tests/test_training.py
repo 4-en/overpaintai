@@ -409,3 +409,17 @@ def test_target_unet_reads_targets_above_the_canvas_resolution(tmp_path):
     assert math.isfinite(stats["loss"])
     assert seen and set(seen) == {64}  # the target U-Net encoded the 64 px targets
     trainer.validate()
+
+
+def test_placement_overlap_has_finite_gradients_for_peaked_maps():
+    from overpaintai.train import placement_overlap
+
+    # bf16-sharp placement maps: most probabilities underflow to exactly 0, where sqrt's gradient is infinite
+    logits = torch.full((2, 4, 64), -200.0)
+    logits[:, :, 0] = 0.0
+    logits[:, 1, 1] = 0.0
+    logits.requires_grad_(True)
+    mean_ov, crowd = placement_overlap(logits)
+    (mean_ov + crowd).backward()
+    assert torch.isfinite(logits.grad).all()
+    assert 0.0 < mean_ov.item() <= 1.0
