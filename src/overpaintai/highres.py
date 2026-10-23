@@ -28,6 +28,7 @@ from PIL import Image
 
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
+from overpaintai.frame_model import TargetCache
 from overpaintai.metrics import ACTIVE_OPACITY
 from overpaintai.model import StrokePredictor
 from overpaintai.plan_model import build_model
@@ -401,6 +402,7 @@ class HighResPainter:
         self.joint = bool(getattr(model, "joint_strokes", False))  # each step / tile as one operation
         self.engine = self.renderer.engine
         self.background = self.renderer.background
+        self._target_cache = TargetCache()  # target encodings: one for all whole-image steps, one per tile set
 
     def composite(self, layer: torch.Tensor) -> torch.Tensor:
         return self.renderer.composite(layer)
@@ -445,15 +447,24 @@ class HighResPainter:
         prog = torch.full((T,), progress, device=self.device)
         # Models that read the full-resolution images along their strokes get them (one copy for all views)
         kw = {"images": (target, canvas)} if getattr(self.model, "uses_images", False) else {}
+        if getattr(self.model, "target_unet", False):
+            kw["target_features"] = self._target_cache.get(self.model, target, boxes, self.R,
+                                                           view_size=boxes[:, 2].clamp(lo, hi), autocast=self._autocast())
         with self._autocast():
             return self.model(x, boxes, prog, global_tokens=global_tokens, view_size=boxes[:, 2].clamp(lo, hi),
                               error_progress=e, **kw)
 
     @torch.no_grad()
     def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: float) -> torch.Tensor:
-        x, e, _ = self._inputs(target, layer, views.whole_image_boxes(1, self.device))
+        whole = views.whole_image_boxes(1, self.device)
+        x, e, _ = self._inputs(target, layer, whole)
+        kw = {}
+        if getattr(self.model, "target_unet", False):  # the whole-image steps' encoding, reused
+            lo, hi = self.cfg.scale_clamp
+            kw["target_features"] = self._target_cache.get(self.model, target, whole, self.R,
+                                                           view_size=whole[:, 2].clamp(lo, hi), autocast=self._autocast())
         with self._autocast():
-            return self.model.encode_global(x, torch.full((1,), progress, device=self.device), e)
+            return self.model.encode_global(x, torch.full((1,), progress, device=self.device), e, **kw)
 
     @staticmethod
     def _visible(strokes: views.Strokes, opacity: torch.Tensor, keep: torch.Tensor, t: int) -> views.Strokes:

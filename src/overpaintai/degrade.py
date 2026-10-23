@@ -241,14 +241,17 @@ def touchup_pair(
     generator: Optional[torch.Generator] = None,
     add_share: float = 0.5,
     strength: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    target_hr: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    A nearly finished painting and its target, `(paint layer (B, 4, S, S), target (B, 3, S, S))`: the target
+    A nearly finished painting and its target, `(paint layer (B, 4, S, S), target (B, 3, S, S), target_hr)`: the target
     slightly softened (like a stroke painting of it, not a pixel copy), with fine detail missing in a few small
     regions, and a few small details (DETAILS, each 1.5-12% of the side, drawn with the engine's strokes; colors
     either close to the image's or random). Per image, with probability `add_share` the details are added to the
     target (the model must paint them), otherwise they sit on the canvas (the model must paint them away and
-    restore the image there). `strength` scales the number of details.
+    restore the image there). `strength` scales the number of details. `target_hr` (B, 3, H, H): the same target at
+    a higher resolution (`target` its area-downsampled version); the details are then drawn at that resolution, the
+    returned `target_hr` gets them too and the returned target is its downsampled version (None without one).
     """
     B, _, S, _ = target.shape
     dev = target.device
@@ -264,13 +267,20 @@ def touchup_pair(
     kind = torch.randint(0, len(DETAILS), (B, n), generator=gen, device=dev)
     colors = _local_colors(target, centers, gen, _rand(gen, B, n, device=dev) < 0.5)
     strokes = _detail_strokes(engine, B, n, centers, sizes, colors, kind, gen)
-    regions = _region_details(B, S, n, centers, sizes, colors, kind, gen)
+    H = S if target_hr is None else target_hr.shape[-1]
+    regions = _region_details(B, H, n, centers, sizes, colors, kind, gen)
     detail = engine(regions, strokes)  # strokes over the regions, on a transparent layer
-    a = detail[:, 3:]
-    over = lambda img: img * (1 - a) + detail[:, :3] * a
+    premult = torch.cat([detail[:, :3] * detail[:, 3:], detail[:, 3:]], 1)
+    over_at = lambda img, pm: img * (1 - pm[:, 3:]) + pm[:, :3]
+    small = premult if H == S else F.interpolate(premult, size=(S, S), mode="area")
 
     add = (_rand(gen, B, 1, 1, 1, device=dev) < add_share)
-    canvas = torch.where(add, base, over(base))
-    new_target = torch.where(add, over(target), target)
+    canvas = torch.where(add, base, over_at(base, small))
+    new_hr = None
+    if target_hr is None:
+        new_target = torch.where(add, over_at(target, small), target)
+    else:
+        new_hr = torch.where(add, over_at(target_hr, premult), target_hr).clamp(0.0, 1.0)
+        new_target = torch.where(add, F.interpolate(new_hr, size=(S, S), mode="area"), target)
     layer = torch.cat([canvas.clamp(0.0, 1.0), torch.ones_like(canvas[:, :1])], dim=1)
-    return layer, new_target.clamp(0.0, 1.0)
+    return layer, new_target.clamp(0.0, 1.0), new_hr

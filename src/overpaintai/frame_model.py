@@ -11,7 +11,13 @@ to each other and to the plan) at U-Net speed, with high detail only where each 
    (where paint stops) and just outside (what to follow), plus the end caps and a few learned points. The raw
    images are read at full resolution when the caller passes them (`images`), so precision is bounded by the
    image, not by the view.
-3. Each point also sees the predicted result: every stroke's coverage there (as the renderer computes it, without
+3. With `target_unet`, the target has its own U-Net, run on the view box at `target_res` x the view resolution
+   (256 px for a 128 px view, from the full-resolution image) and cached: it doesn't depend on the canvas, so it is
+   computed once per view box (once for all whole-image steps of an unroll or painting, once per tile set) instead
+   of every step. Its stages at 64 / 32 / 16 px are added to the canvas stream (canvas + error only) at the same
+   resolutions, and its full-resolution output is what the stroke samples read besides the raw values: learned line
+   and edge features finer than a view pixel, with the context of the whole view.
+4. Each point also sees the predicted result: every stroke's coverage there (as the renderer computes it, without
    rendering) and the canvas after the joint step, so a stroke sees where it would actually land, whether it
    misses a line, cuts into an edge or overlaps another stroke.
 
@@ -24,11 +30,13 @@ an opaque canvas.
 """
 
 import math
+import weakref
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from overpaintai.canvas_engine import joint_at, profile_at
 from overpaintai.model import (
@@ -36,7 +44,7 @@ from overpaintai.model import (
     _groups, _gumbel,
 )
 from overpaintai.plan_model import _blur, _curve, _odd, _sample
-from overpaintai.views import Strokes, view_grid
+from overpaintai.views import Strokes, resample_views, view_grid
 
 ERASER = 4  # tool index of the eraser, the mask with `mask_tool`
 # Fixed points across a stroke: (sign-free multiple of the radius, extra view pixels), mirrored to both sides
@@ -107,6 +115,10 @@ class FrameStrokePredictor(nn.Module):
         frame_along: positions along each stroke where it samples across.
         learned_points: extra sample points per stroke and layer, offsets in the stroke's frame from its latent.
         point_dim: width of the coarse features read at each sample point.
+        target_unet: a separate, cached U-Net for the target (see the module docstring); the per-step stream then
+            only reads canvas and error.
+        target_res: its input resolution as a multiple of the view's (1, 2, 4).
+        target_base: its width at full resolution (doubling per level, at most the coarse path's widest).
     """
 
     IN_CHANNELS = StrokePredictor.IN_CHANNELS
@@ -136,6 +148,9 @@ class FrameStrokePredictor(nn.Module):
         stationary: bool = False,
         hard_gate: bool = False,
         pressure: bool = True,
+        target_unet: bool = False,
+        target_res: int = 2,
+        target_base: int = 16,
     ):
         super().__init__()
         self.num_strokes = num_strokes
@@ -146,9 +161,13 @@ class FrameStrokePredictor(nn.Module):
         self.hard_gate = hard_gate
         self.pressure = pressure
         self.in_channels = self.IN_CHANNELS + int(paintable_mask)
-        # View channels the network reads: everything but the paint alpha (channel 9)
-        self.register_buffer("channels", torch.tensor([c for c in range(self.in_channels) if c != 9]),
+        # View channels the per-step network reads: everything but the paint alpha (channel 9), and with its own
+        # U-Net the target (channels 0-2) neither
+        skip = {9} | ({0, 1, 2} if target_unet else set())
+        self.register_buffer("channels", torch.tensor([c for c in range(self.in_channels) if c not in skip]),
                              persistent=False)
+        self.target_unet = target_unet
+        self.target_res = target_res
         self.view_tokens = view_tokens
         self.global_grid = global_grid
         self.max_offset = max_offset
@@ -171,6 +190,23 @@ class FrameStrokePredictor(nn.Module):
         self.enc2 = Stage(w2, w2, D)
         self.down3 = nn.Conv2d(w2, w3, 3, stride=2, padding=1)
         self.enc3 = Stage(w3, w3, D)
+
+        # Target U-Net: levels from target_res x R down to R/8, each level's output with the whole view's context
+        if target_unet:
+            n = int(round(math.log2(target_res))) + 4
+            if 2 ** (n - 4) != target_res:
+                raise ValueError(f"target_res must be a power of two, got {target_res}")
+            tw = [min(target_base * 2 ** i, w3) for i in range(n)]
+            self.t_cond = nn.Sequential(nn.Linear(1, D), nn.SiLU(), nn.Linear(D, D))  # view size only
+            self.t_stem = nn.Conv2d(3, tw[0], 3, padding=1)
+            self.t_enc = nn.ModuleList([Stage(tw[i], tw[i], D) for i in range(n)])
+            self.t_down = nn.ModuleList([nn.Conv2d(tw[i], tw[i + 1], 3, stride=2, padding=1) for i in range(n - 1)])
+            self.t_up = nn.ModuleList([nn.Conv2d(tw[i + 1], tw[i], 3, padding=1) for i in range(n - 1)])
+            self.t_dec = nn.ModuleList([Stage(2 * tw[i], tw[i], D) for i in range(n - 1)])
+            # into the canvas stream at R/2, R/4, R/8; and the full-resolution map the stroke samples read
+            self.t_fuse = nn.ModuleList([nn.Conv2d(tw[n - 3], w1, 1), nn.Conv2d(tw[n - 2], w2, 1),
+                                         nn.Conv2d(tw[n - 1], w3, 1)])
+            self.t_point = nn.Conv2d(tw[0], point_dim, 1)
 
         # Plan: view tokens, whole-image tokens and plan slots
         self.to_tokens = nn.Linear(w3, D)
@@ -217,7 +253,7 @@ class FrameStrokePredictor(nn.Module):
         # per point: target + canvas 6, error x4 and signed sqrt 6, gradients 4, own coverage and shape 2, predicted
         # error x4 and signed sqrt 6; coarse features; frame coordinates (t, radius multiple, pixels, cap, learned)
         # and sin / cos of t at 3 frequencies 11
-        self.point_in = 24 + point_dim + 11
+        self.point_in = 24 + point_dim * (2 if target_unet else 1) + 11
         self.point_enc = nn.Sequential(nn.LayerNorm(self.point_in), nn.Linear(self.point_in, 4 * point_dim),
                                        nn.SiLU(), nn.Linear(4 * point_dim, D))
         self.refine = nn.ModuleList()
@@ -243,12 +279,52 @@ class FrameStrokePredictor(nn.Module):
     _cond = StrokePredictor._cond
     uses_error_progress = StrokePredictor.uses_error_progress
 
-    def _encode(self, x: torch.Tensor, cond: torch.Tensor):
+    def encode_target(self, target: torch.Tensor, boxes: torch.Tensor, R: int,
+                      view_size: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
+        """
+        The cacheable target features of views `boxes` (B, 3) of `target` (B or 1, 3, H, W), for a model working
+        at view resolution `R`: (map the stroke samples read, at target_res x R; additions to the canvas stream at
+        R/2, R/4, R/8). `view_size` (B,) as in `forward` (default: the boxes' sizes).
+        """
+        x = resample_views(target, boxes, self.target_res * R)
+        vs = boxes[:, 2] if view_size is None else view_size
+        cond = self.t_cond(torch.log2(vs.clamp(min=1e-4)).unsqueeze(-1).to(x.dtype))
+        skips, h = [], self.t_stem(x)
+        for i, stage in enumerate(self.t_enc):
+            h = stage(h, cond)
+            if i < len(self.t_down):
+                skips.append(h)
+                h = self.t_down[i](h)
+        outs = [h]  # bottom up: R/8 first
+        for i in reversed(range(len(self.t_dec))):
+            h = self.t_dec[i](torch.cat([self.t_up[i](F.interpolate(h, scale_factor=2.0, mode="nearest")),
+                                         skips[i]], 1), cond)
+            outs.append(h)
+        outs = outs[::-1]  # full resolution first
+        n = len(outs)
+        return (self.t_point(outs[0]), self.t_fuse[0](outs[n - 3]), self.t_fuse[1](outs[n - 2]),
+                self.t_fuse[2](outs[n - 1]))
+
+    def _encode(self, x: torch.Tensor, cond: torch.Tensor, target: Optional[Tuple[torch.Tensor, ...]] = None):
         x = x[:, self.channels]
-        h1 = self.enc1(self.stem(x), cond)
-        h2 = self.enc2(self.down2(h1), cond)
-        h3 = self.enc3(self.down3(h2), cond)
+        add = (0.0, 0.0, 0.0) if target is None else target[1:]
+        h1 = self.enc1(self.stem(x) + add[0], cond)
+        h2 = self.enc2(self.down2(h1) + add[1], cond)
+        h3 = self.enc3(self.down3(h2) + add[2], cond)
         return h1, h2, h3
+
+    def _target(self, inputs: torch.Tensor, boxes: torch.Tensor, images, target_features, view_size=None):
+        """The target features for this call: given (cached by the caller) or computed (from the full-resolution
+        target when given, else the view's own, upsampled)."""
+        if not self.target_unet:
+            return None
+        if target_features is not None:
+            return target_features
+        if images is not None:
+            return self.encode_target(images[0], boxes, inputs.shape[-1], view_size)
+        unit = boxes.new_tensor([0.0, 0.0, 1.0]).expand(boxes.shape[0], 3)
+        vs = boxes[:, 2] if view_size is None else view_size
+        return self.encode_target(inputs[:, 0:3], unit, inputs.shape[-1], vs)
 
     def _grid_positions(self, boxes: torch.Tensor, G: int) -> torch.Tensor:
         centers = (torch.arange(G, device=boxes.device, dtype=boxes.dtype) + 0.5) / G
@@ -261,12 +337,16 @@ class FrameStrokePredictor(nn.Module):
         return self.to_tokens(pooled) + self.token_pos(self._grid_positions(boxes, G)) + self.token_type[kind]
 
     def encode_global(
-        self, whole_inputs: torch.Tensor, progress: torch.Tensor, error_progress: Optional[torch.Tensor] = None
+        self, whole_inputs: torch.Tensor, progress: torch.Tensor, error_progress: Optional[torch.Tensor] = None,
+        images: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        target_features: Optional[Tuple[torch.Tensor, ...]] = None,
     ) -> torch.Tensor:
-        """Whole-image tokens `(B, G*G, D)`, shared by all tile views of that image and step."""
+        """Whole-image tokens `(B, G*G, D)`, shared by all tile views of that image and step (`images`,
+        `target_features`: as in `forward`, for the whole image)."""
         boxes = whole_inputs.new_tensor([0.0, 0.0, 1.0]).expand(whole_inputs.shape[0], 3)
         cond = self._cond(progress, boxes[:, 2], error_progress)
-        return self._tokens(self._encode(whole_inputs, cond)[2], boxes, self.global_grid, kind=0)
+        target = self._target(whole_inputs, boxes, images, target_features)
+        return self._tokens(self._encode(whole_inputs, cond, target)[2], boxes, self.global_grid, kind=0)
 
     # --- strokes ------------------------------------------------------------------------------------
     def _decode(self, h: torch.Tensor, anchor0: torch.Tensor, imgs: _Images):
@@ -352,7 +432,7 @@ class FrameStrokePredictor(nn.Module):
         return pts, torch.stack([t, k_r, k_px], dim=-1)
 
     def _point_tokens(self, pts: torch.Tensor, coords: torch.Tensor, imgs: _Images, coarse: torch.Tensor,
-                      strokes: Tuple, edge: float):
+                      strokes: Tuple, edge: float, fine: Optional[torch.Tensor] = None):
         """
         Point tokens `(B * N, Q, D)` for each stroke's own sample points `pts` `(B, N, Q, 2)`: image values, the
         predicted result there (from all strokes `strokes`), coarse features and frame coordinates `coords`
@@ -376,6 +456,8 @@ class FrameStrokePredictor(nn.Module):
                                _signed_sqrt(pred_err)], dim=-1)
         # Coarse features and learned positions keep their gradient (the learned offsets learn through them)
         cf = _sample(coarse, pts)  # (B, N, Q, point_dim)
+        if fine is not None:  # the target U-Net's full-resolution features
+            cf = torch.cat([cf, _sample(fine, pts).to(cf.dtype)], -1)
         t = coords[..., 0:1]
         ang = t * math.pi * torch.tensor([1.0, 2.0, 4.0], device=t.device)
         frame = torch.cat([coords, ang.sin(), ang.cos()], dim=-1)
@@ -405,16 +487,19 @@ class FrameStrokePredictor(nn.Module):
         error_progress: Optional[torch.Tensor] = None,
         samples: Optional[StrokeSamples] = None,
         images: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        target_features: Optional[Tuple[torch.Tensor, ...]] = None,
     ) -> StrokeOutput:
         """
         Same contract as `StrokePredictor.forward`, plus `images`: (target, canvas) `(Bi, 3, H, W)` of the whole
         image (Bi = B, or 1 shared by all views) that `boxes` index into, read at full resolution along the strokes.
-        Without them the strokes read the view itself.
+        Without them the strokes read the view itself. `target_features`: `encode_target` of these views, cached
+        by the caller (computed here if omitted).
         """
         sampling = self.training or self.sample_in_eval
         B, _, R, _ = inputs.shape
         cond = self._cond(progress, boxes[:, 2] if view_size is None else view_size, error_progress)
-        h1, h2, h3 = self._encode(inputs, cond)
+        target = self._target(inputs, boxes, images, target_features, view_size)
+        h1, h2, h3 = self._encode(inputs, cond, target)
         imgs = _Images(inputs, boxes, images)
 
         # Plan
@@ -482,7 +567,8 @@ class FrameStrokePredictor(nn.Module):
                 lcoords = torch.cat([lc, torch.zeros_like(lc[..., :1]), torch.ones_like(lc[..., :1])], -1)
                 pts = torch.cat([fixed.to(lp.dtype), lp], 2)
                 coords = torch.cat([coords.to(lcoords.dtype), lcoords], 2)
-            look = self._point_tokens(pts, coords, imgs, coarse, state, edge)  # (B*N, Q, D)
+            look = self._point_tokens(pts, coords, imgs, coarse, state, edge,
+                                      None if target is None else target[0])  # (B*N, Q, D)
             hq = layer["look"](h.reshape(B * self.num_strokes, 1, -1), context=look.to(h.dtype))
             h = hq.view(B, self.num_strokes, -1)
             h = layer["self_attn"](h)
@@ -512,3 +598,47 @@ class FrameStrokePredictor(nn.Module):
             strokes=strokes, tool_logits=tool_logits, anchors=anchor.float(), anchor_entropy=entropy,
             placement_logits=logits, gate=gate, gate_logit=gate_logit, samples=StrokeSamples(place_seed, gate_on),
         )
+
+
+class TargetCache:
+    """
+    Cached `encode_target` features per (target tensor, view boxes): a target and its views don't change while a
+    painting goes on, so whole-image steps (and repeated passes over the same tiles) reuse one encoding. Entries
+    hold the features with their autograd graph when computed with gradients (one encoding shared by all steps of
+    an unroll; their gradients add up), and are keyed by gradient mode, so features without a graph never stand in
+    for ones that need it. A target is recognized by identity (weak reference): a new tensor is a new target.
+    """
+
+    def __init__(self, size: int = 8):
+        self.size = size
+        self.entries = {}
+
+    def get(self, model: nn.Module, target: torch.Tensor, boxes: torch.Tensor, R: int,
+            view_size: Optional[torch.Tensor] = None, repeat: int = 1, autocast=None):
+        """Features of `boxes` (B * repeat, 3) on `target` (B or 1, ...; repeated per view when `repeat` > 1),
+        or None for models without a target U-Net. `autocast`: context manager to compute them under."""
+        if not getattr(model, "target_unet", False):
+            return None
+        vs = None if view_size is None else view_size.detach()
+        key = (boxes.detach().float().cpu().numpy().tobytes(),
+               None if vs is None else vs.float().cpu().numpy().tobytes(),
+               torch.is_grad_enabled(), model.training, R, repeat)
+        self.entries = {k: v for k, v in self.entries.items() if v[0]() is not None}  # targets still alive
+        hit = self.entries.get(key)
+        if hit is not None and hit[0]() is target:
+            return hit[1]
+        img = target.repeat_interleave(repeat, 0) if repeat > 1 else target
+        # With gradients, only the outputs are kept until backward, which runs the U-Net once more: its high-res
+        # activations would otherwise stay alive over the whole unroll (+6 GB for 16 views at 256 px)
+        encode = model.encode_target
+        if torch.is_grad_enabled():
+            encode = lambda *a: torch.utils.checkpoint.checkpoint(model.encode_target, *a, use_reentrant=False)
+        if autocast is None:
+            feats = encode(img, boxes, R, view_size)
+        else:
+            with autocast:
+                feats = encode(img, boxes, R, view_size)
+        if len(self.entries) >= self.size:
+            self.entries.pop(next(iter(self.entries)))
+        self.entries[key] = (weakref.ref(target), feats)
+        return feats

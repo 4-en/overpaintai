@@ -114,7 +114,7 @@ def test_touchup_pairs_differ_from_their_target_only_in_small_places():
     target = render_targets(engine, params, tools, 64)
     background = engine.create_background(8, 64, 64)
     for add_share in (0.0, 1.0):
-        layer, new_target = touchup_pair(target, engine, gen, add_share=add_share)
+        layer, new_target, _ = touchup_pair(target, engine, gen, add_share=add_share)
         assert layer.shape == (8, 4, 64, 64) and new_target.shape == target.shape
         assert (layer[:, 3] == 1).all()  # a finished painting: nothing left unpainted
         canvas = engine.composite(layer, background)

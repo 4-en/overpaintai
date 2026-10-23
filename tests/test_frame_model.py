@@ -166,3 +166,71 @@ def test_checkpoints_build_and_paint_with_the_harness(tmp_path):
                              opaque=True, mask_tool=True)
     assert (redrawn - result.canvas).abs().mean() < 0.01
     assert math.isfinite(result.stats[-1]["psnr"])
+
+
+def _counting(model):
+    calls = []
+    encode = model.encode_target
+
+    def counted(*a, **k):
+        calls.append(1)
+        return encode(*a, **k)
+
+    model.encode_target = counted
+    return calls
+
+
+def test_target_unet_is_encoded_once_per_unroll_and_learns_through_every_step():
+    from overpaintai.painting import Painter
+
+    torch.manual_seed(5)
+    engine = DifferentiableCanvasEngine(canvas_size=64, min_opacity=0.0, opaque=True)
+    target = torch.rand(2, 3, 64, 64)
+    grads = []
+    for ckpt in (False, True):
+        torch.manual_seed(6)
+        model = _model(target_unet=True, stroke_gate=True)
+        model.joint_strokes = True
+        _spread(model)
+        calls = _counting(model)
+        painter = Painter(model, engine, view_res=R, checkpoint_strokes=False)
+        boxes = views.whole_image_boxes(2)
+        painter.target_features(target, boxes)  # before the steps, as the unroll does
+        layer = engine.create_blank_paint_layer(2, 64, 64)
+        loss = 0.0
+        for k in range(3):
+            p = torch.full((2,), k / 3)
+            if ckpt:
+                res = torch.utils.checkpoint.checkpoint(painter.step, target, layer, p, use_reentrant=False)
+            else:
+                res = painter.step(target, layer, p)
+            layer = res.layer
+            loss = loss + (painter.composite(layer) - target).abs().mean()
+        loss.backward()
+        # one encoding for all steps and their recomputation, plus its own recomputation in backward
+        assert len(calls) == 2, calls
+        grads.append(model.t_stem.weight.grad.clone())
+        assert grads[-1].abs().sum() > 0
+    assert torch.allclose(grads[0], grads[1], atol=1e-5)  # checkpointed steps share the same encoding
+    # a new target tensor is a new encoding; gradient mode is part of the key
+    with torch.no_grad():
+        painter.step(target.clone(), layer.detach(), torch.zeros(2))
+        painter.step(target, layer.detach(), torch.zeros(2))
+    assert len(calls) == 4
+
+
+def test_harness_reuses_the_target_encoding():
+    from overpaintai.highres import HighResConfig, HighResPainter
+
+    torch.manual_seed(7)
+    cfg = dict(SMALL, target_unet=True, stroke_gate=True, hard_gate=True, paintable_mask=True, stationary=True)
+    model = _model(**{k: v for k, v in cfg.items() if k not in SMALL}).eval()
+    model.joint_strokes = True
+    calls = _counting(model)
+    hr = HighResConfig(whole_steps=4, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.25,
+                       tile_repeats=2)
+    painter = HighResPainter(model, size=64, view_res=R, config=hr, autocast=None)
+    result = painter.paint(torch.rand(1, 3, 64, 64), source_side=64, log=lambda *_: None)
+    tile_rounds = sum(1 for st in result.stats if st["tiles"] > 0)
+    # whole image once (shared with the tile rounds' global tokens), then once per tile set (both passes)
+    assert len(calls) == 1 + tile_rounds, (len(calls), tile_rounds)

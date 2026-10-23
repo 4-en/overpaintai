@@ -273,7 +273,7 @@ def test_best_of_replays_each_images_best_attempt(tmp_path):
     trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--placement-noise", "1", "--best-of", "3",
                                          "--tile-prob", "0", "--out", str(tmp_path / "b")]))
     trainer.model.train()
-    target, layer, depth, _ = trainer.batch_start(trainer.args.steps)
+    target, layer, depth, _, _ = trainer.batch_start(trainer.args.steps)
     total = (depth + trainer.args.steps).float()
     forced = trainer._best_of_draws(target, layer, depth, total, trainer.args.steps, lambda k: (None, None))
     with torch.no_grad():
@@ -382,3 +382,30 @@ def test_frame_model_trains_with_the_mask_tool_and_paints_with_the_harness(tmp_p
     redrawn = render_strokes(record["strokes"], 64, (64, 64), 64, min_radius=painter.min_radius,
                              max_radius=painter.max_radius, groups=stroke_groups(record), opaque=True, mask_tool=True)
     assert (redrawn - result.canvas).abs().mean() < 0.01
+
+
+def test_target_unet_reads_targets_above_the_canvas_resolution(tmp_path):
+    from overpaintai.train import Trainer, parse_args
+
+    frame = ["--arch", "frame", "--joint-strokes", "--view-tokens", "4", "--learned-points", "2", "--image-size", "32",
+             "--target-size", "64"]
+    with pytest.raises(SystemExit):  # only a target U-Net reads them
+        main(TINY + ["--image-size", "32", "--target-size", "64", "--epochs", "1", "--out", str(tmp_path / "x")])
+    teacher = tmp_path / "teacher"
+    main(TINY + frame + ["--mode", "teacher", "--epochs", "1", "--out", str(teacher)])
+    trainer = Trainer(parse_args(TINY + frame + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"),
+                                                 "--start-mix", "touchup:1", "--pool-size", "8",
+                                                 "--out", str(tmp_path / "u")]))
+    if trainer.pool is not None:
+        assert trainer.pool.targets_hr.shape[-1] == 64
+    target, layer, depth, slots, target_hr = trainer.batch_start(trainer.args.steps)
+    assert target.shape[-1] == 32 and target_hr.shape[-1] == 64
+    # the canvas-resolution target is the high-res one downsampled, touch-up details included
+    assert torch.allclose(torch.nn.functional.interpolate(target_hr, size=(32, 32), mode="area"), target, atol=1e-5)
+    seen = []
+    encode = trainer.model.encode_target
+    trainer.model.encode_target = lambda target, *a, **k: (seen.append(target.shape[-1]), encode(target, *a, **k))[1]
+    stats = trainer.train_step()
+    assert math.isfinite(stats["loss"])
+    assert seen and set(seen) == {64}  # the target U-Net encoded the 64 px targets
+    trainer.validate()

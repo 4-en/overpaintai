@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -44,6 +45,7 @@ from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
 from overpaintai.model import GATE_LOGIT_RANGE, StrokeSamples, TransformerBlock
 from overpaintai.plan_model import build_model
 from overpaintai.painting import Painter
+from overpaintai.synthetic import render_targets
 from overpaintai.viz import save_curve, save_frame, save_progress
 
 TOOLS = {"paint": 0, "dry": 1, "smudge": 2, "blur": 3, "eraser": 4, "mask": 4}  # mask: the eraser as a step mask
@@ -61,8 +63,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--mode", choices=("teacher", "unroll"), default="unroll")
     g.add_argument("--data", default="synthetic", help="'synthetic' or a folder of images (recursive)")
     g.add_argument("--image-size", type=int, default=128, help="Training image / canvas resolution "
-                   "(rendering cost grows with its square; teacher mode gains nothing above --view-res)")
+                   "(rendering cost grows with its square; teacher mode gains nothing above --view-res, except a frame "
+                   "model's target U-Net, which reads --target-res x --view-res)")
     g.add_argument("--view-res", type=int, default=128, help="Working resolution R the model sees")
+    g.add_argument("--target-size", type=int, default=None,
+                   help="Resolution of the targets a frame model's target U-Net reads (default: --image-size). Above "
+                        "--image-size, images are loaded (synthetic paintings rendered) at this size and the canvas, "
+                        "loss and starts use their area-downsampled version: the U-Net sees real detail (e.g. 256 for "
+                        "--target-res 2 at --view-res 128) while rendering stays at --image-size")
     g.add_argument("--target-strokes", default="48,96", help="Synthetic: min,max strokes per painting")
     g.add_argument("--tools", default="paint", help="Comma-separated tools the model may use (paint, dry, smudge, "
                    "blur, eraser; or mask: the eraser slot as a per-step mask, needs --joint-strokes)")
@@ -100,6 +108,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--frame-along", type=int, default=9, help="Frame arch: sample positions along each stroke")
     g.add_argument("--learned-points", type=int, default=8,
                    help="Frame arch: learned sample points per stroke and refinement layer")
+    g.add_argument("--target-unet", action=argparse.BooleanOptionalAction, default=True,
+                   help="Frame arch: a separate, cached U-Net for the target (computed once per view box instead of "
+                        "every step), fused into the canvas stream at 64 / 32 / 16 px; its full-resolution output is "
+                        "read by the stroke samples")
+    g.add_argument("--target-res", type=int, default=2,
+                   help="Frame arch with --target-unet: its input resolution as a multiple of --view-res (from the "
+                        "full-resolution image; use --image-size >= this x --view-res)")
+    g.add_argument("--target-base", type=int, default=16, help="Frame arch: target U-Net width at full resolution")
     g.add_argument("--opaque-canvas", action=argparse.BooleanOptionalAction, default=None,
                    help="New models: paint on an opaque canvas (blank = the background at alpha 1; no transparency; "
                         "default: on for --arch frame, off otherwise)")
@@ -331,8 +347,11 @@ class CanvasPool:
     Kept on the training device.
     """
 
-    def __init__(self, size: int, image_size: int, device: torch.device):
+    def __init__(self, size: int, image_size: int, device: torch.device, target_size: Optional[int] = None):
         self.targets = torch.zeros(size, 3, image_size, image_size, device=device)
+        # the targets at --target-size too, when the target U-Net reads them at a higher resolution
+        self.targets_hr = (torch.zeros(size, 3, target_size, target_size, device=device)
+                           if target_size and target_size > image_size else None)
         self.layers = torch.zeros(size, 4, image_size, image_size, device=device)
         self.depth = torch.zeros(size, dtype=torch.long, device=device)
         self.gain = torch.zeros(size, device=device)  # PSNR gained on the last visit
@@ -358,11 +377,15 @@ class CanvasPool:
         return slots, fresh
 
     def get(self, slots: torch.Tensor):
-        return self.targets[slots], self.layers[slots], self.depth[slots]
+        """(targets, layers, depth, high-res targets or None)"""
+        hr = None if self.targets_hr is None else self.targets_hr[slots]
+        return self.targets[slots], self.layers[slots], self.depth[slots], hr
 
     def put(self, slots: torch.Tensor, targets: torch.Tensor, layers: torch.Tensor, depth: torch.Tensor,
-            gain: torch.Tensor):
+            gain: torch.Tensor, targets_hr: Optional[torch.Tensor] = None):
         self.targets[slots], self.layers[slots], self.depth[slots] = targets, layers.detach(), depth
+        if self.targets_hr is not None:
+            self.targets_hr[slots] = targets_hr
         self.gain[slots] = gain
 
     def stats(self) -> Dict[str, float]:
@@ -389,6 +412,9 @@ class Trainer:
         self.tools = [TOOLS[t] for t in names]
         self.N = args.strokes_per_step
         self.S = args.image_size
+        self.ST = args.target_size or self.S  # targets for the target U-Net (see --target-size)
+        if self.ST < self.S:
+            raise SystemExit("--target-size must be at least --image-size")
         if args.mode == "teacher" and args.data != "synthetic":
             raise SystemExit("--mode teacher needs ground-truth strokes, i.e. --data synthetic")
 
@@ -415,7 +441,9 @@ class Trainer:
             if frame:
                 self.model_config.update(arch="frame", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
                                          plan_slots=args.plan_slots, pressure=not args.no_pressure,
-                                         frame_along=args.frame_along, learned_points=args.learned_points)
+                                         frame_along=args.frame_along, learned_points=args.learned_points,
+                                         target_unet=args.target_unet, target_res=args.target_res,
+                                         target_base=args.target_base)
             if args.joint_strokes:
                 self.model_config["joint_strokes"] = True
             if args.opaque_canvas if args.opaque_canvas is not None else frame:
@@ -459,11 +487,13 @@ class Trainer:
             lr=args.lr, betas=(0.9, 0.99),
         )
 
+        if self.ST > self.S and not getattr(self.model, "target_unet", False):
+            raise SystemExit("--target-size above --image-size only feeds a target U-Net (--arch frame --target-unet)")
         self._setup_data()
         self.pool = None
         if args.mode == "unroll" and args.pool_size > 0:
             if self.model.stationary:
-                self.pool = CanvasPool(max(args.pool_size, args.batch_size), self.S, self.device)
+                self.pool = CanvasPool(max(args.pool_size, args.batch_size), self.S, self.device, self.ST)
             else:
                 print("note: canvas pool off (needs a stationary model; this one conditions on step progress)")
         self.start_kinds, weights = [], []
@@ -474,9 +504,10 @@ class Trainer:
             self.start_kinds.append(kind.strip())
             weights.append(float(w or 1.0))
         self.start_weights = torch.tensor(weights, device=self.device)
-        self.preview_targets = None
+        self.preview_targets = self.preview_targets_hr = None
         if args.preview_image:
-            self.preview_targets = torch.cat([load_image(p, self.S, self.device) for p in args.preview_image])
+            self.preview_targets, self.preview_targets_hr = self._targets(
+                torch.cat([load_image(p, self.ST, self.device) for p in args.preview_image]))
             (self.out / "previews").mkdir(exist_ok=True)
         total = args.epochs * self.steps_per_epoch
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -510,15 +541,16 @@ class Trainer:
             vgen = torch.Generator(device=self.device).manual_seed(10_000 + a.seed)
             val = [self.synth.sample(min(16, a.val_size), vgen) for _ in range(math.ceil(a.val_size / 16))]
             self.val_targets = torch.cat([v.target for v in val])[: a.val_size]
+            self.val_targets_hr = None if self.ST == self.S else torch.cat([self._render_hr(v) for v in val])[: a.val_size]
             self.train_iter = None
         else:
             augment = not a.no_augment
             common = dict(val_fraction=a.val_fraction)
             train_set = ImageFolderDataset(
-                a.data, self.S, "train", augment=augment, crop_scale=_pair(a.crop_scale),
+                a.data, self.ST, "train", augment=augment, crop_scale=_pair(a.crop_scale),
                 hflip=a.hflip, vflip=a.vflip, color_jitter=a.color_jitter, **common,
             )
-            val_set = ImageFolderDataset(a.data, self.S, "val", augment=False, **common)
+            val_set = ImageFolderDataset(a.data, self.ST, "val", augment=False, **common)
             loader = DataLoader(
                 train_set, batch_size=a.batch_size, shuffle=True, drop_last=True,
                 num_workers=a.num_workers, pin_memory=self.device.type == "cuda",
@@ -529,13 +561,29 @@ class Trainer:
             self.steps_per_epoch = min(a.steps_per_epoch, len(loader))
             self.train_iter = infinite(loader)
             n_val = min(a.val_size, len(val_set))
-            self.val_targets = torch.stack([val_set[i] for i in range(n_val)]).to(self.device)
+            self.val_targets, self.val_targets_hr = self._targets(
+                torch.stack([val_set[i] for i in range(n_val)]).to(self.device))
             print(f"folder data: {len(train_set)} train / {len(val_set)} val images")
 
-    def next_targets(self) -> torch.Tensor:
+    def _targets(self, images: torch.Tensor):
+        """Images at --target-size -> (targets at --image-size, the images themselves or None if the sizes match)."""
+        if self.ST == self.S:
+            return images, None
+        return F.interpolate(images, size=(self.S, self.S), mode="area"), images
+
+    @torch.no_grad()
+    def _render_hr(self, batch) -> Optional[torch.Tensor]:
+        """A synthetic batch's paintings rendered at --target-size (None if it is --image-size)."""
+        if self.ST == self.S:
+            return None
+        return render_targets(self.engine, batch.params, batch.tools, self.ST)
+
+    def next_targets(self):
+        """(targets (B, 3, S, S), the same at --target-size or None)"""
         if self.train_iter is not None:
-            return next(self.train_iter).to(self.device, non_blocking=True)
-        return self.synth.sample(self.args.batch_size, self.gen).target
+            return self._targets(next(self.train_iter).to(self.device, non_blocking=True))
+        batch = self.synth.sample(self.args.batch_size, self.gen)
+        return batch.target, self._render_hr(batch)
 
     # --- training steps -------------------------------------------------------------------------------
     def teacher_batch(self) -> Dict[str, torch.Tensor]:
@@ -556,7 +604,7 @@ class Trainer:
 
         boxes = views.whole_image_boxes(B, self.device)
         progress = torch.full((B,), j * N / M, device=self.device)
-        out = self.painter.predict(batch.target, layer, boxes, progress)
+        out = self.painter.predict(batch.target, layer, boxes, progress, target_hr=self._render_hr(batch))
         gt = views.from_engine_params(gt_params, self.engine)  # whole-image view: view = image coords
         match_loss, assign = matched_stroke_loss(out.strokes, gt, per_sample=True)  # (B,)
 
@@ -620,10 +668,10 @@ class Trainer:
         return -(t * log_p).sum(-1).mean(-1)  # (B,)
 
     @torch.no_grad()
-    def start_canvas(self, target: torch.Tensor, window: int):
+    def start_canvas(self, target: torch.Tensor, window: int, target_hr: Optional[torch.Tensor] = None):
         """
-        Start paint layer for an unroll batch, per --start-mix: returns (layer, steps already "done", kind, target);
-        the target changes only for touch-up starts whose details are added to it.
+        Start paint layer for an unroll batch, per --start-mix: returns (layer, steps already "done", kind, target,
+        target_hr); the targets change only for touch-up starts whose details are added to them.
         Progress then runs from done / (done + window), so warm-up and degraded starts train later phases
         of a painting while keeping progress = fraction of the painting completed (as at inference).
         """
@@ -632,18 +680,20 @@ class Trainer:
         blank = self.engine.create_blank_paint_layer(B, S, S, self.device)
         kind = self.start_kinds[int(torch.multinomial(self.start_weights, 1, generator=self.gen).item())]
         if kind == "blank" or a.rollout_max < 1:
-            return blank, 0, kind, target
+            return blank, 0, kind, target, target_hr
         done = int(torch.randint(1, a.rollout_max + 1, (1,), generator=self.gen, device=self.device).item())
         if kind == "degraded":
-            return degraded_canvas(target, self.engine, self.gen, strength=a.degrade_strength), done, kind, target
+            layer = degraded_canvas(target, self.engine, self.gen, strength=a.degrade_strength)
+            return layer, done, kind, target, target_hr
         if kind == "touchup":  # nearly finished: counts as the longest warm-up
-            layer, target = touchup_pair(target, self.engine, self.gen, add_share=a.touchup_add)
-            return layer, a.rollout_max, kind, target
+            layer, target, target_hr = touchup_pair(target, self.engine, self.gen, add_share=a.touchup_add,
+                                                    target_hr=target_hr)
+            return layer, a.rollout_max, kind, target, target_hr
         layer = blank  # warmup: the current model paints `done` steps on its own
         for i in range(done):
             progress = torch.full((B,), i / (done + window), device=self.device)
-            layer = self.painter.step(target, layer, progress).layer
-        return layer, done, kind, target
+            layer = self.painter.step(target, layer, progress, target_hr=target_hr).layer
+        return layer, done, kind, target, target_hr
 
     @torch.no_grad()
     def batch_start(self, window: int):
@@ -655,23 +705,26 @@ class Trainer:
         """
         B = self.args.batch_size
         if self.pool is None:
-            target = self.next_targets()
-            layer, done, _, target = self.start_canvas(target, window)
-            return target, layer, torch.full((B,), done, device=self.device), None
+            target, target_hr = self.next_targets()
+            layer, done, _, target, target_hr = self.start_canvas(target, window, target_hr)
+            return target, layer, torch.full((B,), done, device=self.device), None, target_hr
         slots, fresh = self.pool.draw(B, self.args.pool_reset, self.gen, self.args.pool_min_gain)
-        target, layer, depth = self.pool.get(slots)
+        target, layer, depth, target_hr = self.pool.get(slots)
         n = int(fresh.sum())
         if n:
-            new_target = self.next_targets()[:n]
-            new_layer, done, _, new_target = self.start_canvas(new_target, window)
+            new_target, new_hr = self.next_targets()
+            new_target, new_hr = new_target[:n], None if new_hr is None else new_hr[:n]
+            new_layer, done, _, new_target, new_hr = self.start_canvas(new_target, window, new_hr)
             target[fresh], layer[fresh], depth[fresh] = new_target, new_layer, done
-        return target, layer, depth, slots
+            if target_hr is not None:
+                target_hr[fresh] = new_hr
+        return target, layer, depth, slots, target_hr
 
     def unroll_batch(self) -> Dict[str, torch.Tensor]:
         a = self.args
         tile = torch.rand((), generator=self.gen, device=self.device).item() < a.tile_prob
         window = a.steps + int(tile)
-        target, layer, depth, slots = self.batch_start(window)
+        target, layer, depth, slots, target_hr = self.batch_start(window)
         B, S = target.shape[0], target.shape[-1]
         total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
         loss, weight_sum, entropy, hardness, gates, outside, gate_range, worse = 0.0, 0.0, [], [], [], [], [], []
@@ -706,7 +759,14 @@ class Trainer:
                 return tile_boxes, tile_cores
             return None, None
 
-        forced = self._best_of_draws(target, layer, depth, total, window, step_views) if a.best_of > 1 else None
+        if getattr(self.model, "target_unet", False):  # one target encoding for all steps, outside their checkpoints
+            self.painter.target_features(target, views.whole_image_boxes(B, self.device), target_hr=target_hr)
+            if tile:
+                self.painter.target_features(target, tile_boxes.reshape(-1, 3), repeat=tile_boxes.shape[1],
+                                             target_hr=target_hr)
+
+        forced = (self._best_of_draws(target, layer, depth, total, window, step_views, target_hr)
+                  if a.best_of > 1 else None)
 
         for k in range(window):
             progress = (depth + k).float() / total
@@ -715,9 +775,9 @@ class Trainer:
             draws = None if forced is None else forced[k]
             if a.checkpoint_steps:  # same random gate / tool samples in the recomputation (RNG state is kept)
                 res = torch.utils.checkpoint.checkpoint(self.painter.step, *step_args, margin=a.tile_margin,
-                                                        samples=draws, use_reentrant=False)
+                                                        samples=draws, target_hr=target_hr, use_reentrant=False)
             else:
-                res = self.painter.step(*step_args, margin=a.tile_margin, samples=draws)
+                res = self.painter.step(*step_args, margin=a.tile_margin, samples=draws, target_hr=target_hr)
             layer = res.layer
             entropy.append(res.output.anchor_entropy.mean().detach())
             hardness.append(res.output.strokes.hardness.mean().detach())
@@ -792,12 +852,13 @@ class Trainer:
             if slots is not None:  # back into the pool, to be continued by a later batch
                 layer, depth = layer.detach(), depth + window
                 for i in range(a.pool_fast_forward):
-                    layer = self.painter.step(target, layer, (depth + i).float() / (depth + a.pool_fast_forward)).layer
-                self.pool.put(slots, target, layer, depth + a.pool_fast_forward, gain)
+                    layer = self.painter.step(target, layer, (depth + i).float() / (depth + a.pool_fast_forward),
+                                              target_hr=target_hr).layer
+                self.pool.put(slots, target, layer, depth + a.pool_fast_forward, gain, target_hr)
         return {"loss": loss, **metrics}
 
     @torch.no_grad()
-    def _best_of_draws(self, target, layer, depth, total, window, step_views) -> List[StrokeSamples]:
+    def _best_of_draws(self, target, layer, depth, total, window, step_views, target_hr=None) -> List[StrokeSamples]:
         """
         --best-of: paints the window --best-of times with independent random draws (stroke positions and
         gates), without gradients, and returns per step the draws of each image's best attempt (lowest
@@ -811,7 +872,8 @@ class Trainer:
             for k in range(window):
                 boxes, cores = step_views(k)
                 res = self.painter.step(target, cur, (depth + k).float() / total, boxes,
-                                        None if cores is None else cores.unsqueeze(1), margin=a.tile_margin)
+                                        None if cores is None else cores.unsqueeze(1), margin=a.tile_margin,
+                                        target_hr=target_hr)
                 cur = res.layer
                 draws.append(res.output.samples)
             attempts.append(draws)
@@ -848,14 +910,21 @@ class Trainer:
         return stats
 
     # --- validation -----------------------------------------------------------------------------------
+    def _val_chunks(self):
+        """Validation targets in chunks of 16, with their --target-size versions (or None)."""
+        hr = [None] * math.ceil(len(self.val_targets) / 16) if self.val_targets_hr is None else \
+            self.val_targets_hr.split(16)
+        return zip(self.val_targets.split(16), hr)
+
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
         a = self.args
         model = self.eval_painter.model
         model.eval()
         per_step, losses, finals, quality = [], [], [], []
-        for chunk in self.val_targets.split(16):
-            layers, steps = self.eval_painter.paint(chunk, a.steps, tile_steps=a.val_tile_steps, return_steps=True)
+        for chunk, chunk_hr in self._val_chunks():
+            layers, steps = self.eval_painter.paint(chunk, a.steps, tile_steps=a.val_tile_steps, return_steps=True,
+                                                    target_hr=chunk_hr)
             canvases = [self.eval_painter.composite(lay) for lay in layers]
             per_step.append(torch.stack([psnr(c, chunk) for c in canvases]))  # (steps, b)
             losses.append(self.loss_fn(canvases[-1], chunk)[0] * chunk.shape[0])
@@ -897,12 +966,12 @@ class Trainer:
         painter.model.eval()
         sums = {f"val_long_psnr@{m}": 0.0 for m in marks}
         sums.update(val_long_drift=0.0, val_long_end_strokes=0.0)
-        for chunk in self.val_targets.split(16):
+        for chunk, chunk_hr in self._val_chunks():
             b, _, h, w = chunk.shape
             layer = self.engine.create_blank_paint_layer(b, h, w, self.device)
             best = torch.full((b,), float("-inf"), device=self.device)
             for k in range(L):
-                res = painter.step(chunk, layer, torch.full((b,), k / L, device=self.device))
+                res = painter.step(chunk, layer, torch.full((b,), k / L, device=self.device), target_hr=chunk_hr)
                 layer = res.layer
                 p = psnr(painter.composite(layer), chunk)
                 best = torch.maximum(best, p)
@@ -926,7 +995,7 @@ class Trainer:
         was_training = model.training
         model.eval()
         steps = self.args.preview_steps or self.args.steps
-        layers = self.eval_painter.paint(self.preview_targets, steps)
+        layers = self.eval_painter.paint(self.preview_targets, steps, target_hr=self.preview_targets_hr)
         canvases = [self.eval_painter.composite(lay) for lay in layers]
         p = psnr(canvases[-1], self.preview_targets).mean().item()
         caption = f"{name} | step {self.global_step} | {steps} steps x {self.N} strokes | PSNR {p:.2f} dB"

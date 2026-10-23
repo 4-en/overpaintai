@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
+from overpaintai.frame_model import TargetCache
 from overpaintai.model import StrokeOutput, StrokePredictor, StrokeSamples
 
 
@@ -63,6 +64,7 @@ class Painter:
         # Joint models: each view's N strokes are one order-independent operation (0 = one after another)
         self.joint = model.num_strokes if getattr(model, "joint_strokes", False) else 0
         self._background = {}
+        self._target_cache = TargetCache()
 
     def background(self, B: int, S: int, device: torch.device) -> torch.Tensor:
         key = (S, device)
@@ -104,10 +106,27 @@ class Painter:
         e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.uses_error_progress else None
         return x, e
 
-    def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: torch.Tensor) -> torch.Tensor:
-        x, e = self.inputs(target, layer, views.whole_image_boxes(target.shape[0], target.device))
+    def target_features(self, target: torch.Tensor, boxes: torch.Tensor, repeat: int = 1,
+                        target_hr: Optional[torch.Tensor] = None):
+        """
+        The model's cached target encoding of views `boxes` (B * repeat, 3) of `target` (B, ...), or None for models
+        without a target U-Net. `target_hr`: the same target at a higher resolution than the canvas, encoded instead
+        (the U-Net then sees real detail, not an upscale). Unrolls call this for their views before the steps (with
+        gradients), so the steps, also when checkpointed and recomputed, share one encoding.
+        """
+        source = target if target_hr is None else target_hr
+        return self._target_cache.get(self.model, source, boxes, self.view_res, repeat=repeat,
+                                      autocast=self._autocast(target.device))
+
+    def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: torch.Tensor,
+                      target_hr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        boxes = views.whole_image_boxes(target.shape[0], target.device)
+        x, e = self.inputs(target, layer, boxes)
+        kw = {}
+        if getattr(self.model, "target_unet", False):
+            kw["target_features"] = self.target_features(target, boxes, target_hr=target_hr)
         with self._autocast(target.device):
-            return self.model.encode_global(x, progress, e)
+            return self.model.encode_global(x, progress, e, **kw)
 
     def predict(
         self,
@@ -118,12 +137,18 @@ class Painter:
         global_tokens: Optional[torch.Tensor] = None,
         paintable: Optional[torch.Tensor] = None,
         samples: Optional[StrokeSamples] = None,
+        target_features=None,
+        target_hr: Optional[torch.Tensor] = None,
     ) -> StrokeOutput:
-        """Model output for one view per image (`boxes` (B, 3)); `samples` replays earlier random draws."""
+        """Model output for one view per image (`boxes` (B, 3)); `samples` replays earlier random draws;
+        `target_features`: the target encoding of these views (default: from the cache, of `target_hr` if given)."""
         x, e = self.inputs(target, layer, boxes, paintable)
         kw = {}
         if getattr(self.model, "uses_images", False):  # the full-resolution images, read along the strokes
             kw["images"] = (target, self.composite(layer.detach()))
+        if getattr(self.model, "target_unet", False):
+            kw["target_features"] = target_features if target_features is not None else \
+                self.target_features(target, boxes, target_hr=target_hr)
         with self._autocast(target.device):
             return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e, samples=samples,
                               **kw)
@@ -140,6 +165,7 @@ class Painter:
         cores: Optional[torch.Tensor] = None,
         margin: float = 0.25,
         samples: Optional[StrokeSamples] = None,
+        target_hr: Optional[torch.Tensor] = None,
     ) -> StepResult:
         """
         One painting step. `boxes` is (B, 3) for one view per image (default: whole image), or (B, T, 3)
@@ -150,7 +176,8 @@ class Painter:
         context: the model gets it as its paintable mask, and strokes anchored outside the core or reaching
         past the view are faded over `margin` x core size, exactly as in the high-res harness.
         Rendered opacity = predicted opacity x stroke gate (x fade). `samples` (from an earlier
-        `StepResult.output.samples` of the same step) replays its random draws.
+        `StepResult.output.samples` of the same step) replays its random draws. `target_hr`: the target at a higher
+        resolution, for models with a target U-Net (see `target_features`).
         """
         B = target.shape[0]
         if boxes is None:
@@ -160,12 +187,14 @@ class Painter:
         flat_cores = None if cores is None else cores.reshape(B * T, 3)
         paintable = None if flat_cores is None else views.core_mask(flat_boxes, flat_cores, self.view_res)
         if T == 1:
-            out = self.predict(target, layer, flat_boxes, progress, paintable=paintable, samples=samples)
+            out = self.predict(target, layer, flat_boxes, progress, paintable=paintable, samples=samples,
+                               target_hr=target_hr)
         else:
-            g = self.global_tokens(target, layer, progress).repeat_interleave(T, dim=0)
+            g = self.global_tokens(target, layer, progress, target_hr).repeat_interleave(T, dim=0)
             out = self.predict(
                 target.repeat_interleave(T, 0), layer.repeat_interleave(T, 0), flat_boxes,
                 progress.repeat_interleave(T, 0), global_tokens=g, paintable=paintable, samples=samples,
+                target_features=self.target_features(target, flat_boxes, repeat=T, target_hr=target_hr),
             )
         opacity = out.strokes.opacity * out.gate.unsqueeze(-1)
         reach = None
@@ -197,6 +226,7 @@ class Painter:
         layer: Optional[torch.Tensor] = None,
         return_steps: bool = False,
         margin: float = 0.25,
+        target_hr: Optional[torch.Tensor] = None,
     ):
         """
         Inference: `num_steps` whole-image steps, then `tile_steps` steps on a grid of tiles. Returns the
@@ -217,7 +247,8 @@ class Painter:
         for k in range(total):
             progress = torch.full((B,), k / total, device=target.device)
             tile = k >= num_steps
-            res = self.step(target, layer, progress, tiles if tile else None, cores if tile else None, margin)
+            res = self.step(target, layer, progress, tiles if tile else None, cores if tile else None, margin,
+                            target_hr=target_hr)
             layer = res.layer
             layers.append(layer)
             results.append(res)
