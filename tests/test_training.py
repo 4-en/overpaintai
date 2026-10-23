@@ -423,3 +423,24 @@ def test_placement_overlap_has_finite_gradients_for_peaked_maps():
     (mean_ov + crowd).backward()
     assert torch.isfinite(logits.grad).all()
     assert 0.0 < mean_ov.item() <= 1.0
+
+
+def test_loose_detail_losses_pick_best_by_validation_loss_and_log_detail_metrics(tmp_path):
+    out = tmp_path / "loose"
+    main(TINY + ["--mode", "unroll", "--epochs", "1", "--val-long-steps", "4", "--detail-weight", "0",
+                 "--scales", "16,32", "--scale-weights", "0.2,1", "--shift-detail-weight", "20",
+                 "--texture-weight", "40", "--out", str(out)])
+    ckpt = torch.load(out / "best.pt", weights_only=False)
+    row = ckpt["history"][-1]
+    assert ckpt["select_by"] == "loss" and ckpt["best_score"] == pytest.approx(-row["val_long_loss"])
+    for key in ("val_psnr_low", "val_detail_err", "val_long_psnr_low"):
+        assert math.isfinite(row[key]), key
+
+    # a PSNR-selected checkpoint resumed with the loss selection starts a new best
+    plain = tmp_path / "plain"
+    main(TINY + ["--mode", "unroll", "--epochs", "1", "--out", str(plain)])
+    assert torch.load(plain / "last.pt", weights_only=False)["select_by"] == "psnr"
+    main(TINY + ["--mode", "unroll", "--epochs", "2", "--select-by", "loss", "--resume", str(plain / "last.pt"),
+                 "--out", str(plain)])
+    ckpt = torch.load(plain / "best.pt", weights_only=False)
+    assert ckpt["select_by"] == "loss" and ckpt["epoch"] == 1

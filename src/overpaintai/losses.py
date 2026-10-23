@@ -4,6 +4,7 @@ from typing import Callable, Dict, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 # An extra loss term: (pred_rgb, target_rgb, valid_mask or None) -> scalar
 LossTerm = Callable[[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
@@ -114,6 +115,74 @@ def local_std(x: torch.Tensor, window: int = 5) -> torch.Tensor:
     return torch.sqrt((mean_sq - mean * mean).clamp(min=0.0) + 1e-6)
 
 
+def _soft_sqrt(x: torch.Tensor, eps: float) -> torch.Tensor:
+    """sign(x) sqrt|x|, smooth through 0 (bounded slope)."""
+    return x * torch.rsqrt(x.abs() + eps)
+
+
+def _window(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Gaussian blur with a wide `sigma`, computed at reduced resolution (pool by ~sigma/4) and upsampled."""
+    f = int(sigma // 4)
+    if f < 2:
+        return _gaussian_blur(x, sigma)
+    H, W = x.shape[-2:]
+    low = _gaussian_blur(F.avg_pool2d(x, f, ceil_mode=True), sigma / f)
+    return F.interpolate(low, size=(H, W), mode="bilinear", align_corners=False)
+
+
+def texture_statistics(x: torch.Tensor, window: float = 16.0, bands: Sequence[float] = (0.7, 1.5, 3.0)) -> torch.Tensor:
+    """
+    Local texture statistics of `x` `(B, C, H, W)` -> `(B, 7 * len(bands), H, W)`: the image is split into
+    frequency bands (differences of Gaussian blurs at `bands` px) and, per band, within a Gaussian window of
+    std `window` px: the energy per color channel, the luma structure tensor (stroke direction and strength)
+    and its anisotropic part (how coherent the marks are: brush strokes vs noise). It does not say where in
+    the window a mark is, so cloned or slightly moved texture matches while blurred texture does not.
+    """
+    feats, prev = [], x
+    for sigma in bands:
+        low = _gaussian_blur(x, sigma)
+        h, prev = prev - low, low
+        feats.append(_window(h * h, window).add(1e-6).sqrt())
+        y = h.mean(1, keepdim=True)
+        gx = F.pad(y[..., :, 2:] - y[..., :, :-2], (1, 1, 0, 0), mode="replicate") / 2
+        gy = F.pad(y[..., 2:, :] - y[..., :-2, :], (0, 0, 1, 1), mode="replicate") / 2
+        jxx, jyy, jxy = _window(torch.cat([gx * gx, gy * gy, gx * gy], 1), window).split(1, 1)
+        feats.append(_soft_sqrt(torch.cat([jxx, jyy, jxy], 1), 1e-8))
+        aniso = ((jxx - jyy) ** 2 + 4 * jxy**2 + 1e-12).sqrt()
+        feats.append(aniso * torch.rsqrt(jxx + jyy + 1e-4))
+    return torch.cat(feats, 1)
+
+
+def shift_tolerant_detail(pred: torch.Tensor, target: torch.Tensor, radius: int = 3, patch: int = 7,
+                          sigma: float = 1.5) -> torch.Tensor:
+    """
+    `(B, 1, H, W)`: RMS difference of the fine bands (image minus its `sigma` px blur) per `patch` x `patch`
+    patch, against the best-matching patch of the other image within +-`radius` px, averaged over both
+    directions (prediction -> target and back, so missing and extra detail both count). Detail moved by up to
+    `radius` px is free; blurred detail costs its amplitude; wrong detail costs more than none.
+    """
+    def run(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        p, t = pred - _gaussian_blur(pred, sigma), target - _gaussian_blur(target, sigma)
+        return 0.5 * (_best_shift(p, t, radius, patch) + _best_shift(t, p, radius, patch))
+
+    if torch.is_grad_enabled() and (pred.requires_grad or target.requires_grad):
+        # recomputed in the backward pass: the per-shift differences would cost ~1 GB per call at 16 x 128 px
+        return torch.utils.checkpoint.checkpoint(run, pred, target, use_reentrant=False)
+    return run(pred, target)
+
+
+def _best_shift(a: torch.Tensor, b: torch.Tensor, radius: int, patch: int) -> torch.Tensor:
+    """Per pixel, the RMS difference of `a`'s patch to the closest of `b`'s patches within +-radius px."""
+    B, C, H, W = a.shape
+    k = 2 * radius + 1
+    shifted = F.unfold(F.pad(b, (radius,) * 4, mode="replicate"), k).view(B, C, k * k, H, W)
+    d = (a.unsqueeze(2) - shifted).pow(2).mean(1)  # (B, shifts, H, W)
+    pad = patch // 2
+    d = F.pad(d, (pad,) * 4, mode="replicate")
+    d = F.avg_pool2d(F.avg_pool2d(d, (patch, 1), 1), (1, patch), 1)  # separable box filter
+    return d.min(1, keepdim=True).values.add(1e-6).sqrt()
+
+
 def _coarse(x: torch.Tensor, factor: int, mode: str) -> torch.Tensor:
     """
     Low-resolution view of `x` at `factor`. "blur" pools by factor/4 and then Gaussian-blurs, so the
@@ -165,6 +234,18 @@ class MultiScalePaintLoss(nn.Module):
             `tau / (e + tau)` with e the 5 px mean color error, not differentiated). A crisp stroke over an
             area that was wrong anyway is then judged by its color, not punished for an edge the target
             doesn't have; once the area is right, a spurious edge costs fully again.
+        texture_weight: weight of a texture term (`texture_statistics` of prediction vs target, L1): matches
+            how much fine detail there is, which way it runs and how stroke-like it is, but not where each
+            mark sits: it prefers cloned / slightly moved texture over blurred texture, unlike every
+            pixel-exact term. Alone (or with only weak exact terms) it is also satisfied by busy, wrongly
+            colored strokes; pair it with `shift_detail_weight` (see scripts/loss_check.py).
+        texture_window: std of its window, px.
+        shift_detail_weight: weight of a shift-tolerant fine-detail term (`shift_tolerant_detail`): the
+            fine band must match the target's, but each patch may match anywhere within `shift_radius` px.
+            Unlike the texture term, wrong detail (busy strokes, noise, broken lines) costs more than none.
+        shift_radius: how far (px) detail may move for free.
+        shift_sigma: blur scale (px) below which detail counts as fine.
+        texture_bands: blur scales (px) that split the image into its frequency bands.
         extra_terms: optional named terms added on top (e.g. a perceptual or adversarial loss later),
             as `name -> (weight, fn(pred, target, mask))`.
     """
@@ -181,12 +262,24 @@ class MultiScalePaintLoss(nn.Module):
         robust_tau: float = 0.0,
         value_weight: float = 0.0,
         forgive_tau: float = 0.0,
+        texture_weight: float = 0.0,
+        texture_window: float = 16.0,
+        texture_bands: Sequence[float] = (0.7, 1.5, 3.0),
+        shift_detail_weight: float = 0.0,
+        shift_radius: int = 3,
+        shift_sigma: float = 1.5,
     ):
         super().__init__()
         self.detail_weight = detail_weight
         self.robust_tau = robust_tau
         self.value_weight = value_weight
         self.forgive_tau = forgive_tau
+        self.texture_weight = texture_weight
+        self.texture_window = texture_window
+        self.texture_bands = tuple(texture_bands)
+        self.shift_detail_weight = shift_detail_weight
+        self.shift_radius = shift_radius
+        self.shift_sigma = shift_sigma
         self.scales = tuple(scales)
         self.scale_weights = tuple(scale_weights) if scale_weights is not None else (1.0,) * len(self.scales)
         assert len(self.scale_weights) == len(self.scales)
@@ -257,6 +350,15 @@ class MultiScalePaintLoss(nn.Module):
             terms["value"] = self.value_weight * sum(
                 mean((vp - vt).abs(), valid_mask) if f == 1 else coarse_l1(vp, vt, f) for f in factors
             ) / len(factors)
+
+        if self.texture_weight > 0:
+            def tex(x: torch.Tensor) -> torch.Tensor:
+                return texture_statistics(x, self.texture_window, self.texture_bands)
+            terms["texture"] = self.texture_weight * mean((tex(pred) - tex(target)).abs(), valid_mask)
+
+        if self.shift_detail_weight > 0:
+            d = shift_tolerant_detail(pred, target, self.shift_radius, sigma=self.shift_sigma)
+            terms["shift_detail"] = self.shift_detail_weight * mean(d, valid_mask)
 
         for name, (weight, fn) in self.extra_terms.items():
             terms[name] = weight * fn(pred, target, valid_mask)

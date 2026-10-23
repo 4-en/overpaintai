@@ -39,7 +39,7 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas, touchup_pair
-from overpaintai.losses import MultiScalePaintLoss, psnr, sharpness_pyramid, stroke_edge_sharpness
+from overpaintai.losses import MultiScalePaintLoss, _gaussian_blur, psnr, sharpness_pyramid, stroke_edge_sharpness
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
 from overpaintai.model import GATE_LOGIT_RANGE, StrokeSamples, TransformerBlock
@@ -207,6 +207,21 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "e.g. 0.05. Strokes in soft / flat areas are left free")
     g.add_argument("--value-weight", type=float, default=0.0,
                    help="Weight of a lightness-only loss over full resolution and the coarse scales, e.g. 1")
+    g.add_argument("--texture-weight", type=float, default=0.0,
+                   help="Weight of a texture-statistics loss (energy, direction and coherence of the fine detail "
+                        "in soft windows, not where each mark sits), e.g. 40. Use it with --shift-detail-weight: "
+                        "alone (or with only weak exact terms) it is satisfied by busy, wrongly colored strokes")
+    g.add_argument("--texture-window", type=float, default=16.0, help="Window std of the texture loss, px")
+    g.add_argument("--texture-bands", default="0.7,1.5,3",
+                   help="Blur scales (px) splitting the image into the texture loss's frequency bands")
+    g.add_argument("--shift-detail-weight", type=float, default=0.0,
+                   help="Weight of a shift-tolerant fine-detail loss: each 7 px patch of the fine detail must match "
+                        "the target's somewhere within --shift-radius px (both ways), so moved detail is free but "
+                        "wrong detail costs more than none, e.g. 20. Recommended loss for loose but clean detail: "
+                        "--detail-weight 0 --scales 16,32 --scale-weights 0.2,1 --shift-detail-weight 20 "
+                        "--texture-weight 40 (check variants with scripts/loss_check.py)")
+    g.add_argument("--shift-radius", type=int, default=3, help="How far (px) detail may move for free")
+    g.add_argument("--shift-sigma", type=float, default=1.5, help="Blur scale (px) below which detail counts as fine")
     g.add_argument("--forgive-edges", action="store_true",
                    help="Edges / texture the target doesn't have only count where the colors around are already "
                         "roughly right: a crisp stroke over a still-wrong area is judged by its color")
@@ -270,6 +285,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--resume", default=None, help="Continue a run from a checkpoint (all state)")
     g.add_argument("--init-from", default=None, help="Initialize model weights from a checkpoint only")
     g.add_argument("--val-every", type=int, default=1, help="Validate every N epochs")
+    g.add_argument("--select-by", choices=("auto", "psnr", "loss"), default="auto",
+                   help="What picks best.pt: validation PSNR, or the validation loss under the training loss (of "
+                        "the --val-long-steps painting, if measured). auto = the loss with --shift-detail-weight / "
+                        "--texture-weight (PSNR rewards soft, hedged paintings those losses train away from), else "
+                        "PSNR")
     g.add_argument("--preview-image", nargs="+", default=None, metavar="PATH",
                    help="Image(s) painted after every epoch at --image-size; saved to <out>/previews/")
     g.add_argument("--preview-steps", type=int, default=None, help="Painting steps for previews (default: --steps)")
@@ -477,6 +497,9 @@ class Trainer:
             flat_weight=args.flat_weight if args.flat_loss else 0.0,
             robust_tau=args.robust_tau if args.robust_loss else 0.0, value_weight=args.value_weight,
             forgive_tau=args.robust_tau if args.forgive_edges else 0.0,
+            texture_weight=args.texture_weight, texture_window=args.texture_window,
+            texture_bands=[float(b) for b in args.texture_bands.split(",") if b],
+            shift_detail_weight=args.shift_detail_weight, shift_radius=args.shift_radius, shift_sigma=args.shift_sigma,
         )
 
         decay, no_decay = [], []
@@ -514,7 +537,10 @@ class Trainer:
             self.optimizer, lr_lambda(args.warmup_steps, total, args.min_lr_ratio)
         )
 
-        self.epoch, self.global_step, self.best_psnr = 0, 0, float("-inf")
+        self.epoch, self.global_step, self.best_score = 0, 0, float("-inf")
+        self.select_by = args.select_by
+        if self.select_by == "auto":
+            self.select_by = "loss" if args.shift_detail_weight > 0 or args.texture_weight > 0 else "psnr"
         self.history: List[Dict] = []
         if resume is not None:
             self._load_resume(resume)
@@ -965,7 +991,7 @@ class Trainer:
         painter = self.eval_painter
         painter.model.eval()
         sums = {f"val_long_psnr@{m}": 0.0 for m in marks}
-        sums.update(val_long_drift=0.0, val_long_end_strokes=0.0)
+        sums.update(val_long_drift=0.0, val_long_end_strokes=0.0, val_long_loss=0.0, val_long_psnr_low=0.0)
         for chunk, chunk_hr in self._val_chunks():
             b, _, h, w = chunk.shape
             layer = self.engine.create_blank_paint_layer(b, h, w, self.device)
@@ -981,6 +1007,9 @@ class Trainer:
                     opacity = views.from_engine_params(res.params, self.engine).opacity.mean(-1)
                     sums["val_long_end_strokes"] += (opacity > ACTIVE_OPACITY).float().sum().item() / min(8, L)
             sums["val_long_drift"] += (best - p).sum().item()
+            final = painter.composite(layer)
+            sums["val_long_loss"] += self.loss_fn(final, chunk, per_sample=True)[0].sum().item()
+            sums["val_long_psnr_low"] += psnr(_gaussian_blur(final, 2.0), _gaussian_blur(chunk, 2.0)).sum().item()
         n = self.val_targets.shape[0]
         metrics = {k: v / n for k, v in sums.items()}
         metrics["val_long_psnr"] = metrics[f"val_long_psnr@{L}"]
@@ -1015,7 +1044,8 @@ class Trainer:
                 "scheduler": self.scheduler.state_dict(),
                 "epoch": self.epoch,
                 "global_step": self.global_step,
-                "best_psnr": self.best_psnr,
+                "best_score": self.best_score,
+                "select_by": self.select_by,
                 "history": self.history,
                 "args": vars(self.args),
                 "view_res": self.args.view_res,
@@ -1032,10 +1062,13 @@ class Trainer:
         self.scheduler.load_state_dict(ckpt["scheduler"])
         self.epoch = ckpt["epoch"] + 1
         self.global_step = ckpt["global_step"]
-        self.best_psnr = ckpt["best_psnr"]
+        if ckpt.get("select_by", "psnr") == self.select_by:
+            self.best_score = ckpt.get("best_score", ckpt.get("best_psnr", float("-inf")))
+        else:  # best.pt was picked by another measure: the next validation sets a new best
+            self.best_score = float("-inf")
         self.history = ckpt.get("history", [])
         print(f"resumed from {self.args.resume}: epoch {ckpt['epoch']}, step {self.global_step}, "
-              f"best val PSNR {self.best_psnr:.2f} dB")
+              f"best {self._best_txt()}")
 
     def _init_from(self, path: str):
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
@@ -1102,9 +1135,9 @@ class Trainer:
                 row.update(self.validate())
                 if a.val_long_steps > 0:
                     row.update(self.validate_long())
-                score = row.get("val_long_psnr", row["val_psnr"])  # best.pt: the long painting, if measured
-                if score > self.best_psnr:
-                    self.best_psnr, is_best = score, True
+                score = self._score(row)
+                if score > self.best_score:
+                    self.best_score, is_best = score, True
             row.update(self.preview(f"epoch_{epoch + 1:03d}"))
             if self.pool is not None:
                 row.update(self.pool.stats())
@@ -1121,10 +1154,12 @@ class Trainer:
                 panels=(("train_loss", True), ("train_psnr", False), ("val_psnr", False), ("train_entropy", False)),
                 x_key="epoch",
             )
-            val_txt = (f" | val PSNR {row['val_psnr']:.2f} dB (loss {row['val_loss']:.4f}, edge err {row['val_edge_err']:.4f})"
+            val_txt = (f" | val PSNR {row['val_psnr']:.2f} dB (low-band {row['val_psnr_low']:.2f}, detail err "
+                       f"{row['val_detail_err']:.4f}, sharpness {row['val_sharpness']:.2f}, loss {row['val_loss']:.4f})"
                        f"{' * best' if is_best else ''}") if "val_psnr" in row else ""
             if "val_long_psnr" in row:
-                val_txt += (f" | {a.val_long_steps} steps {row['val_long_psnr']:.2f} dB (drift "
+                val_txt += (f" | {a.val_long_steps} steps {row['val_long_psnr']:.2f} dB (low-band "
+                            f"{row['val_long_psnr_low']:.2f}, loss {row['val_long_loss']:.4f}, drift "
                             f"{row['val_long_drift']:.2f}, {row['val_long_end_strokes']:.1f} strokes/step at the end)")
             preview_txt = f" | preview {row['preview_psnr']:.2f} dB" if "preview_psnr" in row else ""
             skipped = round(sums.get("skipped", 0.0))
@@ -1132,8 +1167,19 @@ class Trainer:
             tqdm.write(f"epoch {epoch + 1}: train loss {row['train_loss']:.4f}, PSNR {row['train_psnr']:.2f} dB, "
                        f"entropy {row['train_entropy']:.2f}, hardness {row['train_hardness']:.2f}"
                        f"{val_txt}{preview_txt} | {row['time']:.0f}s{skip_txt}")
-        metric = f"{a.val_long_steps}-step val PSNR" if a.val_long_steps > 0 else "val PSNR"
-        print(f"done: best {metric} {self.best_psnr:.2f} dB -> {self.out / 'best.pt'}")
+        print(f"done: best {self._best_txt()} -> {self.out / 'best.pt'}")
+
+    def _score(self, row: Dict) -> float:
+        """Higher = better; picks best.pt. The long painting counts, if measured."""
+        if self.select_by == "loss":
+            return -row.get("val_long_loss", row["val_loss"])
+        return row.get("val_long_psnr", row["val_psnr"])
+
+    def _best_txt(self) -> str:
+        long = f"{self.args.val_long_steps}-step " if self.args.val_long_steps > 0 else ""
+        if self.select_by == "loss":
+            return f"{long}val loss {-self.best_score:.4f}"
+        return f"{long}val PSNR {self.best_score:.2f} dB"
 
     @staticmethod
     def _append_csv(path: Path, row: Dict):

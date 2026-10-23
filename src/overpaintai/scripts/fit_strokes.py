@@ -46,6 +46,9 @@ def parse_args():
     p.add_argument("--scales", type=str, default="4,16", help="Downsampling factors of coarse L1 terms")
     p.add_argument("--scale-weights", type=str, default="1,1", help="Weights of the coarse terms")
     p.add_argument("--coarse-mode", choices=("blur", "pool"), default="blur", help="Coarse term type")
+    p.add_argument("--texture-weight", type=float, default=0.0, help="Texture-statistics loss weight")
+    p.add_argument("--texture-window", type=float, default=16.0, help="Texture loss window std (px)")
+    p.add_argument("--shift-detail-weight", type=float, default=0.0, help="Shift-tolerant fine-detail loss weight")
     p.add_argument("--freeze-previous", action="store_true", help="Only optimize the current stage")
     p.add_argument("--no-checkpoint", action="store_true", help="Disable per-stroke checkpointing")
     p.add_argument("--log-every", type=int, default=25, help="Log / frame interval (steps)")
@@ -122,7 +125,9 @@ def main():
 
     scales = [int(s) for s in args.scales.split(",") if s]
     scale_weights = [float(w) for w in args.scale_weights.split(",") if w]
-    loss_fn = MultiScalePaintLoss(args.detail_weight, scales, scale_weights, coarse_mode=args.coarse_mode)
+    loss_fn = MultiScalePaintLoss(args.detail_weight, scales, scale_weights, coarse_mode=args.coarse_mode,
+                                  texture_weight=args.texture_weight, texture_window=args.texture_window,
+                                  shift_detail_weight=args.shift_detail_weight)
 
     tool_w = torch.zeros(1, 1, engine.NUM_TOOLS, device=device)
     tool_w[..., TOOLS[args.tool]] = 1.0

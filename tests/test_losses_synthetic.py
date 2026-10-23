@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
@@ -125,3 +127,95 @@ def test_touchup_pairs_differ_from_their_target_only_in_small_places():
         else:  # details added to the target; the canvas is the (softened) original
             assert ((new_target - target).abs().amax((1, 2, 3)) > 0.05).any()
             assert (psnr(canvas, target) > 22).all()
+
+
+def _strokes_texture(seed: int, size: int = 96) -> torch.Tensor:
+    """Random short dark dashes on a light ground, like painted foliage."""
+    g = torch.Generator().manual_seed(seed)
+    img = torch.full((1, 3, size, size), 0.8)
+    yy, xx = torch.meshgrid(torch.arange(size).float(), torch.arange(size).float(), indexing="ij")
+    for _ in range(140):
+        cy, cx = torch.rand(2, generator=g) * size
+        a = torch.rand(1, generator=g).item() * 0.6 + 1.2  # mostly vertical
+        u = (xx - cx) * math.cos(a) + (yy - cy) * math.sin(a)
+        v = -(xx - cx) * math.sin(a) + (yy - cy) * math.cos(a)
+        dash = ((u.abs() < 4) & (v.abs() < 1.2)).float()
+        img = img * (1 - dash) + dash * torch.tensor([0.2, 0.4, 0.1]).view(1, 3, 1, 1)
+    return img
+
+
+def test_texture_loss_prefers_moved_texture_over_blurred_texture():
+    from overpaintai.losses import MultiScalePaintLoss, _gaussian_blur
+
+    target = _strokes_texture(0)
+    moved = torch.roll(target, (3, 5), (2, 3))  # the same marks, elsewhere
+    blurred = _gaussian_blur(target, 1.5)
+    l1 = MultiScalePaintLoss(1.0, ())
+    tex = MultiScalePaintLoss(0.0, (32,), texture_weight=160)
+    assert l1(moved, target)[0] > l1(blurred, target)[0]  # pixel-exact: blur looks better
+    assert tex(moved, target)[0] < tex(blurred, target)[0]
+    assert tex(target, target)[0] < 1e-6
+
+
+def test_texture_loss_gradients_are_finite_on_flat_images():
+    from overpaintai.losses import MultiScalePaintLoss
+
+    tex = MultiScalePaintLoss(0.0, (32,), texture_weight=160, shift_detail_weight=20)
+    for pred, target in [(torch.full((2, 3, 64, 64), 0.5), _strokes_texture(1, 64).expand(2, -1, -1, -1)),
+                         (torch.full((2, 3, 64, 64), 0.5), torch.full((2, 3, 64, 64), 0.5))]:
+        pred = pred.clone().requires_grad_(True)
+        loss, terms = tex(pred, target, torch.ones(2, 1, 64, 64))
+        loss.backward()
+        assert torch.isfinite(pred.grad).all() and pred.grad.abs().max() < 10
+        assert "texture" in terms
+
+
+def test_loss_check_ranks_a_folder_of_examples(tmp_path, monkeypatch, capsys):
+    import sys
+    from PIL import Image
+    from overpaintai.losses import _gaussian_blur
+    from overpaintai.scripts import loss_check
+
+    target = _strokes_texture(2, 160)
+    save = lambda x, name: Image.fromarray((x[0].permute(1, 2, 0).numpy() * 255).round().astype("uint8")).save(
+        tmp_path / name)
+    save(target, "original.png")
+    save(torch.roll(target, (2, 3), (2, 3)), "good_moved.png")
+    save(_gaussian_blur(target, 2.0), "bad_blur.png")
+    monkeypatch.setattr(sys, "argv", ["loss_check", str(tmp_path), "--downscales", "1", "--crops", "4",
+                                      "--device", "cpu"])
+    loss_check.main()
+    out = capsys.readouterr().out
+    worst = {line.split()[0]: float(line.split()[1]) for line in out.splitlines()[-4:] if line.startswith("  ")}
+    assert worst["L1"] < 1 < worst["loose"]
+
+
+def test_shift_tolerant_detail_frees_moved_detail_and_charges_wrong_detail():
+    from overpaintai.losses import _gaussian_blur, shift_tolerant_detail
+
+    target = _strokes_texture(3)
+    g = torch.Generator().manual_seed(0)
+    moved = torch.roll(target, (2, -3), (2, 3))
+    blurred = _gaussian_blur(target, 2.0)
+    busy = blurred + 0.5 * (_strokes_texture(4) - blurred.mean())  # other marks: right amount, wrong places
+    cost = {k: shift_tolerant_detail(x, target).mean().item()
+            for k, x in {"same": target, "moved": moved, "blurred": blurred, "busy": busy}.items()}
+    assert cost["same"] < 1e-2 and cost["moved"] < 0.5 * cost["blurred"] < cost["busy"]
+
+
+def test_shift_tolerant_detail_gradients_match_without_checkpointing():
+    import torch.utils.checkpoint
+    from overpaintai import losses
+
+    target = _strokes_texture(5, 48)
+    pred = (target.roll(1, 3) * 0.8 + 0.1).requires_grad_(True)
+    losses.shift_tolerant_detail(pred, target).mean().backward()
+    g_ckpt = pred.grad.clone()
+    pred.grad = None
+    orig = torch.utils.checkpoint.checkpoint
+    torch.utils.checkpoint.checkpoint = lambda fn, *a, **k: fn(*a)
+    try:
+        losses.shift_tolerant_detail(pred, target).mean().backward()
+    finally:
+        torch.utils.checkpoint.checkpoint = orig
+    assert torch.isfinite(g_ckpt).all() and torch.allclose(g_ckpt, pred.grad, atol=1e-6)
