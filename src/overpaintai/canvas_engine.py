@@ -263,6 +263,7 @@ class DifferentiableCanvasEngine(nn.Module):
         smudge_max_dabs: int = 128,
         compile_smudge: bool = True,
         compile_masks: bool = True,
+        mask_chunk_elements: Optional[int] = None,
         min_opacity: float = 0.05,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
@@ -288,6 +289,9 @@ class DifferentiableCanvasEngine(nn.Module):
         self.smudge_max_dabs = smudge_max_dabs
         self.compile_smudge = compile_smudge
         self.compile_masks = compile_masks
+        # Segment profiles per chunk of the brush mask's winner search (None: all at once, fastest; a bound keeps
+        # large canvases from materializing strokes x segments x pixels)
+        self.mask_chunk_elements = mask_chunk_elements
         # Opacity param p maps to min_opacity + (1 - min_opacity) * p; the 0.05 floor keeps gradients alive
         # for strokes that would otherwise vanish, 0 lets gated-off strokes disappear completely
         self.min_opacity = min_opacity
@@ -353,15 +357,15 @@ class DifferentiableCanvasEngine(nn.Module):
         at: torch.Tensor,
         hardness: torch.Tensor,
         edge_sharpness: float,
-        chunk: int = 8,
     ) -> torch.Tensor:
         """
         Brush mask `(B, 1, H, W)`: the max of the capsule profiles over all curve segments.
 
         The max only passes gradient to the winning segment, so the winner per pixel is found without
-        autograd (in chunks, bounding peak memory), and only that segment's profile is recomputed
-        differentiably. Values and gradients match materializing all `(B, S-1, H, W)` segment profiles,
-        at a fraction of the saved memory.
+        autograd, and only that segment's profile is recomputed differentiably. Values and gradients match
+        materializing all `(B, S-1, H, W)` segment profiles, at a fraction of the saved memory. The search
+        materializes them (even the compiled kernel); with `mask_chunk_elements` it runs over chunks of segments
+        with about that many profile values each.
         """
         B = bx.shape[0]
         _, _, H, W = self.grid_x.shape
@@ -373,15 +377,23 @@ class DifferentiableCanvasEngine(nn.Module):
         n_seg = seg.shape[1]
 
         with torch.no_grad():
-            if self.compile_masks and seg.is_cuda:
-                best_val, best_idx = _best_segment_compiled(seg, self.grid_x, self.grid_y, hardness, edge_sharpness)
-            else:
-                best_val = torch.full((B, 1, H, W), -1.0, device=seg.device, dtype=seg.dtype)
-                best_idx = torch.zeros((B, 1, H, W), device=seg.device, dtype=torch.long)
-                for c in range(0, n_seg, chunk):
-                    part = seg[:, c : c + chunk].view(B, -1, 1, 1, 8)
-                    val, idx = _segment_profile(part, self.grid_x, self.grid_y, hardness, edge_sharpness).max(
-                        dim=1, keepdim=True)
+            compiled = self.compile_masks and seg.is_cuda
+            # the eager profile keeps ~8 intermediates of the chunk's size alive
+            budget = self.mask_chunk_elements or 2**26
+            chunk = max(1, (budget if compiled else budget // 8) // (B * H * W))
+            if compiled and self.mask_chunk_elements is None:
+                chunk = n_seg
+            best_val = best_idx = None
+            for c in range(0, n_seg, chunk):
+                part = seg[:, c : c + chunk]
+                if compiled:
+                    val, idx = _best_segment_compiled(part, self.grid_x, self.grid_y, hardness, edge_sharpness)
+                else:
+                    val, idx = _segment_profile(part.view(B, -1, 1, 1, 8), self.grid_x, self.grid_y, hardness,
+                                                edge_sharpness).max(dim=1, keepdim=True)
+                if best_val is None:
+                    best_val, best_idx = val, idx
+                else:
                     better = val > best_val
                     best_val = torch.where(better, val, best_val)
                     best_idx = torch.where(better, idx + c, best_idx)

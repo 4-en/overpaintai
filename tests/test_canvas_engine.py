@@ -350,3 +350,15 @@ def test_profile_and_joint_result_at_points_match_a_render():
     canvas = at(engine.composite(layer)[0]).t().unsqueeze(0)
     pred = joint_at(canvas, mask, shape, s.color, tools[..., 0], tools[..., 4])
     assert torch.allclose(pred[0], at(out[0]).t(), atol=1e-3)
+
+
+def test_chunked_mask_search_matches_one_pass():
+    torch.manual_seed(0)
+    params = torch.rand(6, 14, requires_grad=True)
+    out = {}
+    for chunk in (None, 64 * 64 * 6 * 3):  # all segments at once vs chunks of 3 segments
+        engine = DifferentiableCanvasEngine(canvas_size=SIZE, mask_chunk_elements=chunk)
+        mask = engine._brush(params, SIZE, SIZE)[0]
+        out[chunk] = (mask, torch.autograd.grad(mask.sum(), params)[0])
+    (a, ga), (b, gb) = out.values()
+    assert torch.equal(a, b) and torch.allclose(ga, gb)

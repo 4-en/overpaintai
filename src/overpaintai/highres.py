@@ -136,7 +136,7 @@ class CropRenderer:
 
     def __init__(
         self, size: int, num_stamps: int, min_radius: float, max_radius: float, device, tool: int = 0,
-        max_crop: int = 2048, adaptive_stamps: bool = False, opaque: bool = False, mask_tool: bool = False,
+        max_crop: int = 1024, adaptive_stamps: bool = False, opaque: bool = False, mask_tool: bool = False,
     ):
         """
         adaptive_stamps: choose the curve samples per call from the strokes' length in pixels (about one
@@ -163,7 +163,7 @@ class CropRenderer:
         return DifferentiableCanvasEngine(
             canvas_size=n, num_stamps=self.num_stamps, min_opacity=0.0,  # gated strokes may be (near) zero
             min_radius=self.min_radius / scale, max_radius=self.max_radius / scale, opaque=self.opaque,
-            eraser_mode=self.eraser_mode,
+            eraser_mode=self.eraser_mode, mask_chunk_elements=2**26,  # ~256 MB per chunk: bounded on big canvases
         ).to(self.device).eval()
 
     def _stamps_for(self, strokes: views.Strokes) -> int:
@@ -173,6 +173,12 @@ class CropRenderer:
         length = ((p[:, 1] - p[:, 0]).norm(dim=-1) + (p[:, 2] - p[:, 1]).norm(dim=-1)).max().item() * (self.S - 1)
         stamps = 8 * math.ceil((length / 16.0 + 1) / 8)
         return int(min(self.num_stamps, max(8, stamps)))  # multiples of 8: few distinct shapes to compile
+
+    def _crop_size(self, n: int) -> int:
+        """Crop side `n` rounded up to one of 8 sizes per octave (at most the canvas): every crop size gets its
+        own cached engine with full-size grids, so arbitrary sizes would pile up gigabytes over a painting."""
+        step = max(8, 2 ** (n.bit_length() - 1) // 8)
+        return min(self.S, -(-n // step) * step)
 
     def blank(self) -> torch.Tensor:
         return self.engine.create_blank_paint_layer(1, self.S, self.S, self.device)
@@ -203,7 +209,7 @@ class CropRenderer:
         hi = (pts.amax(dim=2) + ext.unsqueeze(-1)).amax(dim=1)[0].clamp(0, 1)
         x0, y0 = math.floor(lo[0].item() * (S - 1)), math.floor(lo[1].item() * (S - 1))
         x1, y1 = math.ceil(hi[0].item() * (S - 1)), math.ceil(hi[1].item() * (S - 1))
-        n = min(S, max(x1 - x0, y1 - y0) + 1)
+        n = self._crop_size(max(x1 - x0, y1 - y0) + 1)
         stamps = self._stamps_for(strokes)
         if n <= self.max_crop:
             self._render_square(layer, strokes, min(x0, S - n), min(y0, S - n), n, stamps, joint, tools)

@@ -144,6 +144,19 @@ def test_split_rendering_matches_single_crop():
     assert (a[:, 3] - b[:, 3]).abs().max() < 1e-4
 
 
+
+def test_crop_sizes_are_rounded_so_few_engines_are_cached():
+    from overpaintai.highres import CropRenderer
+
+    r = CropRenderer(512, 16, 1e-3, 0.75, "cpu")
+    layer = r.blank()
+    for i in range(40):  # strokes of 40 different footprint sizes
+        s = _strokes(1, seed=i)
+        s = views.Strokes(s.points, torch.full_like(s.radii, 0.005 + 0.002 * i), s.opacity, s.hardness, s.color)
+        r.render(layer, s)
+    assert len(r._crop_engines) <= 20  # 8 sizes per octave, not one per footprint size
+    assert all(n <= r._crop_size(n) < 1.125 * n for n in range(64, 512))  # under 12.5% larger than needed
+
 def test_render_strokes_reproduces_and_upscales_a_painting():
     from overpaintai.highres import render_strokes
 
