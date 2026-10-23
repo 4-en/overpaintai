@@ -10,7 +10,7 @@ from typing import Callable, List, Optional, Tuple
 
 import torch
 
-from overpaintai.highres import CropRenderer, stroke_groups, unpack_strokes
+from overpaintai.highres import CropRenderer, stroke_groups, stroke_tools, unpack_strokes
 
 
 def stroke_schedule(n_strokes: int, n_frames: int, gamma: float = 1.8) -> list:
@@ -38,6 +38,8 @@ def render_timelapse(
     should_stop: Optional[Callable[[], bool]] = None,
     gamma: float = 1.8,
     groups: Optional[List[Tuple[int, bool]]] = None,
+    opaque: bool = False,
+    mask_tool: bool = False,
 ) -> Path:
     """
     Args:
@@ -49,6 +51,7 @@ def render_timelapse(
         should_stop: checked every frame; returning True aborts (raises InterruptedError).
         groups: (count, joint) per recorded render (`highres.stroke_groups`); default: chunks of 16, one stroke
             after another. A joint group (one order-independent operation) only appears as a whole.
+        opaque, mask_tool: the record's engine options (see `highres.stroke_record`).
     """
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is not installed (needed to encode the video)")
@@ -57,7 +60,8 @@ def render_timelapse(
     V = max(16, round(canvas_size * max_side / max(w, h)))
     vw, vh = round(w * V / canvas_size) // 2 * 2, round(h * V / canvas_size) // 2 * 2  # even for yuv420p
 
-    renderer = CropRenderer(V, num_stamps, min_radius, max_radius, device, adaptive_stamps=True)
+    renderer = CropRenderer(V, num_stamps, min_radius, max_radius, device, adaptive_stamps=True, opaque=opaque,
+                            mask_tool=mask_tool)
     strokes = strokes.to(renderer.device).float()
     N = strokes.shape[0]
     hold_frames = max(1, round(hold * fps))
@@ -85,7 +89,8 @@ def render_timelapse(
             while done < target_count and g < len(groups):
                 size, joint = groups[g]
                 n = size - g_done if joint else min(size - g_done, target_count - done)
-                renderer.render(layer, unpack_strokes(strokes[done : done + n]), joint)
+                part = strokes[done : done + n]
+                renderer.render(layer, unpack_strokes(part), joint, stroke_tools(part))
                 done, g_done = done + n, g_done + n
                 if g_done == size:
                     g, g_done = g + 1, 0

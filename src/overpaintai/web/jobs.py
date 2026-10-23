@@ -359,6 +359,7 @@ class JobManager:
             duration=job.video_duration, max_side=job.video_max_side, num_stamps=data.get("num_stamps", 32),
             min_radius=data.get("min_radius", 1e-4), max_radius=data.get("max_radius", 0.75), device=self.device,
             on_progress=on_progress, should_stop=lambda: job.cancel_requested, groups=stroke_groups(data),
+            opaque=data.get("opaque", False), mask_tool=data.get("mask_tool", False),
         )
 
     @torch.no_grad()
@@ -377,6 +378,7 @@ class JobManager:
             num_stamps=data.get("num_stamps", 32), min_radius=data.get("min_radius", 1e-4),
             max_radius=data.get("max_radius", 0.75), device=self.device,
             on_progress=on_progress, should_stop=lambda: job.cancel_requested, groups=stroke_groups(data),
+            opaque=data.get("opaque", False), mask_tool=data.get("mask_tool", False),
         )
         arr = to_uint8(img[0])
         del img

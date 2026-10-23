@@ -1,0 +1,168 @@
+import math
+
+import torch
+
+from overpaintai import views
+from overpaintai.canvas_engine import DifferentiableCanvasEngine
+from overpaintai.frame_model import FrameStrokePredictor
+from overpaintai.plan_model import build_model
+
+R = 32
+SMALL = dict(num_strokes=4, widths=(8, 16, 32, 64), token_dim=64, heads=4, global_blocks=1, query_blocks=1,
+             refine_layers=2, view_tokens=4, plan_slots=2, learned_points=3, point_dim=8)
+
+
+def _model(**kw):
+    return FrameStrokePredictor(**{**SMALL, **kw})
+
+
+def _inputs(engine, target, boxes, R=R):
+    layer = engine.create_blank_paint_layer(target.shape[0], target.shape[-1], target.shape[-1])
+    return views.view_inputs(target, engine.composite(layer), layer[:, 3:], boxes, R), layer
+
+
+def _spread(model, std=0.5):
+    with torch.no_grad():  # strokes start as dots; give them extent so there is a frame to sample
+        model.decoder[-1].weight.normal_(std=std)
+
+
+def test_outputs_and_any_input_size():
+    torch.manual_seed(0)
+    model = _model(stroke_gate=True, hard_gate=True, stationary=True, paintable_mask=True).eval()
+    boxes = views.whole_image_boxes(2)
+    x = torch.rand(2, 13, R, R)
+    out = model(x, boxes, torch.zeros(2), error_progress=torch.tensor([0.1, 0.6]))
+    s = out.strokes
+    assert s.points.shape == (2, 4, 3, 2) and s.radii.shape == (2, 4, 3) and s.opacity.shape == (2, 4, 3)
+    lo, hi = model.radius_range
+    assert (s.radii >= lo).all() and (s.radii <= hi).all() and (s.color >= 0).all() and (s.color <= 1).all()
+    assert out.placement_logits.shape == (2, 4, (R // 4) ** 2)  # placement on the R/4 map
+    # the paint alpha (channel 9) is not read: an opaque canvas has none
+    x2 = x.clone()
+    x2[:, 9] = torch.rand(2, R, R)
+    assert torch.allclose(model(x2, boxes, torch.zeros(2), error_progress=torch.tensor([0.1, 0.6])).strokes.points,
+                          s.points)
+    for size in (48, 64):
+        tokens = model.encode_global(torch.rand(1, 13, size, size), torch.zeros(1), torch.zeros(1))
+        assert tokens.shape == (1, model.global_grid ** 2, 64)
+
+
+def test_frame_points_sit_at_the_strokes_edge():
+    model = _model().eval()
+    p = torch.tensor([[[[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]]]])  # a horizontal stroke, y = 0.5
+    r = torch.full((1, 1, 3), 0.1)
+    pts, coords = model._frame_points(p, r, R)
+    px = 1.0 / (R - 1)
+    side = coords[:, 3] == 0
+    # across the stroke: distance from the centre line = radius multiple x r + pixels x px
+    dist = (pts[0, 0, side, 1] - 0.5).abs()
+    want = (coords[side, 1] * 0.1 + coords[side, 2] * px).abs()
+    assert torch.allclose(dist, want, atol=1e-6)
+    assert ((coords[side, 1].abs() == 1.0) & (coords[side, 2] == 0)).sum() == 2 * len(model.t_along)  # the edge
+    # end caps lie beyond the ends, on the stroke's line
+    caps = pts[0, 0, ~side]
+    assert torch.allclose(caps[:, 1], torch.full_like(caps[:, 1], 0.5), atol=1e-6)
+    assert ((caps[:, 0] < 0.2) | (caps[:, 0] > 0.8)).sum() >= 6
+    # a thin stroke's edge band is pixels around its centre line
+    thin = model._frame_points(p, torch.full((1, 1, 3), 0.5 * px), R)[0]
+    assert (thin[0, 0, side, 1] - 0.5).abs().max() < 3 * px
+
+
+def test_strokes_read_full_resolution_images_along_their_frame():
+    torch.manual_seed(1)
+    model = _model().eval()
+    _spread(model)
+    boxes = views.whole_image_boxes(1)
+    x = torch.rand(1, 12, R, R)
+    target = torch.rand(1, 3, 256, 256)
+    canvas = torch.rand(1, 3, 256, 256)
+    a = model(x, boxes, torch.zeros(1), images=(target, canvas)).strokes
+    # detail finer than a view pixel (every second source pixel at 256 for a 32 px view) changes the strokes
+    detail = target.clone()
+    detail[..., ::2, ::2] = 1.0 - detail[..., ::2, ::2]
+    b = model(x, boxes, torch.zeros(1), images=(detail, canvas)).strokes
+    assert (a.color - b.color).abs().max() > 1e-3
+    # one image shared by several views works like a copy per view
+    boxes2 = torch.tensor([[0.0, 0.0, 1.0], [0.2, 0.3, 0.5]])
+    x2 = torch.rand(2, 12, R, R)
+    shared = model(x2, boxes2, torch.zeros(2), images=(target, canvas)).strokes
+    copied = model(x2, boxes2, torch.zeros(2), images=(target.expand(2, -1, -1, -1), canvas.expand(2, -1, -1, -1)))
+    assert torch.allclose(shared.points, copied.strokes.points, atol=1e-5)
+
+
+def test_strokes_see_each_other_and_their_samples():
+    torch.manual_seed(2)
+    model = _model().eval()
+    _spread(model)
+    out = model(torch.rand(1, 12, R, R), views.whole_image_boxes(1), torch.zeros(1))
+    g, = torch.autograd.grad(out.strokes.points[0, 0].sum(), model.queries, retain_graph=True)
+    assert g[1].abs().sum() > 0  # stroke 0 depends on stroke 1's latent
+    g, = torch.autograd.grad(out.strokes.color.sum(), model.point_enc[1].weight)
+    assert g.abs().sum() > 0  # what the frame samples see enters the latents
+
+
+def test_gradients_reach_every_parameter_through_the_renderer():
+    torch.manual_seed(3)
+    model = _model(stroke_gate=True)
+    model.mask_tool = True
+    engine = DifferentiableCanvasEngine(canvas_size=48, min_opacity=0.0, opaque=True, eraser_mode="mask")
+    target = torch.rand(2, 3, 48, 48)
+    boxes = torch.tensor([[0.0, 0.0, 1.0], [0.2, 0.3, 0.6]])
+    opt = torch.optim.SGD(model.parameters(), lr=1e-2)
+    for _ in range(2):  # zero-initialized branches only pass gradient after one update
+        opt.zero_grad()
+        x, layer = _inputs(engine, target, boxes)
+        out = model(x, boxes, torch.tensor([0.3, 0.7]), images=(target, engine.composite(layer)))
+        gated = views.Strokes(out.strokes.points, out.strokes.radii, out.strokes.opacity * out.gate.unsqueeze(-1),
+                              out.strokes.hardness, out.strokes.color)
+        tools = torch.nn.functional.gumbel_softmax(out.tool_logits[..., [0, 4]], hard=True)
+        tool_w = torch.zeros(2, 4, 5)
+        tool_w = tool_w.index_add(-1, torch.tensor([0, 4]), tools)
+        params = views.to_engine_params(views.view_to_image(gated, boxes), engine)
+        canvas = engine.composite(engine(layer, params, tool_w, joint=4))
+        loss = (canvas - target).abs().mean() + 1e-3 * out.tool_logits.square().mean()
+        loss.backward()
+        opt.step()
+    missing = [n for n, p in model.named_parameters() if p.grad is None or p.grad.abs().sum() == 0]
+    assert not missing, missing
+
+
+def test_checkpoints_build_and_paint_with_the_harness(tmp_path):
+    from overpaintai.highres import HighResConfig, HighResPainter, load_checkpoint_model, render_strokes, stroke_record
+
+    torch.manual_seed(4)
+    cfg = dict(SMALL, arch="frame", joint_strokes=True, opaque_canvas=True, mask_tool=True, stroke_gate=True,
+               hard_gate=True, paintable_mask=True, stationary=True)
+    try:
+        build_model(dict(cfg, joint_strokes=False))
+        raise AssertionError("frame models need joint strokes")
+    except ValueError:
+        pass
+    torch.save({"model": build_model(cfg).state_dict(), "ema": None, "model_config": cfg}, tmp_path / "f.pt")
+    model, _ = load_checkpoint_model(str(tmp_path / "f.pt"), torch.device("cpu"))
+    assert isinstance(model, FrameStrokePredictor) and model.opaque_canvas and model.mask_tool
+    _spread(model, 1.0)
+    forward = model.forward
+
+    def every_other_a_mask(*args, **kw):  # tool choices as a trained model might make them
+        out = forward(*args, **kw)
+        out.tool_logits = out.tool_logits.clone()
+        out.tool_logits[:, 0::2, 4] += 10.0
+        out.tool_logits[:, 1::2, 0] += 10.0
+        return out
+
+    model.forward = every_other_a_mask
+
+    hr = HighResConfig(whole_steps=2, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.25)
+    painter = HighResPainter(model.eval(), size=64, view_res=R, config=hr, autocast=None)
+    assert painter.tools == [0, 4] and painter.renderer.engine.opaque
+    result = painter.paint(torch.rand(1, 3, 64, 64), source_side=64, valid=torch.ones(1, 1, 64, 64),
+                           log=lambda *_: None)
+    record = stroke_record(result)
+    assert record["strokes"].shape[1] == 17 and record["opaque"] and record["mask_tool"]
+    assert (record["strokes"][:, 16] == 4).any() and (record["strokes"][:, 16] == 0).any()
+    redrawn = render_strokes(record["strokes"], 64, (64, 64), 64, min_radius=painter.min_radius,
+                             max_radius=painter.max_radius, groups=[(int(n), True) for n in record["groups"]],
+                             opaque=True, mask_tool=True)
+    assert (redrawn - result.canvas).abs().mean() < 0.01
+    assert math.isfinite(result.stats[-1]["psnr"])

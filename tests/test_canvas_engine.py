@@ -1,3 +1,6 @@
+import math
+
+import pytest
 import torch
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine, reverse_strokes
@@ -282,3 +285,68 @@ def test_joint_gradients_stay_finite_in_the_far_tails_of_soft_strokes():
         out = engine(blank, torch.sigmoid(r), joint=2)
         engine.composite(out).mean().backward()
         assert r.grad.isfinite().all(), x
+
+
+def test_opaque_canvas_paints_like_a_transparent_one():
+    torch.manual_seed(7)
+    clear = DifferentiableCanvasEngine(canvas_size=SIZE, min_opacity=0.0).eval()
+    opaque = DifferentiableCanvasEngine(canvas_size=SIZE, min_opacity=0.0, opaque=True).eval()
+    blank = opaque.create_blank_paint_layer(2, SIZE, SIZE)
+    assert (blank[:, 3] == 1).all() and torch.allclose(opaque.composite(blank), clear.create_background(2, SIZE, SIZE))
+    strokes = torch.rand(2, 6, 16)
+    for joint in (0, 6):
+        a = clear.composite(clear(clear.create_blank_paint_layer(2, SIZE, SIZE), strokes, joint=joint))
+        b = opaque.composite(opaque(blank, strokes, joint=joint))
+        assert torch.allclose(a, b, atol=1e-5), joint
+
+
+def test_mask_keeps_the_canvas_and_cuts_a_sharp_edge():
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.5, min_opacity=0.0, opaque=True,
+                                        eraser_mode="mask").eval()
+    layer = engine.create_blank_paint_layer(1, SIZE, SIZE)
+    before = engine.composite(layer)
+    # a big round red dab, and a big hard mask whose straight-ish edge cuts through its middle
+    dab = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.8, 0.8, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.8, 1.0]  # r ~ 0.4
+    mask = [1.3, -0.5, 1.3, 0.5, 1.3, 1.5, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    tools = torch.zeros(1, 2, engine.NUM_TOOLS)
+    tools[0, 0, 0], tools[0, 1, 4] = 1.0, 1.0
+    out = engine.composite(engine(layer, torch.tensor([[dab, mask]]), tools, joint=2))
+    # the radius-0.5 mask at x = 1.3 covers x > 0.8: left of its edge red, right of it the canvas as before
+    edge = 1.3 - (engine.min_radius + 1.0 * (engine.max_radius - engine.min_radius))  # x of the mask's edge
+    col = lambda x: int(round(x * (SIZE - 1)))
+    y = SIZE // 2
+    assert out[0, 0, y, col(edge) - 3] > 0.95 and out[0, 1, y, col(edge) - 3] < 0.05
+    assert torch.allclose(out[0, :, y, col(edge) + 3], before[0, :, y, col(edge) + 3], atol=1e-4)
+    # the cut stays sharp: one pixel from red to the canvas
+    assert out[0, 1, y, col(edge) - 2] < 0.1 and abs(out[0, 1, y, col(edge) + 2] - before[0, 1, y, col(edge) + 2]) < 0.05
+    # masks exist only within joint steps
+    with pytest.raises(ValueError):
+        engine(layer, torch.tensor([[mask]]), tools[:, 1:])
+
+
+def test_profile_and_joint_result_at_points_match_a_render():
+    from overpaintai import views
+    from overpaintai.canvas_engine import joint_at, profile_at
+
+    torch.manual_seed(8)
+    engine = DifferentiableCanvasEngine(canvas_size=SIZE, max_radius=0.3, min_opacity=0.0, num_stamps=16,
+                                        opaque=True, eraser_mode="mask").eval()
+    params = torch.rand(1, 5, 16)
+    params[..., 6:8] *= 0.4
+    tools = torch.zeros(1, 5, engine.NUM_TOOLS)
+    tools[..., 0] = 1.0
+    tools[0, 4, 0], tools[0, 4, 4] = 0.0, 1.0  # one mask
+    layer = engine(engine.create_blank_paint_layer(1, SIZE, SIZE), torch.rand(1, 3, 16))
+    out = engine.composite(engine(layer, params, tools, joint=5))
+    s = views.from_engine_params(params, engine)
+    # pixel centres as points
+    idx = torch.randint(0, SIZE, (1, 300, 2))
+    pts = idx.float() / (SIZE - 1)
+    edge = 2.0 * math.log(9.0) * (SIZE - 1) / engine.hard_edge_px
+    mask, shape = profile_at(pts, s.points, s.radii, s.opacity, s.hardness[..., 0], edge, stamps=16)
+    full = torch.stack([engine._brush(params[:, k], SIZE, SIZE)[0][0, 0] for k in range(5)])  # (5, H, W)
+    at = lambda img: img[..., idx[0, :, 1], idx[0, :, 0]]
+    assert torch.allclose(mask[0], at(full), atol=1e-4)
+    canvas = at(engine.composite(layer)[0]).t().unsqueeze(0)
+    pred = joint_at(canvas, mask, shape, s.color, tools[..., 0], tools[..., 4])
+    assert torch.allclose(pred[0], at(out[0]).t(), atol=1e-3)

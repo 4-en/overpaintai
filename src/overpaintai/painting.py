@@ -121,8 +121,12 @@ class Painter:
     ) -> StrokeOutput:
         """Model output for one view per image (`boxes` (B, 3)); `samples` replays earlier random draws."""
         x, e = self.inputs(target, layer, boxes, paintable)
+        kw = {}
+        if getattr(self.model, "uses_images", False):  # the full-resolution images, read along the strokes
+            kw["images"] = (target, self.composite(layer.detach()))
         with self._autocast(target.device):
-            return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e, samples=samples)
+            return self.model(x, boxes, progress, global_tokens=global_tokens, error_progress=e, samples=samples,
+                              **kw)
 
     def render(self, layer: torch.Tensor, params: torch.Tensor, tool_w: torch.Tensor) -> torch.Tensor:
         return self.engine(layer, params, tool_w, checkpoint_strokes=self.checkpoint_strokes, joint=self.joint)

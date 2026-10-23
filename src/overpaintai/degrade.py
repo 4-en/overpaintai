@@ -83,7 +83,8 @@ def degraded_canvas(
     Paint layer `(B, 4, S, S)` that looks like a partially finished painting of `target` `(B, 3, S, S)`:
     the target with 1-3 randomly chosen degradations, each applied in a few soft regions (and the coarse
     ones sometimes everywhere). `strength` scales how much of the image is affected and how strongly.
-    Missing regions are transparent (alpha 0), so the canvas background shows there.
+    Missing regions are transparent (alpha 0), so the canvas background shows there; with an opaque engine
+    (`engine.opaque`) they are painted over with the background instead, at alpha 1.
     """
     B, _, S, _ = target.shape
     dev = target.device
@@ -113,7 +114,11 @@ def degraded_canvas(
         elif kind == "flatten":  # texture and shading lost: a smooth patch of the region's average color
             new = _gaussian_blur(rgb, S * (0.03 + 0.05 * _rand(gen, 1, device=dev).item()))
         elif kind == "missing":
-            alpha = alpha * (1.0 - mask * (0.5 + 0.5 * _rand(gen, B, 1, 1, 1, device=dev)))
+            gone = mask * (0.5 + 0.5 * _rand(gen, B, 1, 1, 1, device=dev))
+            if engine.opaque:
+                rgb = rgb + gone * (engine.create_background(B, S, S, dev) - rgb)
+            else:
+                alpha = alpha * (1.0 - gone)
             continue
         elif kind == "lowres":
             factor = 2 ** int(torch.randint(1, 4, (1,), generator=gen, device=dev).item())

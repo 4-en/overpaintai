@@ -61,6 +61,8 @@ class PaintResult:
     stats: List[Dict] = field(default_factory=list)
     strokes: List[torch.Tensor] = field(default_factory=list)  # engine-independent stroke records, one per render
     joint: bool = False  # each record was rendered as one order-independent operation (joint-stroke models)
+    opaque: bool = False  # painted on an opaque canvas (`DifferentiableCanvasEngine(opaque=True)`)
+    mask_tool: bool = False  # strokes carry a tool column; tool 4 is a per-step mask (eraser_mode="mask")
 
 
 class PaintCancelled(Exception):
@@ -133,13 +135,16 @@ class CropRenderer:
 
     def __init__(
         self, size: int, num_stamps: int, min_radius: float, max_radius: float, device, tool: int = 0,
-        max_crop: int = 2048, adaptive_stamps: bool = False,
+        max_crop: int = 2048, adaptive_stamps: bool = False, opaque: bool = False, mask_tool: bool = False,
     ):
         """
         adaptive_stamps: choose the curve samples per call from the strokes' length in pixels (about one
             segment per 16 px, between 8 and `num_stamps`) instead of always `num_stamps`; much cheaper for
             the many small detail strokes, visually the same (used for replay / export).
+        opaque, mask_tool: the engine options of the model that painted the strokes (see `PaintResult`).
         """
+        self.opaque = opaque
+        self.eraser_mode = "mask" if mask_tool else "erase"
         self.S = size
         self.max_crop = max_crop
         self.adaptive_stamps = adaptive_stamps
@@ -156,7 +161,8 @@ class CropRenderer:
         """Engine for an n-px canvas covering `scale` of the image side (radii in its own units)."""
         return DifferentiableCanvasEngine(
             canvas_size=n, num_stamps=self.num_stamps, min_opacity=0.0,  # gated strokes may be (near) zero
-            min_radius=self.min_radius / scale, max_radius=self.max_radius / scale,
+            min_radius=self.min_radius / scale, max_radius=self.max_radius / scale, opaque=self.opaque,
+            eraser_mode=self.eraser_mode,
         ).to(self.device).eval()
 
     def _stamps_for(self, strokes: views.Strokes) -> int:
@@ -174,10 +180,12 @@ class CropRenderer:
         return self.engine.composite(layer, self.background)
 
     @torch.no_grad()
-    def render(self, layer: torch.Tensor, strokes: views.Strokes, joint: bool = False) -> torch.Tensor:
+    def render(self, layer: torch.Tensor, strokes: views.Strokes, joint: bool = False,
+               tools: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Renders image-space strokes `(1, N)` in order onto `layer` (in place) and returns it; with `joint`, as
-        one order-independent operation (`DifferentiableCanvasEngine.forward_joint_step`).
+        one order-independent operation (`DifferentiableCanvasEngine.forward_joint_step`). `tools`: (N,) engine
+        tool index per stroke (default: this renderer's tool for all).
         """
         if strokes.radii.shape[1] == 0:
             return layer
@@ -197,16 +205,16 @@ class CropRenderer:
         n = min(S, max(x1 - x0, y1 - y0) + 1)
         stamps = self._stamps_for(strokes)
         if n <= self.max_crop:
-            self._render_square(layer, strokes, min(x0, S - n), min(y0, S - n), n, stamps, joint)
+            self._render_square(layer, strokes, min(x0, S - n), min(y0, S - n), n, stamps, joint, tools)
         else:  # split huge footprints into squares (the last ones may reach past the canvas: padded)
             m = self.max_crop
             for py in range(y0, y1 + 1, m):
                 for px in range(x0, x1 + 1, m):
-                    self._render_square(layer, strokes, px, py, m, stamps, joint)
+                    self._render_square(layer, strokes, px, py, m, stamps, joint, tools)
         return layer
 
     def _render_square(self, layer: torch.Tensor, strokes: views.Strokes, x0: int, y0: int, n: int, stamps: int,
-                       joint: bool = False):
+                       joint: bool = False, tools: Optional[torch.Tensor] = None):
         """Renders `strokes` into the n x n square at pixel (x0, y0); parts outside the canvas are padding."""
         S = self.S
         box = torch.tensor([[x0 / (S - 1), y0 / (S - 1), (n - 1) / (S - 1)]], device=self.device)
@@ -217,42 +225,52 @@ class CropRenderer:
             eng.num_stamps = stamps
             eng.t = torch.linspace(0.0, 1.0, stamps, device=self.device).view(1, stamps, 1, 1)
         params = views.to_engine_params(views.image_to_view(strokes, box), eng, clamp_points=False)
-        tools = torch.zeros(1, params.shape[1], eng.NUM_TOOLS, device=self.device)
-        tools[..., self.tool] = 1.0
+        idx = torch.full((params.shape[1],), self.tool, device=self.device) if tools is None else tools.to(self.device)
+        tool_w = F.one_hot(idx.long(), eng.NUM_TOOLS).float().unsqueeze(0)
         h, w = min(n, S - y0), min(n, S - x0)
         if h == n and w == n:
             crop = layer[:, :, y0 : y0 + n, x0 : x0 + n].contiguous()
         else:
             crop = layer.new_zeros((1, 4, n, n))
             crop[:, :, :h, :w] = layer[:, :, y0 : y0 + h, x0 : x0 + w]
-        out = eng(crop, params, tools, joint=params.shape[1] if joint else 0)
+        out = eng(crop, params, tool_w, joint=params.shape[1] if joint else 0)
         layer[:, :, y0 : y0 + h, x0 : x0 + w] = out[:, :, :h, :w]  # in place (no autograd)
 
 
-STROKE_FORMAT = "points(6), radii(2), opacity(2), hardness, color(3), mid radius, mid opacity; image coords"
+STROKE_FORMAT = ("points(6), radii(2), opacity(2), hardness, color(3), mid radius, mid opacity[, tool]; "
+                 "image coords")
 
 
-def pack_strokes(s: views.Strokes) -> torch.Tensor:
+def pack_strokes(s: views.Strokes, tools: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     Image-space strokes `(1, N)` as `(N, 16)`: points (6), radii (2), opacity (2), hardness, color (3), middle
     radius and opacity (the pressure curve; the mean of the ends for strokes without one, which renders the
-    same linear profile).
+    same linear profile). With `tools` (N,): `(N, 17)`, the engine tool index appended.
     """
     N = s.radii.shape[1]
     r, a = s.radii, s.opacity
     mid = [r[..., 2:], a[..., 2:]] if r.shape[-1] == 3 else [r.mean(-1, keepdim=True), a.mean(-1, keepdim=True)]
-    return torch.cat([s.points.reshape(1, N, 6), r[..., :2], a[..., :2], s.hardness, s.color] + mid, dim=-1)[0]
+    tool = [] if tools is None else [tools.view(1, N, 1).to(s.color.dtype)]
+    return torch.cat([s.points.reshape(1, N, 6), r[..., :2], a[..., :2], s.hardness, s.color] + mid + tool, dim=-1)[0]
 
 
-def pad_strokes(t: torch.Tensor) -> torch.Tensor:
-    """Older `(N, 14)` stroke records -> `(N, 16)` (linear pressure: middle = mean of the ends)."""
-    if t.shape[-1] == 16:
-        return t
-    return torch.cat([t, t[..., 6:8].mean(-1, keepdim=True), t[..., 8:10].mean(-1, keepdim=True)], dim=-1)
+def pad_strokes(t: torch.Tensor, columns: int = 16) -> torch.Tensor:
+    """Older `(N, 14)` stroke records -> `(N, 16)` (linear pressure: middle = mean of the ends); with `columns`
+    17 also the tool column (0 = paint) for records without one."""
+    if t.shape[-1] == 14:
+        t = torch.cat([t, t[..., 6:8].mean(-1, keepdim=True), t[..., 8:10].mean(-1, keepdim=True)], dim=-1)
+    if columns == 17 and t.shape[-1] == 16:
+        t = torch.cat([t, torch.zeros_like(t[..., :1])], dim=-1)
+    return t
+
+
+def stroke_tools(t: torch.Tensor) -> Optional[torch.Tensor]:
+    """The tool index of each recorded stroke `(N,)`, or None for records without a tool column."""
+    return t[..., 16].round().long() if t.shape[-1] == 17 else None
 
 
 def unpack_strokes(t: torch.Tensor) -> views.Strokes:
-    """Inverse of `pack_strokes`: `(N, 16)` (or older `(N, 14)`) -> `Strokes` with batch 1."""
+    """Inverse of `pack_strokes`: `(N, 16 | 17)` (or older `(N, 14)`) -> `Strokes` with batch 1."""
     t = pad_strokes(t).unsqueeze(0)
     N = t.shape[1]
     return views.Strokes(points=t[..., 0:6].reshape(1, N, 3, 2), radii=t[..., [6, 7, 14]],
@@ -271,13 +289,19 @@ def stroke_groups(record: Dict, chunk: int = 16) -> List[Tuple[int, bool]]:
 
 
 def stroke_record(result: PaintResult, prior: Optional[Dict] = None) -> Dict:
-    """The `strokes.pt` stroke fields of a painting (continuing `prior`'s record): strokes, groups, joint."""
-    new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, 16)
+    """The `strokes.pt` stroke fields of a painting (continuing `prior`'s record): strokes, groups, joint, and the
+    engine options it needs to replay (opaque canvas, mask tool)."""
+    cols = 17 if result.mask_tool or (prior is not None and prior["strokes"].shape[-1] == 17) else 16
+    new = torch.cat(result.strokes) if result.strokes else torch.zeros(0, cols)
+    new = pad_strokes(new, cols)
     groups = [(t.shape[0], result.joint) for t in result.strokes]
+    opaque, mask_tool = result.opaque, result.mask_tool
     if prior is not None:
-        new = torch.cat([pad_strokes(prior["strokes"]), new])  # the whole history
+        new = torch.cat([pad_strokes(prior["strokes"], cols), new])  # the whole history
         groups = stroke_groups(prior) + groups
-    return {"strokes": new, "groups": [n for n, _ in groups], "joint": [j for _, j in groups]}
+        opaque, mask_tool = opaque or prior.get("opaque", False), mask_tool or prior.get("mask_tool", False)
+    return {"strokes": new, "groups": [n for n, _ in groups], "joint": [j for _, j in groups],
+            "opaque": opaque, "mask_tool": mask_tool}
 
 
 def render_strokes(
@@ -293,10 +317,12 @@ def render_strokes(
     on_progress: Optional[Callable[[float], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
     groups: Optional[List[Tuple[int, bool]]] = None,
+    opaque: bool = False,
+    mask_tool: bool = False,
 ) -> torch.Tensor:
     """
     `groups`: (count, joint) per recorded render (`stroke_groups`); default: chunks of `chunk`, one stroke after
-    another.
+    another. `opaque`, `mask_tool`: the record's engine options (see `stroke_record`).
 
     Re-renders recorded strokes (`pack_strokes` format, coordinates of the square `canvas_size` canvas with
     `content_wh` content) so that the content's longer side is `output_side` px. Strokes are
@@ -308,7 +334,8 @@ def render_strokes(
     # Max curve samples grow with sqrt(resolution) (flattening error ~ segment length^2); per chunk the
     # renderer picks fewer for short strokes
     stamps = int(min(128, max(num_stamps, round(num_stamps * math.sqrt(S / max(canvas_size, 1))))))
-    renderer = CropRenderer(S, stamps, min_radius, max_radius, device, adaptive_stamps=True)
+    renderer = CropRenderer(S, stamps, min_radius, max_radius, device, adaptive_stamps=True, opaque=opaque,
+                            mask_tool=mask_tool)
     strokes = strokes.to(renderer.device).float()
     layer = renderer.blank()
     N = strokes.shape[0]
@@ -316,7 +343,8 @@ def render_strokes(
         groups = stroke_groups({"strokes": strokes}, chunk)
     i = 0
     for g, (n, joint) in enumerate(groups):  # groups follow the recording (one per step / tile), keeping crops local
-        renderer.render(layer, unpack_strokes(strokes[i : i + n]), joint)
+        chunk_strokes = strokes[i : i + n]
+        renderer.render(layer, unpack_strokes(chunk_strokes), joint, stroke_tools(chunk_strokes))
         i += n
         if should_stop is not None and should_stop():
             raise PaintCancelled()
@@ -364,7 +392,12 @@ class HighResPainter:
         self.autocast = autocast
         self.device = device or next(model.parameters()).device
         self.min_radius, self.max_radius = radius_limits(model, size)
-        self.renderer = CropRenderer(size, num_stamps, self.min_radius, self.max_radius, self.device, tool)
+        self.opaque = bool(getattr(model, "opaque_canvas", False))
+        self.mask_tool = bool(getattr(model, "mask_tool", False))
+        # Tools the strokes may use: `tool`, plus the mask for mask-tool models (each stroke takes the likelier one)
+        self.tools = [tool] + ([4] if self.mask_tool and tool != 4 else [])
+        self.renderer = CropRenderer(size, num_stamps, self.min_radius, self.max_radius, self.device, tool,
+                                     opaque=self.opaque, mask_tool=self.mask_tool)
         self.joint = bool(getattr(model, "joint_strokes", False))  # each step / tile as one operation
         self.engine = self.renderer.engine
         self.background = self.renderer.background
@@ -372,8 +405,15 @@ class HighResPainter:
     def composite(self, layer: torch.Tensor) -> torch.Tensor:
         return self.renderer.composite(layer)
 
-    def render(self, layer: torch.Tensor, strokes: views.Strokes) -> torch.Tensor:
-        return self.renderer.render(layer, strokes, self.joint)
+    def render(self, layer: torch.Tensor, strokes: views.Strokes, tools: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.renderer.render(layer, strokes, self.joint, tools)
+
+    def stroke_tools(self, out) -> Optional[torch.Tensor]:
+        """Tool index per stroke `(T, N)` for models with several tools (None: `tool` for all)."""
+        if len(self.tools) == 1:
+            return None
+        allowed = torch.tensor(self.tools, device=out.tool_logits.device)
+        return allowed[out.tool_logits[..., allowed].argmax(-1)]
 
     # --- model ------------------------------------------------------------------------------------
     def _autocast(self):
@@ -389,9 +429,10 @@ class HighResPainter:
         if self.model.paintable_mask:
             paintable = (views.core_mask(boxes, cores, self.R) if cores is not None
                          else torch.ones(boxes.shape[0], 1, self.R, self.R, device=self.device))
-        x = views.view_inputs(target, self.composite(layer), layer[:, 3:], boxes, self.R, paintable)
+        canvas = self.composite(layer)
+        x = views.view_inputs(target, canvas, layer[:, 3:], boxes, self.R, paintable)
         e = views.error_progress(x, self.engine.bg_color.view(3)) if self.model.uses_error_progress else None
-        return x, e
+        return x, e, canvas
 
     @torch.no_grad()
     def predict(
@@ -399,16 +440,18 @@ class HighResPainter:
         global_tokens: Optional[torch.Tensor] = None, cores: Optional[torch.Tensor] = None,
     ):
         T = boxes.shape[0]
-        x, e = self._inputs(target, layer, boxes, cores)
+        x, e, canvas = self._inputs(target, layer, boxes, cores)
         lo, hi = self.cfg.scale_clamp
         prog = torch.full((T,), progress, device=self.device)
+        # Models that read the full-resolution images along their strokes get them (one copy for all views)
+        kw = {"images": (target, canvas)} if getattr(self.model, "uses_images", False) else {}
         with self._autocast():
             return self.model(x, boxes, prog, global_tokens=global_tokens, view_size=boxes[:, 2].clamp(lo, hi),
-                              error_progress=e)
+                              error_progress=e, **kw)
 
     @torch.no_grad()
     def global_tokens(self, target: torch.Tensor, layer: torch.Tensor, progress: float) -> torch.Tensor:
-        x, e = self._inputs(target, layer, views.whole_image_boxes(1, self.device))
+        x, e, _ = self._inputs(target, layer, views.whole_image_boxes(1, self.device))
         with self._autocast():
             return self.model.encode_global(x, torch.full((1,), progress, device=self.device), e)
 
@@ -561,7 +604,8 @@ class HighResPainter:
         cfg, A = self.cfg, min(self.cfg.analysis_res, self.S)
         t0 = time.time()
         layer = self.renderer.blank() if initial_layer is None else initial_layer.to(self.device).float().clone()
-        result = PaintResult(layer=layer, canvas=self.composite(layer), joint=self.joint)
+        result = PaintResult(layer=layer, canvas=self.composite(layer), joint=self.joint, opaque=self.opaque,
+                             mask_tool=self.mask_tool)
         target_a = F.interpolate(target, size=(A, A), mode="area")
         weight_a = torch.ones(1, 1, A, A, device=self.device)
         if valid is not None:
@@ -602,9 +646,12 @@ class HighResPainter:
             out = self.predict(target, result.layer, whole, (whole_done + k) / whole_total)
             img = views.view_to_image(out.strokes, whole)
             opacity = img.opacity * out.gate.unsqueeze(-1)
-            strokes = self._visible(img, opacity, opacity.amax(-1) > ACTIVE_OPACITY, 0)  # gated-off: skip
-            result.layer = self.render(result.layer, strokes)
-            result.strokes.append(pack_strokes(strokes).cpu())
+            keep = opacity.amax(-1) > ACTIVE_OPACITY  # gated-off: skip
+            strokes = self._visible(img, opacity, keep, 0)
+            tools = self.stroke_tools(out)
+            tools = None if tools is None else tools[0, keep[0]]
+            result.layer = self.render(result.layer, strokes, tools)
+            result.strokes.append(pack_strokes(strokes, tools).cpu())
             n_strokes += strokes.radii.shape[1]
             progress({"stage": "whole image", "kind": "whole", "step": k + 1, "steps": cfg.whole_steps}, k + 1)
         if cfg.whole_steps > 0:
@@ -630,10 +677,12 @@ class HighResPainter:
                         factor, keep = factor * fade, fade > 0.1
                     opacity = img.opacity * factor.unsqueeze(-1)
                     keep = keep & (opacity.amax(-1) > ACTIVE_OPACITY)  # invisible strokes are not rendered at all
+                    tools = self.stroke_tools(out)
                     for t in range(cores.shape[0]):  # highest-error tile first
                         tile = self._visible(img, opacity, keep, t)
-                        result.layer = self.render(result.layer, tile)
-                        result.strokes.append(pack_strokes(tile).cpu())
+                        tile_tools = None if tools is None else tools[t, keep[t]]
+                        result.layer = self.render(result.layer, tile, tile_tools)
+                        result.strokes.append(pack_strokes(tile, tile_tools).cpu())
                         n_strokes += tile.radii.shape[1]
                 level_tiles += cores.shape[0]
                 progress({"stage": label, "kind": "tiles", "round": rnd + 1, "rounds": cfg.rounds_per_level,

@@ -1,5 +1,5 @@
 import math
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,6 +72,87 @@ def _best_segment(
 # Fusing profile + max avoids ~20 full-size intermediates per segment and stroke, which dominate rendering
 # cost; used for the no-grad winner search on CUDA
 _best_segment_compiled = torch.compile(_best_segment, dynamic=True)
+
+
+def profile_at(
+    points: torch.Tensor,
+    ctrl: torch.Tensor,
+    radii: torch.Tensor,
+    opacity: torch.Tensor,
+    hardness: torch.Tensor,
+    edge_sharpness: float,
+    stamps: int = 16,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Brush masks of K strokes at Q arbitrary points, as the renderer computes them per pixel (capsule segments
+    along the curve, quadratic radius / opacity profiles), without rendering an image.
+
+    Args:
+        points: (B, Q, 2) where to evaluate, in the strokes' coordinates.
+        ctrl: (B, K, 3, 2) curve control points; radii, opacity: (B, K, 3) start / end / middle control values
+            (`views.Strokes` layout); hardness: (B, K).
+        edge_sharpness: as in `DifferentiableCanvasEngine._brush` for the canvas the points live on.
+    Returns:
+        (mask, shape) `(B, K, Q)`: the brush mask (profile x opacity) and the shape alone (at full opacity).
+    """
+    if radii.shape[-1] == 2:  # no pressure curve: linear profile
+        radii = torch.cat([radii, radii.mean(-1, keepdim=True)], -1)
+        opacity = torch.cat([opacity, opacity.mean(-1, keepdim=True)], -1)
+    t = torch.linspace(0.0, 1.0, stamps, device=points.device, dtype=points.dtype).view(1, 1, -1)
+    omt = 1.0 - t
+    q = lambda v0, v1, v2: omt * omt * v0.unsqueeze(-1) + 2.0 * omt * t * v1.unsqueeze(-1) + t * t * v2.unsqueeze(-1)
+    bx = q(ctrl[..., 0, 0], ctrl[..., 1, 0], ctrl[..., 2, 0])  # (B, K, S)
+    by = q(ctrl[..., 0, 1], ctrl[..., 1, 1], ctrl[..., 2, 1])
+    rt = q(radii[..., 0], radii[..., 2], radii[..., 1])
+    at = q(opacity[..., 0], opacity[..., 2], opacity[..., 1])
+    seg = torch.stack([bx[..., :-1], by[..., :-1], bx[..., 1:] - bx[..., :-1], by[..., 1:] - by[..., :-1],
+                       rt[..., :-1], rt[..., 1:], at[..., :-1], at[..., 1:]], dim=-1)  # (B, K, S-1, 8)
+    seg = seg.unsqueeze(3)  # (B, K, S-1, 1, 8) against points (B, 1, 1, Q)
+    px, py = points[..., 0].view(points.shape[0], 1, 1, -1), points[..., 1].view(points.shape[0], 1, 1, -1)
+    h = hardness.view(*hardness.shape, 1, 1)
+    fn = _profile_pair_compiled if points.is_cuda else _profile_pair
+    return fn(seg, px, py, h, edge_sharpness)
+
+
+def _profile_pair(seg, px, py, h, edge_sharpness: float):
+    """Max over segments of the profile with and without opacity: (mask, shape)."""
+    ax, ay, abx, aby, r0, r1, a0, a1 = seg.unbind(dim=-1)
+    apx, apy = px - ax, py - ay
+    t = ((apx * abx + apy * aby) / (abx * abx + aby * aby + 1e-8)).clamp(0.0, 1.0)
+    prof = _brush_profile((apx - t * abx) ** 2 + (apy - t * aby) ** 2, r0 + t * (r1 - r0), h, edge_sharpness)
+    return (prof * (a0 + t * (a1 - a0))).amax(2), prof.amax(2)
+
+
+# Fused: the (B, K, segments, Q) intermediates dominate otherwise
+_profile_pair_compiled = torch.compile(_profile_pair, dynamic=True)
+
+
+def joint_at(
+    canvas: torch.Tensor,
+    mask: torch.Tensor,
+    shape: torch.Tensor,
+    color: torch.Tensor,
+    paint_w: torch.Tensor,
+    mask_w: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    The canvas colour after one joint step (`DifferentiableCanvasEngine.forward_joint_step`) at Q points, for an
+    opaque canvas: `canvas` (B, Q, 3) before the step, `mask` / `shape` (B, K, Q) from `profile_at`, `color`
+    (B, K, 3), `paint_w` (B, K) the paint (+ dry) tool weights, `mask_w` (B, K) the mask tool's (eraser_mode
+    'mask'). Smudge and blur strokes and the dry brush's grain are left out (an estimate for those).
+    """
+    paint = (paint_w.unsqueeze(-1) * mask).clamp(0.0, 1.0)
+    shp = (paint_w.unsqueeze(-1) * shape).clamp(0.0, 1.0)
+    safe = lambda x: x.clamp(min=1e-6)
+    union = 1.0 - (1.0 - shp).prod(1)
+    weight = paint.sum(1)
+    cov = (union * weight / safe(shp.sum(1))).clamp(0.0, 1.0)  # (B, Q)
+    rgb = torch.einsum("bkq,bkc->bqc", paint, color) / safe(weight).unsqueeze(-1)
+    out = canvas + cov.unsqueeze(-1) * (rgb - canvas)
+    if mask_w is not None:
+        m = 1.0 - (1.0 - (mask_w.unsqueeze(-1) * mask).clamp(0.0, 1.0)).prod(1)
+        out = out + m.unsqueeze(-1) * (canvas - out)
+    return out
 
 
 def _window_index(base: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
@@ -153,7 +234,13 @@ class DifferentiableCanvasEngine(nn.Module):
       1: Dry / Textured Brush (Pigment deposition modulated by procedural canvas/chalk grain)
       2: Smudge / Push (Brush carries a paint patch along the curve, depositing and picking up as it moves)
       3: Blur / Blend (In-place isotropic softening of colors and edges underneath the brush)
-      4: Eraser (Subtractive alpha removal, from soft feathered eraser at h=0 to hard cutout at h=1)
+      4: Eraser (Subtractive alpha removal, from soft feathered eraser at h=0 to hard cutout at h=1), or with
+         `eraser_mode="mask"` a mask: in a joint step, the pixels under it keep the canvas from before the step
+         (paint, blur and smudge of that step don't reach them), like masking tape or a selection. A mask
+         edge crossing a paint edge gives a sharp corner even with round brushes.
+
+    `opaque=True`: blank canvases are the background itself at alpha 1 instead of transparent (paint composites
+    the same; blur and smudge then carry the paper's colour, and there is no transparency to erase).
     """
 
     NUM_CONT_PARAMS = 14  # x0, y0, x1, y1, x2, y2, r0, r2, a0, a2, hardness, R, G, B
@@ -179,8 +266,17 @@ class DifferentiableCanvasEngine(nn.Module):
         min_opacity: float = 0.05,
         bg_color: Tuple[float, float, float] = (0.97, 0.96, 0.93),
         bg_texture_strength: float = 0.04,
+        opaque: bool = False,
+        eraser_mode: str = "erase",
     ):
         super().__init__()
+        if eraser_mode not in ("erase", "mask"):
+            raise ValueError(f"unknown eraser_mode {eraser_mode!r}")
+        self.opaque = opaque
+        self.eraser_mode = eraser_mode
+        # Tools a trained model can pick (None: any). With tool weights that need gradients, the others are still
+        # skipped when unused: their weights are exactly zero with zero gradient (masked out before sampling)
+        self.grad_tools: Optional[Sequence[int]] = None
         self.canvas_size = canvas_size
         self.num_stamps = max(4, num_stamps)
         self.min_radius = min_radius
@@ -472,10 +568,14 @@ class DifferentiableCanvasEngine(nn.Module):
     def create_blank_paint_layer(
         self, batch_size: int = 1, H: Optional[int] = None, W: Optional[int] = None, device: Optional[torch.device] = None
     ) -> torch.Tensor:
-        """Returns a completely transparent RGBA paint layer of shape (B, 4, H, W) initialized to zeros."""
+        """Returns a blank RGBA paint layer `(B, 4, H, W)`: transparent zeros, or with `opaque` the background
+        at alpha 1."""
         H = H or self.canvas_size
         W = W or self.canvas_size
         device = device or self.bg_color.device
+        if self.opaque:
+            bg = self.create_background(batch_size, H, W, device)
+            return torch.cat([bg, torch.ones_like(bg[:, :1])], dim=1)
         return torch.zeros((batch_size, 4, H, W), dtype=torch.float32, device=device)
 
     def create_background(
@@ -619,15 +719,19 @@ class DifferentiableCanvasEngine(nn.Module):
         paint_mask = (w_paint * brush_mask + w_dry * (brush_mask * self.paper_grain)).clamp(0.0, 1.0)
         blur_mask = (w_blur * brush_mask).clamp(0.0, 1.0)
         eraser_mask = (w_eraser * brush_mask).clamp(0.0, 1.0)
+        if self.eraser_mode == "mask":  # masks only exist within a joint step
+            if bool((w_eraser > 0).any()):
+                raise ValueError("the mask tool (eraser_mode='mask') needs joint steps (forward(..., joint=K))")
+            eraser_mask = None
 
         # Tools whose weight is zero everywhere are skipped when no gradient needs them (e.g. paint-only
         # inference): the result is the same up to float rounding, and each skipped step saves several
         # full-canvas passes per stroke.
-        need_all = tool_weights.requires_grad
+        need = self._needs(tool_weights)
         smudges = []
-        if need_all or bool((w_smudge > 0).any()):
+        if need(2, w_smudge):
             smudges.append((ctrl, bx, by, hardness.view(B), w_smudge.view(B), edge_sharpness))
-        blur_mask = blur_mask if need_all or bool((w_blur > 0).any()) else None
+        blur_mask = blur_mask if need(3, w_blur) else None
         return self._apply_tools(paint_layer, paint_mask, stroke_rgb, smudges, blur_mask, eraser_mask)
 
     def forward_joint_step(
@@ -681,10 +785,11 @@ class DifferentiableCanvasEngine(nn.Module):
         paint_rgb = torch.einsum("bkhw,bkc->bchw", paint, rgb.view(B, K, 3)) / safe(weight)
 
         # 1. Edits of the canvas before the step, in premultiplied RGBA: each one's change from that canvas
-        need_all = tool_weights.requires_grad
+        need = self._needs(tool_weights)
         base = torch.cat([paint_layer[:, :3] * paint_layer[:, 3:4], paint_layer[:, 3:4]], dim=1)
         delta = None
-        smudging = [k for k, on in enumerate((w_smudge.view(B, K) > 0).any(0).tolist()) if on or need_all]
+        all_smudge = need(2, torch.zeros(()))  # every stroke may become a smudge stroke (its gradient is needed)
+        smudging = [k for k, on in enumerate((w_smudge.view(B, K) > 0).any(0).tolist()) if on or all_smudge]
         if smudging:  # all smudge strokes in one batch, each on its own copy of the canvas
             n = len(smudging)
             i = (torch.tensor(smudging, device=device).view(n, 1) + K * torch.arange(B, device=device)).flatten()
@@ -692,7 +797,7 @@ class DifferentiableCanvasEngine(nn.Module):
             smeared = self._smudge(rep, ctrl[i], bx[i], by[i], hardness.view(B * K)[i],
                                    w_smudge.view(B, K).t()[smudging].flatten(), edge_sharpness)
             delta = (smeared - rep).view(n, B, 4, H, W).sum(0)
-        if need_all or bool((w_blur > 0).any()):
+        if need(3, w_blur):
             blur_mask = (w_blur * brush).clamp(0.0, 1.0).amax(1, keepdim=True)
             blurred = blur_mask * (self._gaussian_blur_rgba(base) - base)
             delta = blurred if delta is None else delta + blurred
@@ -702,13 +807,33 @@ class DifferentiableCanvasEngine(nn.Module):
             a = edited[:, 3:4].clamp(0.0, 1.0)
             rgb = torch.where(a > 1e-5, (edited[:, :3] / (a + 1e-6)).clamp(0.0, 1.0), paint_layer[:, :3])
             layer = torch.cat([rgb, a], dim=1)
-        if need_all or bool((w_eraser > 0).any()):
+        masking = self.eraser_mode == "mask"
+        if not masking and need(4, w_eraser):
             eraser_mask = (w_eraser * brush).clamp(0.0, 1.0).amax(1, keepdim=True)
             a = layer[:, 3:4] * (1.0 - eraser_mask)
             layer = torch.cat([torch.where(a > 1e-5, layer[:, :3], torch.zeros_like(a)), a], dim=1)
 
         # 2. Paint on top
-        return self._apply_tools(layer, paint_mask, paint_rgb, [], None, None)
+        out = self._apply_tools(layer, paint_mask, paint_rgb, [], None, None)
+
+        # 3. Masks: the union of the mask strokes keeps the canvas from before the step (blended premultiplied)
+        if masking and need(4, w_eraser):
+            m = 1.0 - (1.0 - (w_eraser * brush).clamp(0.0, 1.0)).prod(1, keepdim=True)
+            new = torch.cat([out[:, :3] * out[:, 3:4], out[:, 3:4]], dim=1)
+            mixed = new + m * (base - new)
+            a = mixed[:, 3:4].clamp(0.0, 1.0)
+            rgb = torch.where(a > 1e-5, (mixed[:, :3] / (a + 1e-6)).clamp(0.0, 1.0), out[:, :3])
+            out = torch.cat([rgb, a], dim=1)
+        return out
+
+    def _needs(self, tool_weights: torch.Tensor):
+        """`need(tool, weights)`: whether a tool's pass must run: it is used, or its gradient is needed."""
+        grad = tool_weights.requires_grad
+        allowed = self.grad_tools
+
+        def need(tool: int, w: torch.Tensor) -> bool:
+            return (grad and (allowed is None or tool in allowed)) or bool((w > 0).any())
+        return need
 
     def _apply_tools(
         self,

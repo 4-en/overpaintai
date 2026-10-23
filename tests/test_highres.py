@@ -172,3 +172,20 @@ def test_harness_with_gated_masked_model_skips_invisible_strokes():
     painter = HighResPainter(model, size=64, view_res=16, config=cfg, autocast=None)
     result = painter.paint(torch.rand(1, 3, 64, 64), 64, log=lambda *_: None)
     assert result.stats[-1]["strokes"] == 0  # all gated off -> nothing rendered
+
+
+def test_stroke_records_with_and_without_a_tool_column():
+    from overpaintai.highres import pack_strokes, pad_strokes, stroke_tools, unpack_strokes
+
+    torch.manual_seed(9)
+    s = views.Strokes(points=torch.rand(1, 3, 3, 2), radii=0.05 * torch.rand(1, 3, 3) + 0.01,
+                      opacity=torch.rand(1, 3, 3), hardness=torch.rand(1, 3, 1), color=torch.rand(1, 3, 3))
+    plain = pack_strokes(s)
+    tooled = pack_strokes(s, torch.tensor([0, 4, 0]))
+    assert plain.shape == (3, 16) and tooled.shape == (3, 17)
+    assert stroke_tools(plain) is None and stroke_tools(tooled).tolist() == [0, 4, 0]
+    for t in (plain, tooled):
+        back = unpack_strokes(t)
+        assert torch.allclose(back.points, s.points) and torch.allclose(back.radii, s.radii)
+    assert torch.equal(pad_strokes(plain, 17)[:, :16], plain) and (pad_strokes(plain, 17)[:, 16] == 0).all()
+    assert torch.equal(pad_strokes(tooled, 17), tooled)

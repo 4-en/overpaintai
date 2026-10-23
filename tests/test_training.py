@@ -352,3 +352,33 @@ def test_joint_strokes_train_and_paint_with_the_harness(tmp_path):
     redrawn = render_strokes(record["strokes"], 64, (64, 64), 64, min_radius=painter.min_radius,
                              max_radius=painter.max_radius, groups=groups)
     assert (redrawn - result.canvas).abs().mean() < 0.01
+
+
+def test_frame_model_trains_with_the_mask_tool_and_paints_with_the_harness(tmp_path):
+    from overpaintai.highres import HighResConfig, HighResPainter, load_checkpoint_model, render_strokes, stroke_groups
+    from overpaintai.highres import stroke_record
+
+    frame = ["--arch", "frame", "--joint-strokes", "--view-tokens", "4", "--learned-points", "2"]
+    with pytest.raises(SystemExit):
+        main(TINY + ["--arch", "frame", "--epochs", "1", "--out", str(tmp_path / "x")])  # needs joint strokes
+    teacher = tmp_path / "teacher"
+    main(TINY + frame + ["--mode", "teacher", "--epochs", "1", "--out", str(teacher)])
+    unroll = tmp_path / "unroll"
+    main(TINY + frame + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--tools", "paint,mask",
+                         "--tile-prob", "1", "--checkpoint-steps", "--start-mix", "blank:0.5,degraded:0.5",
+                         "--image-size", "64", "--epochs", "1", "--out", str(unroll)])
+    ckpt = torch.load(unroll / "last.pt", weights_only=False)
+    cfg = ckpt["model_config"]
+    assert cfg["arch"] == "frame" and cfg["opaque_canvas"] and cfg["mask_tool"] and ckpt["tools"] == [0, 4]
+    assert math.isfinite(ckpt["history"][-1]["train_loss"])
+    main(TINY + ["--mode", "unroll", "--resume", str(unroll / "last.pt"), "--tools", "paint,mask", "--image-size", "64",
+                 "--epochs", "2"])  # resumes
+
+    model, _ = load_checkpoint_model(str(unroll / "last.pt"), torch.device("cpu"))
+    hr = HighResConfig(whole_steps=2, rounds_per_level=1, max_tiles=2, error_threshold=0.0, min_core=0.25)
+    painter = HighResPainter(model, size=64, view_res=16, config=hr, autocast=None)
+    result = painter.paint(torch.rand(1, 3, 64, 64), source_side=64, log=lambda *_: None)
+    record = stroke_record(result)
+    redrawn = render_strokes(record["strokes"], 64, (64, 64), 64, min_radius=painter.min_radius,
+                             max_radius=painter.max_radius, groups=stroke_groups(record), opaque=True, mask_tool=True)
+    assert (redrawn - result.canvas).abs().mean() < 0.01

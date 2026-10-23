@@ -388,11 +388,19 @@ class PlanStrokePredictor(nn.Module):
 
 def build_model(config: dict) -> nn.Module:
     """The model a checkpoint's `model_config` describes (`arch`: 'unet' = `StrokePredictor`, the default for
-    checkpoints from before the key existed, or 'plan' = `PlanStrokePredictor`)."""
+    checkpoints from before the key existed, 'plan' = `PlanStrokePredictor` or 'frame' = `FrameStrokePredictor`)."""
     config = dict(config)
     arch = config.pop("arch", "unet")
     joint = config.pop("joint_strokes", False)
-    if arch == "plan":
+    opaque = config.pop("opaque_canvas", False)
+    mask_tool = config.pop("mask_tool", False)
+    if arch == "frame":
+        if not joint:
+            raise ValueError("the frame architecture paints joint steps (joint_strokes)")
+        from overpaintai.frame_model import FrameStrokePredictor  # imports this module
+
+        model = FrameStrokePredictor(**config)
+    elif arch == "plan":
         config.setdefault("stroke_points", "free")  # plan checkpoints from before these options
         config.setdefault("color_base", "blur9")
         model = PlanStrokePredictor(**config)
@@ -403,4 +411,8 @@ def build_model(config: dict) -> nn.Module:
     # How the model's strokes are rendered, not part of the network: each step's strokes as one order-independent
     # operation (`DifferentiableCanvasEngine.forward_joint_step`) instead of one after another
     model.joint_strokes = bool(joint)
+    # The canvas it paints on (`DifferentiableCanvasEngine(opaque=...)`) and whether the eraser is a per-step mask
+    # (`eraser_mode="mask"`): engines that render its strokes are built to match
+    model.opaque_canvas = bool(opaque)
+    model.mask_tool = bool(mask_tool)
     return model

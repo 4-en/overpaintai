@@ -46,7 +46,7 @@ from overpaintai.plan_model import build_model
 from overpaintai.painting import Painter
 from overpaintai.viz import save_curve, save_frame, save_progress
 
-TOOLS = {"paint": 0, "dry": 1, "smudge": 2, "blur": 3, "eraser": 4}
+TOOLS = {"paint": 0, "dry": 1, "smudge": 2, "blur": 3, "eraser": 4, "mask": 4}  # mask: the eraser as a step mask
 
 MODEL_PRESETS = {
     "tiny": dict(widths=(16, 32, 64, 128), token_dim=128, heads=4),
@@ -64,7 +64,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    "(rendering cost grows with its square; teacher mode gains nothing above --view-res)")
     g.add_argument("--view-res", type=int, default=128, help="Working resolution R the model sees")
     g.add_argument("--target-strokes", default="48,96", help="Synthetic: min,max strokes per painting")
-    g.add_argument("--tools", default="paint", help="Comma-separated tools the model may use")
+    g.add_argument("--tools", default="paint", help="Comma-separated tools the model may use (paint, dry, smudge, "
+                   "blur, eraser; or mask: the eraser slot as a per-step mask, needs --joint-strokes)")
     g.add_argument("--val-fraction", type=float, default=0.05, help="Folder: share of images held out")
     g.add_argument("--val-size", type=int, default=32, help="Validation images")
     g.add_argument("--num-workers", type=int, default=4, help="Folder: DataLoader workers")
@@ -81,19 +82,27 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g = p.add_argument_group("model")
     g.add_argument("--model-size", choices=sorted(MODEL_PRESETS), default="small")
     g.add_argument("--strokes-per-step", type=int, default=16, help="N strokes predicted per view and step")
-    g.add_argument("--arch", choices=("unet", "plan"), default="unet",
+    g.add_argument("--arch", choices=("unet", "plan", "frame"), default="unet",
                    help="New models: 'unet' = StrokePredictor; 'plan' = PlanStrokePredictor (plan tokens, stroke "
                         "latents refined while seeing each other's provisional strokes, pressure curve, anchor "
-                        "anywhere along the stroke; see plan_model.py)")
+                        "anywhere along the stroke; see plan_model.py); 'frame' = FrameStrokePredictor (coarse "
+                        "features, strokes refined from full-resolution samples in their own frame and the "
+                        "predicted result; needs --joint-strokes; see frame_model.py)")
     g.add_argument("--global-blocks", type=int, default=None,
-                   help="Transformer blocks over the plan / global tokens (default: 2 unet, 6 plan)")
+                   help="Transformer blocks over the plan / global tokens (default: 2 unet, 6 plan, 3 frame)")
     g.add_argument("--query-blocks", type=int, default=None,
-                   help="Query block pairs (strokes coordinate, then read the plan; default: 2 unet, 4 plan). With "
-                        "--init-from a shallower model, the extra blocks start as identity")
-    g.add_argument("--refine-layers", type=int, default=3, help="Plan arch: stroke refinement layers")
-    g.add_argument("--view-tokens", type=int, default=16, help="Plan arch: side of the view's token grid")
-    g.add_argument("--plan-slots", type=int, default=8, help="Plan arch: learned plan tokens")
-    g.add_argument("--no-pressure", action="store_true", help="Plan arch: no pressure curve (linear tapers)")
+                   help="Query block pairs (strokes coordinate, then read the plan; default: 2 unet, 4 plan, 2 "
+                        "frame). With --init-from a shallower model, the extra blocks start as identity")
+    g.add_argument("--refine-layers", type=int, default=3, help="Plan / frame arch: stroke refinement layers")
+    g.add_argument("--view-tokens", type=int, default=16, help="Plan / frame arch: side of the view's token grid")
+    g.add_argument("--plan-slots", type=int, default=8, help="Plan / frame arch: learned plan tokens")
+    g.add_argument("--no-pressure", action="store_true", help="Plan / frame arch: no pressure curve (linear tapers)")
+    g.add_argument("--frame-along", type=int, default=9, help="Frame arch: sample positions along each stroke")
+    g.add_argument("--learned-points", type=int, default=8,
+                   help="Frame arch: learned sample points per stroke and refinement layer")
+    g.add_argument("--opaque-canvas", action=argparse.BooleanOptionalAction, default=None,
+                   help="New models: paint on an opaque canvas (blank = the background at alpha 1; no transparency; "
+                        "default: on for --arch frame, off otherwise)")
     g.add_argument("--no-stroke-gate", action="store_true", help="New models: no per-stroke gate output")
     g.add_argument("--no-paintable-mask", action="store_true", help="New models: no paintable-mask input")
     g.add_argument("--no-error-progress", action="store_true",
@@ -376,7 +385,8 @@ class Trainer:
         self.out = Path(args.out)
         (self.out / "samples").mkdir(parents=True, exist_ok=True)
 
-        self.tools = [TOOLS[t.strip()] for t in args.tools.split(",") if t.strip()]
+        names = [t.strip() for t in args.tools.split(",") if t.strip()]
+        self.tools = [TOOLS[t] for t in names]
         self.N = args.strokes_per_step
         self.S = args.image_size
         if args.mode == "teacher" and args.data != "synthetic":
@@ -385,10 +395,14 @@ class Trainer:
         if resume:
             self.model_config = resume["model_config"]
         else:
-            plan = args.arch == "plan"
+            plan, frame = args.arch == "plan", args.arch == "frame"
+            if frame and not args.joint_strokes:
+                raise SystemExit("--arch frame paints joint steps: add --joint-strokes")
+            if "mask" in names and not args.joint_strokes:
+                raise SystemExit("the mask tool only exists within joint steps: add --joint-strokes")
             self.model_config = dict(
                 num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
-                global_blocks=args.global_blocks or (6 if plan else 2),
+                global_blocks=args.global_blocks or (6 if plan else 3 if frame else 2),
                 query_blocks=args.query_blocks or (4 if plan else 2),
                 paintable_mask=not args.no_paintable_mask, stationary=not args.step_progress,
                 error_progress=args.step_progress and not args.no_error_progress,  # stationary: built in
@@ -398,13 +412,24 @@ class Trainer:
                 self.model_config.update(arch="plan", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
                                          plan_slots=args.plan_slots, pressure=not args.no_pressure,
                                          stroke_points="chord", color_base="scaled")
+            if frame:
+                self.model_config.update(arch="frame", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
+                                         plan_slots=args.plan_slots, pressure=not args.no_pressure,
+                                         frame_along=args.frame_along, learned_points=args.learned_points)
             if args.joint_strokes:
                 self.model_config["joint_strokes"] = True
+            if args.opaque_canvas if args.opaque_canvas is not None else frame:
+                self.model_config["opaque_canvas"] = True
+            if "mask" in names:
+                self.model_config["mask_tool"] = True
         # Gated strokes must be able to vanish completely: no opacity floor in the engine then
         min_opacity = 0.0 if self.model_config.get("stroke_gate") else 0.05
         self.engine = DifferentiableCanvasEngine(
-            canvas_size=self.S, num_stamps=args.num_stamps, min_opacity=min_opacity
+            canvas_size=self.S, num_stamps=args.num_stamps, min_opacity=min_opacity,
+            opaque=self.model_config.get("opaque_canvas", False),
+            eraser_mode="mask" if self.model_config.get("mask_tool") else "erase",
         ).to(self.device).train()
+        self.engine.grad_tools = list(self.tools)  # only these tools' passes need to run for their gradients
         self.model = build_model(self.model_config).to(self.device)
         self.model.placement_noise = args.placement_noise
         self.N = self.model.num_strokes
@@ -476,7 +501,9 @@ class Trainer:
         if a.data == "synthetic":
             self.synth = SyntheticSource(
                 self.engine, self.S, _pair(a.target_strokes, int), multiple_of=self.N,
-                tool_probs=[1.0 if i in self.tools else 0.0 for i in range(5)],
+                # no masks in synthetic paintings (rendered one stroke after another)
+                tool_probs=[1.0 if i in self.tools and not (i == 4 and self.engine.eraser_mode == "mask") else 0.0
+                            for i in range(5)],
             )
             self.steps_per_epoch = a.steps_per_epoch
             # Fixed validation paintings (seeded independently of training)
