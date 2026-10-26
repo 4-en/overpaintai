@@ -36,10 +36,10 @@ class Painter:
             in eval.
         autocast: dtype for the network (e.g. torch.bfloat16) or None. The renderer always runs in fp32.
         checkpoint_strokes: recompute strokes in backward (see `DifferentiableCanvasEngine.forward`).
-        grad_through_inputs: let gradients flow into the canvas the model *looks at*. Off by default: over a
-            multi-step unroll this chains the network's input Jacobian once per step (like an RNN) and
-            explodes. Earlier strokes still get gradients through the renderer, where later strokes are
-            composited on top of them.
+
+    The canvas the model *looks at* is detached: gradients through it chain the network's input Jacobian once
+    per step of an unroll (like an RNN) and explode. Earlier strokes still get gradients through the renderer,
+    where later strokes are composited on top of them.
     """
 
     def __init__(
@@ -51,7 +51,6 @@ class Painter:
         autocast: Optional[torch.dtype] = None,
         checkpoint_strokes: bool = True,
         gumbel_tau: float = 1.0,
-        grad_through_inputs: bool = False,
     ):
         self.model = model
         self.engine = engine
@@ -60,7 +59,6 @@ class Painter:
         self.autocast = autocast
         self.checkpoint_strokes = checkpoint_strokes
         self.gumbel_tau = gumbel_tau
-        self.grad_through_inputs = grad_through_inputs
         # Joint models: each view's N strokes are one order-independent operation (0 = one after another)
         self.joint = model.num_strokes if getattr(model, "joint_strokes", False) else 0
         self._background = {}
@@ -95,8 +93,7 @@ class Painter:
     def inputs(self, target: torch.Tensor, layer: torch.Tensor, boxes: torch.Tensor,
                paintable: Optional[torch.Tensor] = None):
         """View inputs for the model (with the paintable mask if it uses one) and the error progress."""
-        if not self.grad_through_inputs:
-            layer = layer.detach()
+        layer = layer.detach()
         R = self.view_res
         if self.model.paintable_mask and paintable is None:
             paintable = torch.ones(boxes.shape[0], 1, R, R, device=target.device)

@@ -9,13 +9,14 @@ Modes:
   unroll   Render-loss training: paint K steps from a blank canvas with the model's own strokes and
            compare the paintings to the target (multi-scale loss). Works with synthetic targets or a
            folder of images; optionally adds a zoomed-in tile step to train the high-resolution path.
-           With a canvas pool (--pool-size), most batches continue paintings from earlier batches
-           instead of starting over, so the model also learns to work on deep canvases.
+           Batches start from a mix of blank, self-painted, degraded and nearly finished canvases
+           (--start-mix), so the model learns every phase of a painting.
 
-Typical PoC: teacher pretraining, then unroll fine-tuning initialized from it:
-  overpaint-train --mode teacher --epochs 10 --out runs/teacher
-  overpaint-train --mode unroll --init-from runs/teacher/best.pt --epochs 20 --out runs/unroll
-  overpaint-train --mode unroll --data path/to/images --init-from runs/unroll/best.pt --out runs/real
+The defaults are the current recipe (joint strokes, 12-step unrolls, the 'loose' block-in loss for unroll,
+'pixel' for teacher; see --loss). Typical: teacher pretraining on synthetic paintings, then unroll training on
+real images initialized from it (--init-from also lowers the default learning rate and warm-up):
+  overpaint-train --mode teacher --epochs 6 --out runs/teacher
+  overpaint-train --data path/to/images --init-from runs/teacher/best.pt --epochs 6 --out runs/real
 Resume an interrupted run (model, EMA, optimizer, schedule, epoch, history) with --resume <ckpt>.
 """
 
@@ -39,16 +40,21 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas, touchup_pair
-from overpaintai.losses import (
-    MultiScalePaintLoss, _gaussian_blur, psnr, sharpness_pyramid, stroke_edge_sharpness, stroke_shape_bias,
-)
+from overpaintai.losses import MultiScalePaintLoss, _gaussian_blur, psnr, stroke_shape_bias
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
-from overpaintai.model import GATE_LOGIT_RANGE, StrokeSamples, TransformerBlock
+from overpaintai.model import GATE_LOGIT_RANGE, TransformerBlock
 from overpaintai.plan_model import build_model
 from overpaintai.painting import Painter
 from overpaintai.synthetic import render_targets
 from overpaintai.viz import save_curve, save_frame, save_progress
+
+LOSS_PRESETS = {
+    "loose": dict(detail_weight=0.0, scales="16,32", scale_weights="0.2,1", edge_weight=0.0, value_weight=0.0,
+                  texture_weight=40.0, shift_detail_weight=20.0, simplify_size=9),
+    "pixel": dict(detail_weight=1.0, scales="4,16", scale_weights="1,1", edge_weight=0.4, value_weight=0.5,
+                  texture_weight=0.0, shift_detail_weight=0.0, simplify_size=0),
+}
 
 TOOLS = {"paint": 0, "dry": 1, "smudge": 2, "blur": 3, "eraser": 4, "mask": 4}  # mask: the eraser as a step mask
 
@@ -123,129 +129,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "default: on for --arch frame, off otherwise)")
     g.add_argument("--no-stroke-gate", action="store_true", help="New models: no per-stroke gate output")
     g.add_argument("--no-paintable-mask", action="store_true", help="New models: no paintable-mask input")
-    g.add_argument("--no-error-progress", action="store_true",
-                   help="New --step-progress models: no error-based progress input")
-    g.add_argument("--step-progress", action="store_true",
-                   help="New models: condition on step / num_steps as before, instead of only on the canvas "
-                        "(stationary: the same model fits any number of steps; needed for the canvas pool)")
-    g.add_argument("--soft-gate", action="store_true",
-                   help="New models: stroke gate as a dimmer in [0, 1] instead of on / off")
-    g.add_argument("--joint-strokes", action="store_true",
+    g.add_argument("--joint-strokes", action=argparse.BooleanOptionalAction, default=True,
                    help="New models: render each step's strokes as one order-independent operation (per pixel the "
                         "max coverage, colors mixed by coverage) instead of one after another; overlapping strokes "
                         "of a step merge seamlessly. Stored in the checkpoint, the harness renders the same way. "
                         "Works with --init-from a sequential model")
 
-    g = p.add_argument_group("painting / loss")
-    g.add_argument("--steps", type=int, default=6, help="K whole-image painting steps (unroll + validation)")
-    g.add_argument("--tile-prob", type=float, default=0.25, help="Unroll: chance a batch adds a zoomed tile step")
-    g.add_argument("--tile-size", default="0.3,0.6", help="Unroll: tile core side range (fraction of the image)")
-    g.add_argument("--tile-margin", type=float, default=0.25,
-                   help="Unroll: context margin around tile cores (fraction of the core, per side); strokes "
-                        "outside the core are faded as in the high-res harness (with a paintable-mask model)")
-    g.add_argument("--outside-penalty", type=float, default=0.0,
-                   help="Unroll: extra cost for stroke footprint reaching past the paintable core (tile steps). "
-                        "Experimental: the edge fade already pulls strokes inward, and at 0.1 the model learned "
-                        "to shrink all tile strokes to the minimum radius instead")
-    g.add_argument("--val-tile-steps", type=int, default=1,
-                   help="Validation: extra 2x2-tile steps (with context margin for paintable-mask models)")
-    g.add_argument("--val-long-steps", type=int, default=128,
-                   help="Validation: also paint this many whole-image steps and log PSNR along the way, drift "
-                        "from the best point and strokes still painted at the end; selects best.pt (0 = off)")
-    g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
-    g.add_argument("--step-ramp", type=float, default=0.0,
-                   help="Unroll: earlier steps' weight = --intermediate-weight x ((k + 1) / steps) ** this, so the "
-                        "first steps are judged more by where the painting ends up than by their own result "
-                        "(room for a bold block-in that later steps refine). 0 = all earlier steps alike")
-    g.add_argument("--start-mix", default="blank:1",
+    g = p.add_argument_group("painting")
+    g.add_argument("--steps", type=int, default=12, help="K whole-image painting steps (unroll + validation)")
+    g.add_argument("--start-mix", default="blank:0.2,warmup:0.3,degraded:0.2,touchup:0.3",
                    help="Unroll: start canvases per batch, as kind:weight pairs. 'blank' = empty canvas, "
                         "'warmup' = the model first paints 1..--rollout-max steps without gradients, "
                         "'degraded' = the target with synthetic painting mistakes (see degrade.py), "
                         "'touchup' = a nearly finished painting with a few small differences from its target "
                         "(lines, shapes, hatching, dots, small fills / gradients, missing fine detail), either "
-                        "painted on the canvas or added to the target (--touchup-add). "
-                        "E.g. blank:0.2,warmup:0.3,degraded:0.25,touchup:0.25")
-    g.add_argument("--rollout-max", type=int, default=12,
+                        "painted on the canvas or added to the target (--touchup-add)")
+    g.add_argument("--rollout-max", type=int, default=24,
                    help="Unroll: max warm-up steps (and steps a degraded start counts as already painted)")
     g.add_argument("--degrade-strength", type=float, default=1.0, help="Unroll: how much degraded starts deviate")
     g.add_argument("--touchup-add", type=float, default=0.5,
                    help="Unroll: share of touch-up starts whose details are added to the target (the model must paint "
                         "them; the rest have them on the canvas, to be painted away)")
-    g.add_argument("--detach-canvas", action="store_true", help="Unroll: no gradient through earlier steps")
-    g.add_argument("--grad-through-inputs", action="store_true",
-                   help="Unroll: also backprop through the canvas the model looks at (unstable: explodes "
-                        "over several steps); by default earlier steps get gradients via the renderer only")
-    g.add_argument("--pool-size", type=int, default=0,
-                   help="Unroll: paintings kept between batches and painted on further, e.g. 512 (0 = always "
-                        "start over; needs a stationary model). ~0.5 MB GPU memory each at --image-size 128. "
-                        "Experimental: at 128 px paintings saturate after a few dozen steps, and it has not beaten "
-                        "fresh starts yet")
-    g.add_argument("--pool-reset", type=float, default=0.05,
-                   help="Unroll: chance per image and batch that a pool painting is replaced by a fresh start "
-                        "(--start-mix). Sets the depth spread: median ~0.7/x batch visits, 10%% beyond 2.3/x")
-    g.add_argument("--pool-min-gain", type=float, default=0.1,
-                   help="Unroll: pool paintings whose last batch gained less PSNR than this (dB) are replaced "
-                        "by fresh starts: finished paintings teach nothing but 'don't touch it', and with most "
-                        "of a batch saying so, the model learned to paint timid soft strokes, then none")
-    g.add_argument("--pool-fast-forward", type=int, default=0,
-                   help="Unroll: extra steps without gradients on each painting before it goes back into the "
-                        "pool (reaches deep canvases faster, at their cost)")
-    g.add_argument("--detail-weight", type=float, default=1.0)
-    g.add_argument("--edge-loss", action="store_true",
-                   help="Add an L1 loss on image gradients (Sobel) that rewards sharp, correctly placed edges")
-    g.add_argument("--edge-weight", type=float, default=1.0, help="Weight of the edge loss (with --edge-loss)")
-    g.add_argument("--flat-loss", action="store_true",
-                   help="Add a loss matching local variation (std) so flat target areas stay flat, not mottled")
-    g.add_argument("--flat-weight", type=float, default=1.0, help="Weight of the flatness loss (with --flat-loss)")
-    g.add_argument("--robust-loss", action="store_true",
-                   help="Saturating full-resolution error instead of L1 (lightness counts double): painting over "
-                        "already-wrong pixels is cheap, breaking right ones is expensive; favors bold early "
-                        "strokes and crisp over soft edges")
-    g.add_argument("--robust-tau", type=float, default=0.1,
-                   help="Error at which the robust loss is half saturated (it is capped at this value); also the "
-                        "color error at which --forgive-edges counts spurious edges half")
-    g.add_argument("--hard-edge-reward", type=float, default=0.0,
-                   help="Unroll: pushes strokes towards hard edges where the target is sharp along their border, "
-                        "e.g. 0.05. Strokes in soft / flat areas are left free")
-    g.add_argument("--value-weight", type=float, default=0.0,
-                   help="Weight of a lightness-only loss over full resolution and the coarse scales, e.g. 1")
-    g.add_argument("--texture-weight", type=float, default=0.0,
-                   help="Weight of a texture-statistics loss (energy, direction and coherence of the fine detail "
-                        "in soft windows, not where each mark sits), e.g. 40. Use it with --shift-detail-weight: "
-                        "alone (or with only weak exact terms) it is satisfied by busy, wrongly colored strokes")
-    g.add_argument("--texture-window", type=float, default=16.0, help="Window std of the texture loss, px")
-    g.add_argument("--texture-bands", default="0.7,1.5,3",
-                   help="Blur scales (px) splitting the image into the texture loss's frequency bands")
-    g.add_argument("--shift-detail-weight", type=float, default=0.0,
-                   help="Weight of a shift-tolerant fine-detail loss: each 7 px patch of the fine detail must match "
-                        "the target's somewhere within --shift-radius px (both ways), so moved detail is free but "
-                        "wrong detail costs more than none, e.g. 20. Recommended loss for loose but clean detail: "
-                        "--detail-weight 0 --scales 16,32 --scale-weights 0.2,1 --shift-detail-weight 20 "
-                        "--texture-weight 40 (check variants with scripts/loss_check.py)")
-    g.add_argument("--shift-radius", type=int, default=3, help="How far (px) detail may move for free")
-    g.add_argument("--shift-sigma", type=float, default=1.5, help="Blur scale (px) below which detail counts as fine")
-    g.add_argument("--simplify-size", type=int, default=0,
-                   help="Block in first: judge each area by its large shapes (the target with everything smaller "
-                        "than this many view px removed by median filters, hard edges of larger shapes kept) until "
-                        "they are right, then by all terms (readiness per pixel, never 0: details always count a "
-                        "little). Small things are ignored while an area is wrong, soft edges on big shapes are "
-                        "not. E.g. 9. Validation, best.pt, best-of and --worse-weight use the loss without it "
-                        "(its value is not monotone)")
-    g.add_argument("--simplify-passes", type=int, default=2, help="Median passes of --simplify-size")
-    g.add_argument("--readiness-tau", type=float, default=0.05,
-                   help="--simplify-size: color error of the simplified canvas at which details count half; "
-                        "larger = details come in earlier")
-    g.add_argument("--simplify-weight", type=float, default=10.0,
-                   help="--simplify-size: weight of the block-in term (10 suits the loose recipe's detail weights)")
-    g.add_argument("--forgive-edges", action="store_true",
-                   help="Edges / texture the target doesn't have only count where the colors around are already "
-                        "roughly right: a crisp stroke over a still-wrong area is judged by its color")
-    g.add_argument("--stroke-cost", type=float, default=0.0,
-                   help="Cost per active stroke (mean stroke gate) so steps leave out strokes they don't need. "
-                        "With the relative loss it is a share of the remaining error: 0.02 = a batch's steps "
-                        "with all strokes on must remove 2%% of the error left. Experimental: every cost tried "
-                        "so far eventually switched all strokes off (off strokes get no gradient for position "
-                        "and color, so turning them back on never pays off)")
+    g.add_argument("--tile-prob", type=float, default=0.25, help="Unroll: chance a batch adds a zoomed tile step")
+    g.add_argument("--tile-size", default="0.3,0.6", help="Unroll: tile core side range (fraction of the image)")
+    g.add_argument("--tile-margin", type=float, default=0.25,
+                   help="Unroll: context margin around tile cores (fraction of the core, per side); strokes "
+                        "outside the core are faded as in the high-res harness (with a paintable-mask model)")
+    g.add_argument("--intermediate-weight", type=float, default=0.3, help="Unroll: loss weight of earlier steps")
+    g.add_argument("--placement-spread", type=float, default=1.0,
+                   help="Unroll: penalty for pairs of strokes whose placement maps nearly coincide (Bhattacharyya "
+                        "overlap above 0.5; logged as `overlap`, the mean over pairs). Without it the plan model's "
+                        "strokes piled onto the same few pixels within a few hundred steps")
     g.add_argument("--length-bias", type=float, default=0.0,
                    help="Unroll: painterly bias towards longer strokes, relative to each step's loss: doubling the "
                         "length of every visible stroke is worth 0.69 x this share of the step's loss (log of the "
@@ -255,17 +169,54 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--size-bias", type=float, default=0.0,
                    help="Unroll: the same towards larger brushes (log radius). Width costs detail, unlike length, "
                         "so keep it below --length-bias, e.g. 0.005. Logged: stroke_radius (view pixels)")
-    g.add_argument("--placement-spread", type=float, default=0.0,
-                   help="Unroll: penalty for pairs of strokes whose placement maps nearly coincide (Bhattacharyya "
-                        "overlap above 0.5; logged as `overlap`, the mean over pairs), e.g. 1. Without it the "
-                        "plan model's strokes piled onto the same few pixels within a few hundred steps")
-    g.add_argument("--no-relative-loss", action="store_true",
-                   help="Unroll: plain loss instead of each image's loss relative to its loss at the start of "
-                        "the batch (relative: deep canvases with little error left still get a strong signal)")
-    g.add_argument("--worse-weight", type=float, default=1.0,
-                   help="Unroll: extra loss for steps that make the painting worse than before the step")
-    g.add_argument("--scales", default="4,16")
-    g.add_argument("--scale-weights", default="1,1")
+    g.add_argument("--checkpoint-steps", action=argparse.BooleanOptionalAction, default=True,
+                   help="Unroll: recompute each painting step in backward, keeping only the canvas between steps "
+                        "(the full gradient in a fraction of the memory, at ~1.3x compute)")
+    g.add_argument("--num-stamps", type=int, default=16, help="Curve samples per stroke in the renderer")
+    g.add_argument("--no-checkpoint-strokes", action="store_true", help="Faster, but much more memory")
+    g.add_argument("--val-tile-steps", type=int, default=1,
+                   help="Validation: extra 2x2-tile steps (with context margin for paintable-mask models)")
+    g.add_argument("--val-long-steps", type=int, default=128,
+                   help="Validation: also paint this many whole-image steps and log PSNR along the way, drift "
+                        "from the best point and strokes still painted at the end; selects best.pt (0 = off)")
+
+    g = p.add_argument_group("loss (a --loss preset; the options below override single values)")
+    g.add_argument("--loss", choices=sorted(LOSS_PRESETS), default=None,
+                   help="'loose' (default for unroll): block in large shapes with hard edges first, then detail that "
+                        "may move a few px, judged by texture statistics rather than exact pixels. 'pixel' (default "
+                        "for teacher): exact L1 at full resolution and two coarse scales, plus edges and lightness")
+    g.add_argument("--detail-weight", type=float, default=None, help="Exact full-resolution L1")
+    g.add_argument("--scales", default=None, help="Coarse scales (pooling factors), e.g. 16,32")
+    g.add_argument("--scale-weights", default=None, help="Their weights, e.g. 0.2,1")
+    g.add_argument("--edge-weight", type=float, default=None, help="L1 on image gradients (sharp, placed edges)")
+    g.add_argument("--value-weight", type=float, default=None,
+                   help="Lightness-only loss over full resolution and the coarse scales")
+    g.add_argument("--texture-weight", type=float, default=None,
+                   help="Texture statistics (energy, direction and coherence of the fine detail in soft windows, "
+                        "not where each mark sits). Needs --shift-detail-weight: alone it is satisfied by busy, "
+                        "wrongly colored strokes")
+    g.add_argument("--shift-detail-weight", type=float, default=None,
+                   help="Shift-tolerant fine detail: each 7 px patch of the fine detail must match the target's "
+                        "somewhere within --shift-radius px (both ways), so moved detail is free but wrong detail "
+                        "costs more than none (check variants with scripts/loss_check.py)")
+    g.add_argument("--simplify-size", type=int, default=None,
+                   help="Block in first: judge each area by its large shapes (the target with everything smaller "
+                        "than this many view px removed by median filters, hard edges of larger shapes kept) until "
+                        "they are right, then by all terms (readiness per pixel, never 0: details always count a "
+                        "little). 0 = off. Validation and best.pt use the loss without it (its value is not "
+                        "monotone)")
+    g.add_argument("--simplify-weight", type=float, default=10.0, help="--simplify-size: weight of the block-in term")
+    g.add_argument("--texture-window", type=float, default=16.0, help="Window std of the texture loss, px")
+    g.add_argument("--texture-bands", default="0.7,1.5,3",
+                   help="Blur scales (px) splitting the image into the texture loss's frequency bands")
+    g.add_argument("--shift-radius", type=int, default=3, help="How far (px) detail may move for free")
+    g.add_argument("--shift-sigma", type=float, default=1.5, help="Blur scale (px) below which detail counts as fine")
+    g.add_argument("--simplify-passes", type=int, default=2, help="Median passes of --simplify-size")
+    g.add_argument("--readiness-tau", type=float, default=0.05,
+                   help="--simplify-size: color error of the simplified canvas at which details count half; "
+                        "larger = details come in earlier")
+
+    g = p.add_argument_group("teacher mode")
     g.add_argument("--teacher-tail", type=int, default=2,
                    help="Teacher: predict one of the last K groups of N strokes (1 = the final, fully visible "
                         "strokes); 0 = any group, including the first strokes of a blank canvas")
@@ -279,26 +230,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--heatmap-weight", type=float, default=0.1,
                    help="Teacher: cross-entropy of placement maps against ground-truth stroke midpoints")
     g.add_argument("--heatmap-sigma", type=float, default=1.5, help="Teacher: heatmap target width (view px)")
-    g.add_argument("--num-stamps", type=int, default=16, help="Curve samples per stroke in the renderer")
-    g.add_argument("--no-checkpoint-strokes", action="store_true", help="Faster, but much more memory")
-    g.add_argument("--best-of", type=int, default=1,
-                   help="Unroll: paint each window this many times with different random draws (no gradient), "
-                        "train on each image's best attempt (by its loss at the end of the window). Attempts "
-                        "differ by --placement-noise and the hard gate's draws")
-    g.add_argument("--placement-noise", type=float, default=0.0,
-                   help="Training: Gumbel noise scale on the placement logits, so each stroke leans towards one "
-                        "of its map's good spots per draw (e.g. 1); positions stay continuous, no noise at inference")
-    g.add_argument("--checkpoint-steps", action="store_true",
-                   help="Unroll: recompute each painting step in backward, keeping only the canvas between "
-                        "steps: long unrolls (--steps 32+) fit in memory, with the full gradient, at ~1.3x compute")
 
     g = p.add_argument_group("optimization")
     g.add_argument("--epochs", type=int, default=20)
     g.add_argument("--steps-per-epoch", type=int, default=500, help="Batches per epoch (folder: capped by size)")
     g.add_argument("--batch-size", type=int, default=16)
-    g.add_argument("--lr", type=float, default=3e-4)
+    g.add_argument("--lr", type=float, default=None, help="Default: 3e-4 from scratch, 1e-4 with --init-from")
+    g.add_argument("--warmup-steps", type=int, default=None, help="Default: 500 from scratch, 100 with --init-from")
     g.add_argument("--weight-decay", type=float, default=0.02)
-    g.add_argument("--warmup-steps", type=int, default=500)
     g.add_argument("--min-lr-ratio", type=float, default=0.05, help="Cosine schedule floor")
     g.add_argument("--grad-clip", type=float, default=1.0)
     g.add_argument("--ema", type=float, default=0.999, help="EMA decay for eval weights (0 disables)")
@@ -312,8 +251,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--select-by", choices=("auto", "psnr", "loss"), default="auto",
                    help="What picks best.pt: validation PSNR, or the validation loss under the training loss (of "
                         "the --val-long-steps painting, if measured). auto = the loss with --shift-detail-weight / "
-                        "--texture-weight / --simplify-size (PSNR rewards soft, hedged paintings those losses train away from), else "
-                        "PSNR")
+                        "--texture-weight / --simplify-size (PSNR rewards the soft, hedged paintings those losses "
+                        "train away from), else PSNR")
     g.add_argument("--preview-image", nargs="+", default=None, metavar="PATH",
                    help="Image(s) painted after every epoch at --image-size; saved to <out>/previews/")
     g.add_argument("--preview-steps", type=int, default=None, help="Painting steps for previews (default: --steps)")
@@ -321,7 +260,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--log-every", type=int, default=25, help="Step log interval")
     g.add_argument("--seed", type=int, default=0)
     g.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # Loss preset, then single overrides; resolved here so args.json records the values the run used
+    args.loss = args.loss or ("pixel" if args.mode == "teacher" else "loose")
+    for k, v in LOSS_PRESETS[args.loss].items():
+        if getattr(args, k) is None:
+            setattr(args, k, v)
+    fine_tune = args.init_from is not None
+    if args.lr is None:
+        args.lr = 1e-4 if fine_tune else 3e-4
+    if args.warmup_steps is None:
+        args.warmup_steps = 100 if fine_tune else 500
+    return args
 
 
 def _pair(text: str, cast=float):
@@ -382,62 +332,6 @@ def infinite(loader: DataLoader) -> Iterator[torch.Tensor]:
         yield from loader
 
 
-class CanvasPool:
-    """
-    Paintings (target, paint layer, steps painted so far) that unroll training keeps painting on across
-    batches, as in the sample pool of "Growing Neural Cellular Automata": each batch continues some of them
-    for a short unroll and puts them back, so the model sees canvases hundreds of steps deep, painted by
-    itself, and learns to keep improving them (or to stop) instead of only the first steps of a painting.
-    Kept on the training device.
-    """
-
-    def __init__(self, size: int, image_size: int, device: torch.device, target_size: Optional[int] = None):
-        self.targets = torch.zeros(size, 3, image_size, image_size, device=device)
-        # the targets at --target-size too, when the target U-Net reads them at a higher resolution
-        self.targets_hr = (torch.zeros(size, 3, target_size, target_size, device=device)
-                           if target_size and target_size > image_size else None)
-        self.layers = torch.zeros(size, 4, image_size, image_size, device=device)
-        self.depth = torch.zeros(size, dtype=torch.long, device=device)
-        self.gain = torch.zeros(size, device=device)  # PSNR gained on the last visit
-        self.filled = 0
-
-    @property
-    def size(self) -> int:
-        return self.targets.shape[0]
-
-    def draw(self, B: int, reset: float, gen: torch.Generator, min_gain: float = float("-inf")):
-        """
-        Slots `(B,)` for a batch and which of them start fresh `(B,)`: the next empty slots while the pool
-        fills up (all fresh), then random slots, each replaced by a fresh start with probability `reset` or
-        when it gained less than `min_gain` dB on its last visit (stagnant: finished, or stuck).
-        """
-        dev = self.targets.device
-        if self.filled < self.size:
-            slots = torch.arange(self.filled, self.filled + B, device=dev) % self.size
-            self.filled = min(self.size, self.filled + B)
-            return slots, torch.ones(B, dtype=torch.bool, device=dev)
-        slots = torch.randperm(self.size, generator=gen, device=dev)[:B]
-        fresh = (torch.rand(B, generator=gen, device=dev) < reset) | (self.gain[slots] < min_gain)
-        return slots, fresh
-
-    def get(self, slots: torch.Tensor):
-        """(targets, layers, depth, high-res targets or None)"""
-        hr = None if self.targets_hr is None else self.targets_hr[slots]
-        return self.targets[slots], self.layers[slots], self.depth[slots], hr
-
-    def put(self, slots: torch.Tensor, targets: torch.Tensor, layers: torch.Tensor, depth: torch.Tensor,
-            gain: torch.Tensor, targets_hr: Optional[torch.Tensor] = None):
-        self.targets[slots], self.layers[slots], self.depth[slots] = targets, layers.detach(), depth
-        if self.targets_hr is not None:
-            self.targets_hr[slots] = targets_hr
-        self.gain[slots] = gain
-
-    def stats(self) -> Dict[str, float]:
-        d = self.depth[: self.filled].float()
-        return {"pool_depth_mean": d.mean().item(), "pool_depth_p90": torch.quantile(d, 0.9).item(),
-                "pool_depth_max": d.max().item()}
-
-
 # ----------------------------------------------------------------------------------------------------
 class Trainer:
     def __init__(self, args: argparse.Namespace):
@@ -467,16 +361,15 @@ class Trainer:
         else:
             plan, frame = args.arch == "plan", args.arch == "frame"
             if frame and not args.joint_strokes:
-                raise SystemExit("--arch frame paints joint steps: add --joint-strokes")
+                raise SystemExit("--arch frame paints joint steps: drop --no-joint-strokes")
             if "mask" in names and not args.joint_strokes:
-                raise SystemExit("the mask tool only exists within joint steps: add --joint-strokes")
+                raise SystemExit("the mask tool only exists within joint steps: drop --no-joint-strokes")
             self.model_config = dict(
                 num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
                 global_blocks=args.global_blocks or (6 if plan else 3 if frame else 2),
                 query_blocks=args.query_blocks or (4 if plan else 2),
-                paintable_mask=not args.no_paintable_mask, stationary=not args.step_progress,
-                error_progress=args.step_progress and not args.no_error_progress,  # stationary: built in
-                hard_gate=not args.no_stroke_gate and not args.soft_gate,
+                paintable_mask=not args.no_paintable_mask, stationary=True, error_progress=False,
+                hard_gate=not args.no_stroke_gate,
             )
             if plan:
                 self.model_config.update(arch="plan", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
@@ -503,35 +396,28 @@ class Trainer:
         ).to(self.device).train()
         self.engine.grad_tools = list(self.tools)  # only these tools' passes need to run for their gradients
         self.model = build_model(self.model_config).to(self.device)
-        self.model.placement_noise = args.placement_noise
         self.N = self.model.num_strokes
         self.ema = EMA(self.model, args.ema) if args.ema > 0 else None
 
         amp = torch.bfloat16 if args.amp == "bf16" else None
         ckpt_strokes = not args.no_checkpoint_strokes
-        self.painter = Painter(self.model, self.engine, args.view_res, self.tools, amp, ckpt_strokes,
-                               grad_through_inputs=args.grad_through_inputs)
+        self.painter = Painter(self.model, self.engine, args.view_res, self.tools, amp, ckpt_strokes)
         eval_model = self.ema.model if self.ema else self.model
         self.eval_painter = Painter(eval_model, self.engine, args.view_res, self.tools, amp, checkpoint_strokes=False)
 
         scales = [int(s) for s in args.scales.split(",") if s]
         weights = [float(w) for w in args.scale_weights.split(",") if w]
         loss_kw = dict(
-            edge_weight=args.edge_weight if args.edge_loss else 0.0,
-            flat_weight=args.flat_weight if args.flat_loss else 0.0,
-            robust_tau=args.robust_tau if args.robust_loss else 0.0, value_weight=args.value_weight,
-            forgive_tau=args.robust_tau if args.forgive_edges else 0.0,
-            texture_weight=args.texture_weight, texture_window=args.texture_window,
+            edge_weight=args.edge_weight, value_weight=args.value_weight, texture_weight=args.texture_weight, texture_window=args.texture_window,
             texture_bands=[float(b) for b in args.texture_bands.split(",") if b],
             shift_detail_weight=args.shift_detail_weight, shift_radius=args.shift_radius, shift_sigma=args.shift_sigma,
         )
         self.loss_fn = MultiScalePaintLoss(
-            args.detail_weight, scales, weights, simplify_size=getattr(args, "simplify_size", 0),
-            simplify_passes=getattr(args, "simplify_passes", 2), readiness_tau=getattr(args, "readiness_tau", 0.05),
-            simplify_weight=getattr(args, "simplify_weight", 10.0), **loss_kw,
+            args.detail_weight, scales, weights, simplify_size=args.simplify_size, simplify_passes=args.simplify_passes,
+            readiness_tau=args.readiness_tau, simplify_weight=args.simplify_weight, **loss_kw,
         )
-        # Comparing canvases (validation, best.pt, best-of, worse-than-before) needs a monotone loss: the
-        # training loss without the block-in readiness (whose value rises as areas get ready)
+        # Comparing canvases (validation, best.pt) needs a monotone loss: the training loss without the block-in
+        # readiness (whose value rises as areas get ready)
         self.eval_loss_fn = (MultiScalePaintLoss(args.detail_weight, scales, weights, **loss_kw)
                              if self.loss_fn.simplify_size > 0 else self.loss_fn)
 
@@ -546,12 +432,6 @@ class Trainer:
         if self.ST > self.S and not getattr(self.model, "target_unet", False):
             raise SystemExit("--target-size above --image-size only feeds a target U-Net (--arch frame --target-unet)")
         self._setup_data()
-        self.pool = None
-        if args.mode == "unroll" and args.pool_size > 0:
-            if self.model.stationary:
-                self.pool = CanvasPool(max(args.pool_size, args.batch_size), self.S, self.device, self.ST)
-            else:
-                print("note: canvas pool off (needs a stationary model; this one conditions on step progress)")
         self.start_kinds, weights = [], []
         for part in args.start_mix.split(","):
             kind, _, w = part.partition(":")
@@ -574,7 +454,7 @@ class Trainer:
         self.select_by = args.select_by
         if self.select_by == "auto":
             self.select_by = ("loss" if args.shift_detail_weight > 0 or args.texture_weight > 0
-                              or getattr(args, "simplify_size", 0) > 0 else "psnr")
+                              or args.simplify_size > 0 else "psnr")
         self.history: List[Dict] = []
         if resume is not None:
             self._load_resume(resume)
@@ -757,49 +637,24 @@ class Trainer:
 
     @torch.no_grad()
     def batch_start(self, window: int):
-        """
-        Targets and start paint layers of an unroll batch, the steps already painted on each `(B,)`, and the
-        pool slots to put the results back into (None without a pool). Without a pool every batch starts
-        over (--start-mix); with one, most images continue a pool painting and a --pool-reset share starts
-        fresh.
-        """
-        B = self.args.batch_size
-        if self.pool is None:
-            target, target_hr = self.next_targets()
-            layer, done, _, target, target_hr = self.start_canvas(target, window, target_hr)
-            return target, layer, torch.full((B,), done, device=self.device), None, target_hr
-        slots, fresh = self.pool.draw(B, self.args.pool_reset, self.gen, self.args.pool_min_gain)
-        target, layer, depth, target_hr = self.pool.get(slots)
-        n = int(fresh.sum())
-        if n:
-            new_target, new_hr = self.next_targets()
-            new_target, new_hr = new_target[:n], None if new_hr is None else new_hr[:n]
-            new_layer, done, _, new_target, new_hr = self.start_canvas(new_target, window, new_hr)
-            target[fresh], layer[fresh], depth[fresh] = new_target, new_layer, done
-            if target_hr is not None:
-                target_hr[fresh] = new_hr
-        return target, layer, depth, slots, target_hr
+        """Targets and start paint layers of an unroll batch (--start-mix), the steps already painted on each
+        `(B,)` and the targets at --target-size (or None)."""
+        target, target_hr = self.next_targets()
+        layer, done, _, target, target_hr = self.start_canvas(target, window, target_hr)
+        return target, layer, torch.full((target.shape[0],), done, device=self.device), target_hr
 
     def unroll_batch(self) -> Dict[str, torch.Tensor]:
         a = self.args
         tile = torch.rand((), generator=self.gen, device=self.device).item() < a.tile_prob
         window = a.steps + int(tile)
-        target, layer, depth, slots, target_hr = self.batch_start(window)
+        target, layer, depth, target_hr = self.batch_start(window)
         B, S = target.shape[0], target.shape[-1]
         total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
-        loss, weight_sum, entropy, hardness, gates, outside, gate_range, worse = 0.0, 0.0, [], [], [], [], [], []
-        soft_edges, overlap, crowding, shape_bias, shape_stats = [], [], [], [], []
+        loss, weight_sum, entropy, hardness, gates, outside, gate_range = 0.0, 0.0, [], [], [], [], []
+        overlap, crowding, shape_bias, shape_stats = [], [], [], []
         shaped = a.length_bias > 0 or a.size_bias > 0
         with torch.no_grad():
-            pyramid = sharpness_pyramid(target) if a.hard_edge_reward > 0 else None
-            start = self.painter.composite(layer)
-            start_psnr = psnr(start, target)  # (B,)
-            prev = self.eval_loss_fn(start, target, per_sample=True)[0]  # (B,) loss before each step
-        # Relative loss: each image's loss in units of its loss at the start of this batch, so a deep painting
-        # with little error left counts as much as a blank one. The stroke cost is then relative too: a step
-        # must remove a share of the error that is left, which keeps fine strokes worth it late in a painting
-        # (an absolute cost outweighed everything a deep painting could still gain and switched all strokes off)
-        scale = 1.0 / prev.clamp(min=1e-4) if not a.no_relative_loss else torch.ones_like(prev)
+            start_psnr = psnr(self.painter.composite(layer), target)  # (B,)
 
         tile_boxes = tile_cores = None
         if tile:  # one zoomed tile per image in the last step: a core plus context margin around it
@@ -815,59 +670,39 @@ class Trainer:
                 tile_boxes = tile_cores.unsqueeze(1)
                 tile_cores = None
 
-        def step_views(k: int):
-            if tile and k == window - 1:
-                return tile_boxes, tile_cores
-            return None, None
-
         if getattr(self.model, "target_unet", False):  # one target encoding for all steps, outside their checkpoints
             self.painter.target_features(target, views.whole_image_boxes(B, self.device), target_hr=target_hr)
             if tile:
                 self.painter.target_features(target, tile_boxes.reshape(-1, 3), repeat=tile_boxes.shape[1],
                                              target_hr=target_hr)
 
-        forced = (self._best_of_draws(target, layer, depth, total, window, step_views, target_hr)
-                  if a.best_of > 1 else None)
-
         for k in range(window):
             progress = (depth + k).float() / total
-            boxes, cores = step_views(k)
+            last = k == window - 1
+            boxes, cores = (tile_boxes, tile_cores) if tile and last else (None, None)
             step_args = (target, layer, progress, boxes, None if cores is None else cores.unsqueeze(1))
-            draws = None if forced is None else forced[k]
             if a.checkpoint_steps:  # same random gate / tool samples in the recomputation (RNG state is kept)
                 res = torch.utils.checkpoint.checkpoint(self.painter.step, *step_args, margin=a.tile_margin,
-                                                        samples=draws, target_hr=target_hr, use_reentrant=False)
+                                                        target_hr=target_hr, use_reentrant=False)
             else:
-                res = self.painter.step(*step_args, margin=a.tile_margin, samples=draws, target_hr=target_hr)
+                res = self.painter.step(*step_args, margin=a.tile_margin, target_hr=target_hr)
             layer = res.layer
             entropy.append(res.output.anchor_entropy.mean().detach())
             hardness.append(res.output.strokes.hardness.mean().detach())
-            gates.append(res.gate.mean())
+            gates.append(res.gate.mean().detach())
             mean_ov, crowd = placement_overlap(res.output.placement_logits)
             overlap.append(mean_ov.detach())
             crowding.append(crowd)
-            if pyramid is not None:  # softness of visible strokes where the target is sharp around them
-                st = views.from_engine_params(res.params, self.engine)
-                vis = st.opacity.mean(-1).detach()
-                want = stroke_edge_sharpness(pyramid, st.points.detach(), st.radii.detach())
-                soft_edges.append((vis * want * (1.0 - st.hardness[..., 0])).sum() / vis.sum().clamp(min=1e-6))
             if res.output.gate_logit is not None:  # keep gate logits in range so off-gates can come back
                 over = (res.output.gate_logit.abs() - GATE_LOGIT_RANGE).clamp(min=0.0)
                 gate_range.append((over * over).mean())
-            if res.reach is not None:  # footprint past the core, in margin widths
+            if res.reach is not None:  # footprint past the core, in margin widths (logged)
                 width = a.tile_margin * cores[:, 2:3] / boxes[:, 0, 2:3]
-                # Not weighted by the gate: switching strokes off must not be a way around it (that made
-                # tile steps collapse to all-off); only keeping strokes inside the core avoids it
-                outside.append((res.reach / width.clamp(min=1e-3)).clamp(max=2.0).mean())
+                outside.append((res.reach / width.clamp(min=1e-3)).clamp(max=2.0).mean().detach())
 
-            last = k == window - 1
             canvas = self.painter.composite(layer)
             full, terms = self.loss_fn(canvas, target, per_sample=True)
-            if a.worse_weight > 0:  # a step should never make the painting worse
-                now = full if self.eval_loss_fn is self.loss_fn else self.eval_loss_fn(canvas, target, per_sample=True)[0]
-                worse.append((now - prev).clamp(min=0.0))
-                prev = now.detach()
-            w = 1.0 if last else a.intermediate_weight * ((k + 1) / window) ** a.step_ramp
+            w = 1.0 if last else a.intermediate_weight
             if w > 0:
                 step_loss = full
                 if boxes is not None:  # emphasize the zoomed region the tile step painted
@@ -885,86 +720,26 @@ class Trainer:
                 vw = visible / visible.sum(-1, keepdim=True).clamp(min=1e-6)
                 chord = (st.points[:, :, 2] - st.points[:, :, 0]).norm(dim=-1)
                 shape_stats.append(torch.stack([(vw * chord).sum(-1).mean(), (vw * st.radii.mean(-1)).sum(-1).mean()]))
-            if a.detach_canvas and not last:
-                layer = layer.detach()
 
-        loss = (scale * loss).mean() / weight_sum
-        if worse:
-            loss = loss + a.worse_weight * (scale * torch.stack(worse).mean(0)).mean()
-        mean_gate = torch.stack(gates).mean()
-        if self.model.stroke_gate and a.stroke_cost > 0:
-            loss = loss + a.stroke_cost * mean_gate
-        if outside and a.outside_penalty > 0:
-            loss = loss + a.outside_penalty * torch.stack(outside).mean()
+        loss = loss.mean() / weight_sum
         if gate_range:
             loss = loss + 0.01 * torch.stack(gate_range).mean()
-        if soft_edges:
-            loss = loss + a.hard_edge_reward * torch.stack(soft_edges).mean()
         if shape_bias:
-            loss = loss + (scale * torch.stack(shape_bias).mean(0)).mean()
+            loss = loss + torch.stack(shape_bias).mean()
         if a.placement_spread > 0:
             loss = loss + a.placement_spread * torch.stack(crowding).mean()
         with torch.no_grad():
-            final = self.painter.composite(layer)
-            gain = psnr(final, target) - start_psnr  # (B,)
-            metrics = {"psnr": psnr(final, target).mean(), "entropy": torch.stack(entropy).mean(),
+            final_psnr = psnr(self.painter.composite(layer), target)
+            metrics = {"psnr": final_psnr.mean(), "entropy": torch.stack(entropy).mean(),
                        "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr.mean(),
-                       "gate": mean_gate.detach(), "depth": depth.float().mean(),
-                       "overlap": torch.stack(overlap).mean()}
+                       "gate": torch.stack(gates).mean(), "depth": depth.float().mean(),
+                       "overlap": torch.stack(overlap).mean(),
+                       "gain": (final_psnr - start_psnr).mean()}  # improvement of this window over its start
             if outside:
-                metrics["outside"] = torch.stack(outside).mean().detach()
-            if worse:
-                metrics["worse"] = torch.stack(worse).mean().detach()
-            if soft_edges:
-                metrics["soft_edges"] = torch.stack(soft_edges).mean().detach()
-            if shape_stats:
-                metrics["stroke_len"], metrics["stroke_radius"] = torch.stack(shape_stats).mean(0) * (a.view_res - 1)
-            metrics["gain"] = gain.mean()  # improvement of this window over its start
-            if forced is not None:  # how much better the chosen attempt was than the average one (loss units)
-                sc = self._best_of_scores
-                metrics["best_of_gain"] = ((sc.mean(0) - sc.amin(0)) * scale).mean()
+                metrics["outside"] = torch.stack(outside).mean()
+            metrics["stroke_len"], metrics["stroke_radius"] = torch.stack(shape_stats).mean(0) * (a.view_res - 1)
             metrics.update({k: torch.tensor(v) for k, v in terms.items()})
-            if slots is not None:  # back into the pool, to be continued by a later batch
-                layer, depth = layer.detach(), depth + window
-                for i in range(a.pool_fast_forward):
-                    layer = self.painter.step(target, layer, (depth + i).float() / (depth + a.pool_fast_forward),
-                                              target_hr=target_hr).layer
-                self.pool.put(slots, target, layer, depth + a.pool_fast_forward, gain, target_hr)
         return {"loss": loss, **metrics}
-
-    @torch.no_grad()
-    def _best_of_draws(self, target, layer, depth, total, window, step_views, target_hr=None) -> List[StrokeSamples]:
-        """
-        --best-of: paints the window --best-of times with independent random draws (stroke positions and
-        gates), without gradients, and returns per step the draws of each image's best attempt (lowest
-        loss at the end of the window). The training pass replays them, so it learns from the plan that
-        worked out best over the whole window rather than from the best single step.
-        """
-        a = self.args
-        attempts, scores = [], []
-        for _ in range(a.best_of):
-            cur, draws = layer, []
-            for k in range(window):
-                boxes, cores = step_views(k)
-                res = self.painter.step(target, cur, (depth + k).float() / total, boxes,
-                                        None if cores is None else cores.unsqueeze(1), margin=a.tile_margin,
-                                        target_hr=target_hr)
-                cur = res.layer
-                draws.append(res.output.samples)
-            attempts.append(draws)
-            scores.append(self.eval_loss_fn(self.painter.composite(cur), target, per_sample=True)[0])
-        self._best_of_scores = torch.stack(scores)  # (K, B) loss of each attempt at the end of the window
-        winner = self._best_of_scores.argmin(0)  # (B,)
-
-        def pick(field: str, k: int):
-            values = [getattr(att[k], field) for att in attempts]
-            if values[0] is None:
-                return None
-            stacked = torch.stack(values)  # (K, B, ...)
-            idx = winner.view(1, -1, *([1] * (stacked.dim() - 2))).expand(1, *stacked.shape[1:])
-            return stacked.gather(0, idx)[0]
-
-        return [StrokeSamples(pick("place_seed", k), pick("gate_on", k)) for k in range(window)]
 
     def train_step(self) -> Dict[str, float]:
         self.model.train()
@@ -1188,8 +963,6 @@ class Trainer:
                 if score > self.best_score:
                     self.best_score, is_best = score, True
             row.update(self.preview(f"epoch_{epoch + 1:03d}"))
-            if self.pool is not None:
-                row.update(self.pool.stats())
             self.history.append(row)
 
             self.save(self.out / "last.pt")

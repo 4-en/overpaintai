@@ -130,8 +130,9 @@ def checkpoint_defaults(path: Path) -> Dict:
     cfg, view_res, _ = config_from_checkpoint({"args": args})
     return {"whole_steps": cfg.whole_steps, "view_res": view_res, "tile_range": list(cfg.scale_clamp),
             "train_image_size": args.get("image_size"), "data": args.get("data"),
-            # runs from before --step-progress existed condition on step / num_steps
-            "stationary": "step_progress" in args and not args["step_progress"]}
+            # runs from before --step-progress existed condition on step / num_steps; runs since --loss (which
+            # replaced the option) are always stationary
+            "stationary": args.get("step_progress") is False or "loss" in args}
 
 
 def auto_importance(img: Image.Image, mode: str, device: Optional[torch.device] = None) -> Image.Image:

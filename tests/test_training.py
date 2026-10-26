@@ -97,7 +97,7 @@ def test_log_uniform_crops_cover_all_zoom_levels():
 TINY = (
     "--model-size tiny --image-size 32 --view-res 16 --strokes-per-step 4 --target-strokes 8,12 --steps 2 "
     "--batch-size 4 --steps-per-epoch 3 --val-size 4 --warmup-steps 1 --log-every 1 --num-workers 0 "
-    "--device cpu --amp none --val-long-steps 8"
+    "--device cpu --amp none --val-long-steps 8 --start-mix blank:1"
 ).split()
 
 
@@ -109,7 +109,7 @@ def test_training_modes_checkpoints_and_resume(tmp_path, image_folder):
 
     unroll = tmp_path / "unroll"
     main(TINY + ["--mode", "unroll", "--tile-prob", "1", "--epochs", "1", "--init-from", str(teacher / "best.pt"),
-                 "--edge-loss", "--out", str(unroll)])
+                 "--loss", "pixel", "--out", str(unroll)])
     main(TINY + ["--mode", "unroll", "--epochs", "2", "--resume", str(unroll / "last.pt"), "--out", str(unroll)])
     ckpt = torch.load(unroll / "last.pt", weights_only=False)
     assert ckpt["epoch"] == 1 and ckpt["global_step"] == 6 and len(ckpt["history"]) == 2
@@ -136,37 +136,25 @@ def test_training_modes_checkpoints_and_resume(tmp_path, image_folder):
 
 def test_new_losses_tile_cores_and_quality_metrics(tmp_path):
     out = tmp_path / "features"
-    main(TINY + ["--mode", "unroll", "--tile-prob", "1", "--flat-loss", "--edge-loss", "--stroke-cost", "0.05",
-                 "--outside-penalty", "0.2", "--epochs", "1", "--out", str(out)])
+    main(TINY + ["--mode", "unroll", "--tile-prob", "1", "--loss", "pixel", "--epochs", "1", "--out", str(out)])
     hist = torch.load(out / "last.pt", weights_only=False)["history"][-1]
-    for key in ("train_flat", "train_edge", "train_gate", "train_outside", "val_sharpness", "val_strokes",
+    for key in ("train_edge", "train_value", "train_gate", "train_outside", "val_sharpness", "val_strokes",
                 "val_faint_share", "val_gain_per_100", "val_lineart_edge_err", "val_tile_gate"):
         assert key in hist, key
     cfg = torch.load(out / "last.pt", weights_only=False)["model_config"]
     assert cfg["stroke_gate"] and cfg["paintable_mask"] and cfg["stationary"] and cfg["hard_gate"]
 
 
-def test_canvas_pool_continues_paintings_and_long_validation(tmp_path):
+def test_long_validation(tmp_path):
     from overpaintai.train import Trainer, parse_args
 
-    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--pool-size", "8", "--pool-reset", "0", "--pool-min-gain", "-1000", "--tile-prob", "0",
-                                         "--start-mix", "blank:1,degraded:1", "--out", str(tmp_path / "pool")]))
-    assert trainer.pool is not None
-    for _ in range(2):  # batch size 4: two batches fill the pool, all fresh
-        trainer.train_step()
-    assert trainer.pool.filled == 8
-    first_depth = trainer.pool.depth.clone()
-    stats = [trainer.train_step() for _ in range(4)]  # no resets: every batch continues pool paintings
-    assert all(st["depth"] > 0 for st in stats)
-    assert trainer.pool.depth.sum() == first_depth.sum() + 4 * 4 * 2  # 4 batches x 4 images x 2 steps
-    assert "worse" in stats[0]
+    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--tile-prob", "0", "--start-mix", "blank:1,degraded:1",
+                                         "--out", str(tmp_path / "long")]))
+    trainer.train_step()
     long = trainer.validate_long()
     for key in ("val_long_psnr", "val_long_psnr@8", "val_long_drift", "val_long_end_strokes"):
         assert key in long, key
     assert long["val_long_drift"] >= 0
-
-    old = Trainer(parse_args(TINY + ["--mode", "unroll", "--step-progress", "--out", str(tmp_path / "old")]))
-    assert old.pool is None and not old.model.stationary  # step-conditioned models can't use the pool
 
 
 def test_per_sample_loss_matches_the_batch_loss():
@@ -242,21 +230,11 @@ def test_value_loss_and_forgiving_edges():
     assert soft(target, edged)[0] > 0.9 * strict(target, edged)[0]  # too soft is never forgiven
 
 
-def test_hardness_reward_and_step_ramp_train(tmp_path):
-    from overpaintai.train import Trainer, parse_args
-
-    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--robust-loss", "--hard-edge-reward", "0.1",
-                                         "--step-ramp", "2", "--edge-loss", "--flat-loss", "--forgive-edges",
-                                         "--value-weight", "1", "--out", str(tmp_path / "r")]))
-    stats = trainer.train_step()
-    assert "soft_edges" in stats and 0.0 <= stats["soft_edges"] <= 1.0 and math.isfinite(stats["loss"])
-
-
 def test_checkpointed_steps_give_the_same_gradient(tmp_path):
     from overpaintai.train import Trainer, parse_args
 
     grads = []
-    for extra in ([], ["--checkpoint-steps"]):
+    for extra in (["--no-checkpoint-steps"], ["--checkpoint-steps"]):
         torch.manual_seed(0)
         trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--tile-prob", "0", "--seed", "3",
                                              "--out", str(tmp_path / f"c{len(extra)}")] + extra))
@@ -264,25 +242,6 @@ def test_checkpointed_steps_give_the_same_gradient(tmp_path):
         trainer.unroll_batch()["loss"].backward()
         grads.append(torch.cat([q.grad.flatten() for q in trainer.model.parameters() if q.grad is not None]))
     assert torch.allclose(grads[0], grads[1], rtol=1e-3, atol=1e-6)
-
-
-def test_best_of_replays_each_images_best_attempt(tmp_path):
-    from overpaintai.losses import psnr  # noqa: F401
-    from overpaintai.train import Trainer, parse_args
-
-    trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--placement-noise", "1", "--best-of", "3",
-                                         "--tile-prob", "0", "--out", str(tmp_path / "b")]))
-    trainer.model.train()
-    target, layer, depth, _, _ = trainer.batch_start(trainer.args.steps)
-    total = (depth + trainer.args.steps).float()
-    forced = trainer._best_of_draws(target, layer, depth, total, trainer.args.steps, lambda k: (None, None))
-    with torch.no_grad():
-        for k in range(trainer.args.steps):
-            layer = trainer.painter.step(target, layer, (depth + k).float() / total, samples=forced[k]).layer
-        replay = trainer.loss_fn(trainer.painter.composite(layer), target, per_sample=True)[0]
-    assert torch.allclose(replay, trainer._best_of_scores.amin(0), rtol=1e-4, atol=1e-6)
-    stats = trainer.train_step()
-    assert stats["best_of_gain"] >= 0 and math.isfinite(stats["loss"])
 
 
 def test_plan_architecture_trains_in_teacher_and_unroll_mode(tmp_path):
@@ -294,8 +253,7 @@ def test_plan_architecture_trains_in_teacher_and_unroll_mode(tmp_path):
     assert cfg["arch"] == "plan" and cfg["pressure"] and cfg["refine_layers"] == 1
 
     unroll = tmp_path / "unroll"
-    main(TINY + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--tile-prob", "1", "--edge-loss",
-                 "--robust-loss", "--hard-edge-reward", "0.05", "--checkpoint-steps", "--placement-spread", "1",
+    main(TINY + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"), "--tile-prob", "1", "--loss", "pixel",
                  "--epochs", "1", "--out", str(unroll)] + plan)
     ckpt = torch.load(unroll / "last.pt", weights_only=False)
     hist = ckpt["history"][-1]
@@ -360,7 +318,7 @@ def test_frame_model_trains_with_the_mask_tool_and_paints_with_the_harness(tmp_p
 
     frame = ["--arch", "frame", "--joint-strokes", "--view-tokens", "4", "--learned-points", "2"]
     with pytest.raises(SystemExit):
-        main(TINY + ["--arch", "frame", "--epochs", "1", "--out", str(tmp_path / "x")])  # needs joint strokes
+        main(TINY + ["--arch", "frame", "--no-joint-strokes", "--epochs", "1", "--out", str(tmp_path / "x")])  # needs joint
     teacher = tmp_path / "teacher"
     main(TINY + frame + ["--mode", "teacher", "--epochs", "1", "--out", str(teacher)])
     unroll = tmp_path / "unroll"
@@ -394,11 +352,8 @@ def test_target_unet_reads_targets_above_the_canvas_resolution(tmp_path):
     teacher = tmp_path / "teacher"
     main(TINY + frame + ["--mode", "teacher", "--epochs", "1", "--out", str(teacher)])
     trainer = Trainer(parse_args(TINY + frame + ["--mode", "unroll", "--init-from", str(teacher / "best.pt"),
-                                                 "--start-mix", "touchup:1", "--pool-size", "8",
-                                                 "--out", str(tmp_path / "u")]))
-    if trainer.pool is not None:
-        assert trainer.pool.targets_hr.shape[-1] == 64
-    target, layer, depth, slots, target_hr = trainer.batch_start(trainer.args.steps)
+                                                 "--start-mix", "touchup:1", "--out", str(tmp_path / "u")]))
+    target, layer, depth, target_hr = trainer.batch_start(trainer.args.steps)
     assert target.shape[-1] == 32 and target_hr.shape[-1] == 64
     # the canvas-resolution target is the high-res one downsampled, touch-up details included
     assert torch.allclose(torch.nn.functional.interpolate(target_hr, size=(32, 32), mode="area"), target, atol=1e-5)
@@ -427,9 +382,7 @@ def test_placement_overlap_has_finite_gradients_for_peaked_maps():
 
 def test_loose_detail_losses_pick_best_by_validation_loss_and_log_detail_metrics(tmp_path):
     out = tmp_path / "loose"
-    main(TINY + ["--mode", "unroll", "--epochs", "1", "--val-long-steps", "4", "--detail-weight", "0",
-                 "--scales", "16,32", "--scale-weights", "0.2,1", "--shift-detail-weight", "20",
-                 "--texture-weight", "40", "--out", str(out)])
+    main(TINY + ["--mode", "unroll", "--epochs", "1", "--val-long-steps", "4", "--out", str(out)])  # loose: default
     ckpt = torch.load(out / "best.pt", weights_only=False)
     row = ckpt["history"][-1]
     assert ckpt["select_by"] == "loss" and ckpt["best_score"] == pytest.approx(-row["val_long_loss"])
@@ -438,19 +391,18 @@ def test_loose_detail_losses_pick_best_by_validation_loss_and_log_detail_metrics
 
     # a PSNR-selected checkpoint resumed with the loss selection starts a new best
     plain = tmp_path / "plain"
-    main(TINY + ["--mode", "unroll", "--epochs", "1", "--out", str(plain)])
+    main(TINY + ["--mode", "unroll", "--loss", "pixel", "--epochs", "1", "--out", str(plain)])
     assert torch.load(plain / "last.pt", weights_only=False)["select_by"] == "psnr"
-    main(TINY + ["--mode", "unroll", "--epochs", "2", "--select-by", "loss", "--resume", str(plain / "last.pt"),
-                 "--out", str(plain)])
+    main(TINY + ["--mode", "unroll", "--loss", "pixel", "--epochs", "2", "--select-by", "loss", "--resume",
+                 str(plain / "last.pt"), "--out", str(plain)])
     ckpt = torch.load(plain / "best.pt", weights_only=False)
     assert ckpt["select_by"] == "loss" and ckpt["epoch"] == 1
 
 
 def test_block_in_loss_trains_and_validates_without_readiness(tmp_path):
     out = tmp_path / "block"
-    main(TINY + ["--mode", "unroll", "--epochs", "1", "--val-long-steps", "4", "--detail-weight", "0",
-                 "--scales", "16,32", "--scale-weights", "0.2,1", "--shift-detail-weight", "20",
-                 "--texture-weight", "40", "--simplify-size", "5", "--out", str(out)])
+    main(TINY + ["--mode", "unroll", "--epochs", "1", "--val-long-steps", "4", "--simplify-size", "5",
+                 "--out", str(out)])
     ckpt = torch.load(out / "best.pt", weights_only=False)
     row = ckpt["history"][-1]
     assert 0 < row["train_ready"] < 1 and row["train_block"] > 0
@@ -463,3 +415,16 @@ def test_shape_bias_trains_and_logs_stroke_shape(tmp_path):
                  "--out", str(out)])
     row = torch.load(out / "last.pt", weights_only=False)["history"][-1]
     assert row["train_stroke_len"] > 0 and row["train_stroke_radius"] > 0 and math.isfinite(row["train_loss"])
+
+
+def test_loss_presets_and_fine_tune_defaults():
+    from overpaintai.train import parse_args
+
+    loose = parse_args([])
+    assert loose.loss == "loose" and loose.simplify_size == 9 and loose.detail_weight == 0 and loose.texture_weight == 40
+    assert loose.lr == 3e-4 and loose.warmup_steps == 500 and loose.joint_strokes and loose.checkpoint_steps
+    teacher = parse_args(["--mode", "teacher"])
+    assert teacher.detail_weight == 1 and teacher.simplify_size == 0 and teacher.edge_weight == 0.4
+    tuned = parse_args(["--init-from", "x.pt", "--texture-weight", "10", "--simplify-size", "0"])
+    assert tuned.lr == 1e-4 and tuned.warmup_steps == 100
+    assert tuned.texture_weight == 10 and tuned.simplify_size == 0 and tuned.shift_detail_weight == 20  # overrides
