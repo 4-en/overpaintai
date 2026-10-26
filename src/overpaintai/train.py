@@ -39,7 +39,9 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas, touchup_pair
-from overpaintai.losses import MultiScalePaintLoss, _gaussian_blur, psnr, sharpness_pyramid, stroke_edge_sharpness
+from overpaintai.losses import (
+    MultiScalePaintLoss, _gaussian_blur, psnr, sharpness_pyramid, stroke_edge_sharpness, stroke_shape_bias,
+)
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
 from overpaintai.model import GATE_LOGIT_RANGE, StrokeSamples, TransformerBlock
@@ -222,6 +224,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "--texture-weight 40 (check variants with scripts/loss_check.py)")
     g.add_argument("--shift-radius", type=int, default=3, help="How far (px) detail may move for free")
     g.add_argument("--shift-sigma", type=float, default=1.5, help="Blur scale (px) below which detail counts as fine")
+    g.add_argument("--simplify-size", type=int, default=0,
+                   help="Block in first: judge each area by its large shapes (the target with everything smaller "
+                        "than this many view px removed by median filters, hard edges of larger shapes kept) until "
+                        "they are right, then by all terms (readiness per pixel, never 0: details always count a "
+                        "little). Small things are ignored while an area is wrong, soft edges on big shapes are "
+                        "not. E.g. 9. Validation, best.pt, best-of and --worse-weight use the loss without it "
+                        "(its value is not monotone)")
+    g.add_argument("--simplify-passes", type=int, default=2, help="Median passes of --simplify-size")
+    g.add_argument("--readiness-tau", type=float, default=0.05,
+                   help="--simplify-size: color error of the simplified canvas at which details count half; "
+                        "larger = details come in earlier")
+    g.add_argument("--simplify-weight", type=float, default=10.0,
+                   help="--simplify-size: weight of the block-in term (10 suits the loose recipe's detail weights)")
     g.add_argument("--forgive-edges", action="store_true",
                    help="Edges / texture the target doesn't have only count where the colors around are already "
                         "roughly right: a crisp stroke over a still-wrong area is judged by its color")
@@ -231,6 +246,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "with all strokes on must remove 2%% of the error left. Experimental: every cost tried "
                         "so far eventually switched all strokes off (off strokes get no gradient for position "
                         "and color, so turning them back on never pays off)")
+    g.add_argument("--length-bias", type=float, default=0.0,
+                   help="Unroll: painterly bias towards longer strokes, relative to each step's loss: doubling the "
+                        "length of every visible stroke is worth 0.69 x this share of the step's loss (log of the "
+                        "chord in view pixels). The loss barely depends on length (doubling all strokes costs "
+                        "0.1-1.5%% of it after the first few steps), so it's left to drift short; 0.01-0.02 is a "
+                        "slight bias. Logged (always): stroke_len, the mean chord of visible strokes in view pixels")
+    g.add_argument("--size-bias", type=float, default=0.0,
+                   help="Unroll: the same towards larger brushes (log radius). Width costs detail, unlike length, "
+                        "so keep it below --length-bias, e.g. 0.005. Logged: stroke_radius (view pixels)")
     g.add_argument("--placement-spread", type=float, default=0.0,
                    help="Unroll: penalty for pairs of strokes whose placement maps nearly coincide (Bhattacharyya "
                         "overlap above 0.5; logged as `overlap`, the mean over pairs), e.g. 1. Without it the "
@@ -288,7 +312,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--select-by", choices=("auto", "psnr", "loss"), default="auto",
                    help="What picks best.pt: validation PSNR, or the validation loss under the training loss (of "
                         "the --val-long-steps painting, if measured). auto = the loss with --shift-detail-weight / "
-                        "--texture-weight (PSNR rewards soft, hedged paintings those losses train away from), else "
+                        "--texture-weight / --simplify-size (PSNR rewards soft, hedged paintings those losses train away from), else "
                         "PSNR")
     g.add_argument("--preview-image", nargs="+", default=None, metavar="PATH",
                    help="Image(s) painted after every epoch at --image-size; saved to <out>/previews/")
@@ -492,8 +516,8 @@ class Trainer:
 
         scales = [int(s) for s in args.scales.split(",") if s]
         weights = [float(w) for w in args.scale_weights.split(",") if w]
-        self.loss_fn = MultiScalePaintLoss(
-            args.detail_weight, scales, weights, edge_weight=args.edge_weight if args.edge_loss else 0.0,
+        loss_kw = dict(
+            edge_weight=args.edge_weight if args.edge_loss else 0.0,
             flat_weight=args.flat_weight if args.flat_loss else 0.0,
             robust_tau=args.robust_tau if args.robust_loss else 0.0, value_weight=args.value_weight,
             forgive_tau=args.robust_tau if args.forgive_edges else 0.0,
@@ -501,6 +525,15 @@ class Trainer:
             texture_bands=[float(b) for b in args.texture_bands.split(",") if b],
             shift_detail_weight=args.shift_detail_weight, shift_radius=args.shift_radius, shift_sigma=args.shift_sigma,
         )
+        self.loss_fn = MultiScalePaintLoss(
+            args.detail_weight, scales, weights, simplify_size=getattr(args, "simplify_size", 0),
+            simplify_passes=getattr(args, "simplify_passes", 2), readiness_tau=getattr(args, "readiness_tau", 0.05),
+            simplify_weight=getattr(args, "simplify_weight", 10.0), **loss_kw,
+        )
+        # Comparing canvases (validation, best.pt, best-of, worse-than-before) needs a monotone loss: the
+        # training loss without the block-in readiness (whose value rises as areas get ready)
+        self.eval_loss_fn = (MultiScalePaintLoss(args.detail_weight, scales, weights, **loss_kw)
+                             if self.loss_fn.simplify_size > 0 else self.loss_fn)
 
         decay, no_decay = [], []
         for n, prm in self.model.named_parameters():
@@ -540,7 +573,8 @@ class Trainer:
         self.epoch, self.global_step, self.best_score = 0, 0, float("-inf")
         self.select_by = args.select_by
         if self.select_by == "auto":
-            self.select_by = "loss" if args.shift_detail_weight > 0 or args.texture_weight > 0 else "psnr"
+            self.select_by = ("loss" if args.shift_detail_weight > 0 or args.texture_weight > 0
+                              or getattr(args, "simplify_size", 0) > 0 else "psnr")
         self.history: List[Dict] = []
         if resume is not None:
             self._load_resume(resume)
@@ -754,12 +788,13 @@ class Trainer:
         B, S = target.shape[0], target.shape[-1]
         total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
         loss, weight_sum, entropy, hardness, gates, outside, gate_range, worse = 0.0, 0.0, [], [], [], [], [], []
-        soft_edges, overlap, crowding = [], [], []
+        soft_edges, overlap, crowding, shape_bias, shape_stats = [], [], [], [], []
+        shaped = a.length_bias > 0 or a.size_bias > 0
         with torch.no_grad():
             pyramid = sharpness_pyramid(target) if a.hard_edge_reward > 0 else None
             start = self.painter.composite(layer)
             start_psnr = psnr(start, target)  # (B,)
-            prev = self.loss_fn(start, target, per_sample=True)[0]  # (B,) loss before each step
+            prev = self.eval_loss_fn(start, target, per_sample=True)[0]  # (B,) loss before each step
         # Relative loss: each image's loss in units of its loss at the start of this batch, so a deep painting
         # with little error left counts as much as a blank one. The stroke cost is then relative too: a step
         # must remove a share of the error that is left, which keeps fine strokes worth it late in a painting
@@ -829,8 +864,9 @@ class Trainer:
             canvas = self.painter.composite(layer)
             full, terms = self.loss_fn(canvas, target, per_sample=True)
             if a.worse_weight > 0:  # a step should never make the painting worse
-                worse.append((full - prev).clamp(min=0.0))
-            prev = full.detach()
+                now = full if self.eval_loss_fn is self.loss_fn else self.eval_loss_fn(canvas, target, per_sample=True)[0]
+                worse.append((now - prev).clamp(min=0.0))
+                prev = now.detach()
             w = 1.0 if last else a.intermediate_weight * ((k + 1) / window) ** a.step_ramp
             if w > 0:
                 step_loss = full
@@ -840,6 +876,15 @@ class Trainer:
                     step_loss = 0.5 * (step_loss + tile_loss)
                 loss = loss + w * step_loss
                 weight_sum += w
+            st = res.output.strokes
+            visible = st.opacity.mean(-1) * res.gate
+            if shaped:  # in units of this step's loss, so the bias stays a fixed share of what painting gains
+                bias = stroke_shape_bias(st.points, st.radii, visible, a.view_res - 1, a.length_bias, a.size_bias)
+                shape_bias.append(bias.view(B, -1).mean(1) * full.detach())
+            with torch.no_grad():  # mean chord and radius of the visible strokes, in view pixels
+                vw = visible / visible.sum(-1, keepdim=True).clamp(min=1e-6)
+                chord = (st.points[:, :, 2] - st.points[:, :, 0]).norm(dim=-1)
+                shape_stats.append(torch.stack([(vw * chord).sum(-1).mean(), (vw * st.radii.mean(-1)).sum(-1).mean()]))
             if a.detach_canvas and not last:
                 layer = layer.detach()
 
@@ -855,6 +900,8 @@ class Trainer:
             loss = loss + 0.01 * torch.stack(gate_range).mean()
         if soft_edges:
             loss = loss + a.hard_edge_reward * torch.stack(soft_edges).mean()
+        if shape_bias:
+            loss = loss + (scale * torch.stack(shape_bias).mean(0)).mean()
         if a.placement_spread > 0:
             loss = loss + a.placement_spread * torch.stack(crowding).mean()
         with torch.no_grad():
@@ -870,6 +917,8 @@ class Trainer:
                 metrics["worse"] = torch.stack(worse).mean().detach()
             if soft_edges:
                 metrics["soft_edges"] = torch.stack(soft_edges).mean().detach()
+            if shape_stats:
+                metrics["stroke_len"], metrics["stroke_radius"] = torch.stack(shape_stats).mean(0) * (a.view_res - 1)
             metrics["gain"] = gain.mean()  # improvement of this window over its start
             if forced is not None:  # how much better the chosen attempt was than the average one (loss units)
                 sc = self._best_of_scores
@@ -903,7 +952,7 @@ class Trainer:
                 cur = res.layer
                 draws.append(res.output.samples)
             attempts.append(draws)
-            scores.append(self.loss_fn(self.painter.composite(cur), target, per_sample=True)[0])
+            scores.append(self.eval_loss_fn(self.painter.composite(cur), target, per_sample=True)[0])
         self._best_of_scores = torch.stack(scores)  # (K, B) loss of each attempt at the end of the window
         winner = self._best_of_scores.argmin(0)  # (B,)
 
@@ -953,7 +1002,7 @@ class Trainer:
                                                     target_hr=chunk_hr)
             canvases = [self.eval_painter.composite(lay) for lay in layers]
             per_step.append(torch.stack([psnr(c, chunk) for c in canvases]))  # (steps, b)
-            losses.append(self.loss_fn(canvases[-1], chunk)[0] * chunk.shape[0])
+            losses.append(self.eval_loss_fn(canvases[-1], chunk)[0] * chunk.shape[0])
             finals.append(canvases[-1])
             strokes = views.from_engine_params(torch.cat([r.params for r in steps], dim=1), self.engine)
             b, _, h, w = chunk.shape
@@ -1008,7 +1057,7 @@ class Trainer:
                     sums["val_long_end_strokes"] += (opacity > ACTIVE_OPACITY).float().sum().item() / min(8, L)
             sums["val_long_drift"] += (best - p).sum().item()
             final = painter.composite(layer)
-            sums["val_long_loss"] += self.loss_fn(final, chunk, per_sample=True)[0].sum().item()
+            sums["val_long_loss"] += self.eval_loss_fn(final, chunk, per_sample=True)[0].sum().item()
             sums["val_long_psnr_low"] += psnr(_gaussian_blur(final, 2.0), _gaussian_blur(chunk, 2.0)).sum().item()
         n = self.val_targets.shape[0]
         metrics = {k: v / n for k, v in sums.items()}

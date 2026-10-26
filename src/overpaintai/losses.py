@@ -93,6 +93,24 @@ def stroke_edge_sharpness(pyramid: torch.Tensor, points: torch.Tensor, radii: to
     return s / (s + ref)
 
 
+def stroke_shape_bias(points: torch.Tensor, radii: torch.Tensor, visible: torch.Tensor, pixels: float,
+                      length_weight: float = 0.0, size_weight: float = 0.0) -> torch.Tensor:
+    """
+    Painterly bias `(B,)` (lower = longer, larger strokes): minus the mean of `length_weight * log(1 + chord)` and
+    `size_weight * log(radius)` over a step's strokes, weighted by how visible they are (`visible` (B, N), detached:
+    a faint or switched-off stroke gains nothing from its shape, so making strokes faint is no way to collect it).
+    Lengths in pixels of `pixels` per unit (`points` (B, N, 3, 2), `radii` (B, N, k)). The chord, not the arc, so
+    a stroke can't gain length by doubling back. Logs: every doubling is worth the same, and the pull on a stroke
+    that is already long fades (1 / length).
+    """
+    d = points[:, :, 2] - points[:, :, 0]
+    chord = torch.sqrt((d * d).sum(-1) + 1e-12) * pixels  # (sqrt with eps: a dot's gradient stays finite)
+    r = (radii.mean(-1) * pixels).clamp(min=0.25)
+    w = visible.detach()
+    w = w / w.sum(-1, keepdim=True).clamp(min=1e-6)
+    return -(w * (length_weight * torch.log1p(chord) + size_weight * torch.log(r))).sum(-1)
+
+
 def robust_color_error(pred: torch.Tensor, target: torch.Tensor, tau: float) -> torch.Tensor:
     """
     Saturating per-pixel error `(B, 1, H, W)`: `rho(e) = tau * e / (e + tau)` (slope 1 at 0, at most `tau`) of
@@ -183,6 +201,21 @@ def _best_shift(a: torch.Tensor, b: torch.Tensor, radius: int, patch: int) -> to
     return d.min(1, keepdim=True).values.add(1e-6).sqrt()
 
 
+def simplify(x: torch.Tensor, size: int = 9, passes: int = 2) -> torch.Tensor:
+    """
+    `x` with everything smaller than about `size` px removed and the edges of larger shapes kept hard:
+    `passes` median filters of `size` x `size` (per channel). Unlike a blur, a hard edge stays hard and a soft
+    one soft, so it reads like a painter's first block-in: silhouettes and big color areas, no eyes, lines or
+    texture. Differentiable (the gradient goes to each window's median pixel).
+    """
+    p = size // 2
+    B, C, H, W = x.shape
+    for _ in range(passes):
+        u = F.unfold(F.pad(x, (p,) * 4, mode="replicate"), size)  # (B, C * size^2, H * W)
+        x = u.view(B, C, size * size, H * W).median(2).values.view(B, C, H, W)
+    return x
+
+
 def _coarse(x: torch.Tensor, factor: int, mode: str) -> torch.Tensor:
     """
     Low-resolution view of `x` at `factor`. "blur" pools by factor/4 and then Gaussian-blurs, so the
@@ -246,6 +279,19 @@ class MultiScalePaintLoss(nn.Module):
         shift_radius: how far (px) detail may move for free.
         shift_sigma: blur scale (px) below which detail counts as fine.
         texture_bands: blur scales (px) that split the image into its frequency bands.
+        simplify_size: > 0 judges each area by its large shapes until they are right, then by everything:
+            per pixel `(1 - r) * block + r * (the full-resolution terms)`, the coarse terms unchanged. "block"
+            compares the simplified images (`simplify`: shapes smaller than this many px removed, the edges of
+            larger ones kept hard) by L1 and local sharpness: big shapes in place with hard edges where the
+            target has them, small things ignored (S(pred) drops them too: not punished, just not counted).
+            Readiness `r = readiness_tau / (e + readiness_tau)` (not differentiated), with e the mean color
+            error of S(pred) vs S(target) over a window twice the size. r is never 0, so details always count
+            a little; a larger tau brings them in earlier. With r = 1 everywhere this is the loss without
+            simplification. The value is not monotone (an area that gets ready starts counting its details),
+            so compare canvases by the loss without it. 0 disables it.
+        simplify_passes: median passes of the simplification.
+        readiness_tau: color error of the simplified images at which the details count half.
+        simplify_weight: weight of the block-in term.
         extra_terms: optional named terms added on top (e.g. a perceptual or adversarial loss later),
             as `name -> (weight, fn(pred, target, mask))`.
     """
@@ -268,6 +314,10 @@ class MultiScalePaintLoss(nn.Module):
         shift_detail_weight: float = 0.0,
         shift_radius: int = 3,
         shift_sigma: float = 1.5,
+        simplify_size: int = 0,
+        simplify_passes: int = 2,
+        readiness_tau: float = 0.05,
+        simplify_weight: float = 1.0,
     ):
         super().__init__()
         self.detail_weight = detail_weight
@@ -280,6 +330,10 @@ class MultiScalePaintLoss(nn.Module):
         self.shift_detail_weight = shift_detail_weight
         self.shift_radius = shift_radius
         self.shift_sigma = shift_sigma
+        self.simplify_size = simplify_size
+        self.simplify_passes = simplify_passes
+        self.readiness_tau = readiness_tau
+        self.simplify_weight = simplify_weight
         self.scales = tuple(scales)
         self.scale_weights = tuple(scale_weights) if scale_weights is not None else (1.0,) * len(self.scales)
         assert len(self.scale_weights) == len(self.scales)
@@ -289,23 +343,49 @@ class MultiScalePaintLoss(nn.Module):
         self.flat_weight = flat_weight
         self.extra_terms = dict(extra_terms or {})
 
+    @torch.no_grad()
+    def readiness(self, s_pred: torch.Tensor, s_target: torch.Tensor) -> torch.Tensor:
+        """(B, 1, H, W) in (0, 1]: how right the large shapes are around each pixel (simplified images)."""
+        k = 2 * self.simplify_size + 1
+        e = (s_pred - s_target).abs().mean(1, keepdim=True)
+        e = F.avg_pool2d(F.pad(e, (k // 2,) * 4, mode="replicate"), k, 1)
+        return self.readiness_tau / (e + self.readiness_tau)
+
     def forward(
         self, pred: torch.Tensor, target: torch.Tensor, valid_mask: Optional[torch.Tensor] = None,
-        per_sample: bool = False,
+        per_sample: bool = False, readiness: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Returns the total loss (a scalar, or `(B,)` per image with `per_sample`) and a dict of the
         individual (weighted) terms, as batch means, for logging. Extra terms are always batch scalars.
+        With `simplify_size`, `readiness` (B, 1, H, W) replaces the readiness of `pred` (e.g. another canvas').
         """
 
         def mean(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
             return _masked_mean(x, mask, per_sample)
 
         terms: Dict[str, torch.Tensor] = {}
+        logs: Dict[str, float] = {}
+        ready = None  # (B, 1, H, W) readiness, with the simplified images
+        if self.simplify_size > 0:
+            with torch.no_grad():
+                s_target = simplify(target, self.simplify_size, self.simplify_passes)
+            s_pred = simplify(pred, self.simplify_size, self.simplify_passes)
+            ready = readiness.detach() if readiness is not None else self.readiness(s_pred, s_target)
+            logs["ready"] = float(ready.mean() if valid_mask is None else _masked_mean(ready, valid_mask))
+
+        def fine(x: torch.Tensor) -> torch.Tensor:
+            """A full-resolution term's map, counted by readiness."""
+            return x if ready is None else ready * x
+
+        if ready is not None:  # the block-in: large shapes in place, with the target's hard edges
+            block = (s_pred - s_target).abs() + 0.5 * (local_sharpness(s_pred) - local_sharpness(s_target)).abs()
+            terms["block"] = self.simplify_weight * mean((1.0 - ready) * block, valid_mask)
+
         if self.detail_weight > 0 and self.robust_tau > 0:
-            terms["detail"] = self.detail_weight * mean(robust_color_error(pred, target, self.robust_tau), valid_mask)
+            terms["detail"] = self.detail_weight * mean(fine(robust_color_error(pred, target, self.robust_tau)), valid_mask)
         elif self.detail_weight > 0:
-            terms["detail"] = self.detail_weight * mean((pred - target).abs(), valid_mask)
+            terms["detail"] = self.detail_weight * mean(fine((pred - target).abs()), valid_mask)
 
         right = None  # (B, 1, H, W): 1 where the colors around are right, -> 0 where far off
         if self.forgive_tau > 0 and (self.edge_weight > 0 or self.flat_weight > 0):
@@ -324,11 +404,12 @@ class MultiScalePaintLoss(nn.Module):
             diff = (gp - gt).abs()
             if right is not None:  # a gradient stronger than the target's is a spurious edge
                 diff = torch.where(gp.abs() > gt.abs(), right * diff, diff)
-            terms["edge"] = 0.5 * self.edge_weight * mean(diff, valid_mask)
-            terms["sharp"] = self.edge_weight * mean(excess(local_sharpness(pred), local_sharpness(target)), valid_mask)
+            terms["edge"] = 0.5 * self.edge_weight * mean(fine(diff), valid_mask)
+            terms["sharp"] = self.edge_weight * mean(fine(excess(local_sharpness(pred), local_sharpness(target))),
+                                                     valid_mask)
 
         if self.flat_weight > 0:
-            terms["flat"] = self.flat_weight * mean(excess(local_std(pred), local_std(target)), valid_mask)
+            terms["flat"] = self.flat_weight * mean(fine(excess(local_std(pred), local_std(target))), valid_mask)
 
         def coarse_l1(p: torch.Tensor, t: torch.Tensor, factor: int) -> torch.Tensor:
             if valid_mask is None:
@@ -348,23 +429,23 @@ class MultiScalePaintLoss(nn.Module):
             vp, vt = pred.mean(1, keepdim=True), target.mean(1, keepdim=True)
             factors = (1,) + self.scales
             terms["value"] = self.value_weight * sum(
-                mean((vp - vt).abs(), valid_mask) if f == 1 else coarse_l1(vp, vt, f) for f in factors
+                mean(fine((vp - vt).abs()), valid_mask) if f == 1 else coarse_l1(vp, vt, f) for f in factors
             ) / len(factors)
 
         if self.texture_weight > 0:
             def tex(x: torch.Tensor) -> torch.Tensor:
                 return texture_statistics(x, self.texture_window, self.texture_bands)
-            terms["texture"] = self.texture_weight * mean((tex(pred) - tex(target)).abs(), valid_mask)
+            terms["texture"] = self.texture_weight * mean(fine((tex(pred) - tex(target)).abs()), valid_mask)
 
         if self.shift_detail_weight > 0:
             d = shift_tolerant_detail(pred, target, self.shift_radius, sigma=self.shift_sigma)
-            terms["shift_detail"] = self.shift_detail_weight * mean(d, valid_mask)
+            terms["shift_detail"] = self.shift_detail_weight * mean(fine(d), valid_mask)
 
         for name, (weight, fn) in self.extra_terms.items():
             terms[name] = weight * fn(pred, target, valid_mask)
 
         total = sum(terms.values())
-        return total, {k: float(v.detach().mean()) for k, v in terms.items()}
+        return total, {**{k: float(v.detach().mean()) for k, v in terms.items()}, **logs}
 
 
 def psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

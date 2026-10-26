@@ -70,6 +70,8 @@ def parse_loss(spec: str) -> MultiScalePaintLoss:
         key, value = item.split("=", 1)
         if key in ("scales", "scale_weights", "texture_bands"):
             kwargs[key] = [float(v) if key != "scales" else int(v) for v in value.split("/") if v]
+        elif key in ("simplify_size", "simplify_passes", "shift_radius"):
+            kwargs[key] = int(value)
         else:
             kwargs[key] = float(value)
     return MultiScalePaintLoss(**kwargs)

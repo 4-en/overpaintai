@@ -3,7 +3,7 @@ import math
 import torch
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
-from overpaintai.losses import MultiScalePaintLoss, psnr
+from overpaintai.losses import MultiScalePaintLoss, psnr, stroke_shape_bias
 from overpaintai.synthetic import radius_to_param, random_strokes, render_targets
 
 
@@ -219,3 +219,68 @@ def test_shift_tolerant_detail_gradients_match_without_checkpointing():
     finally:
         torch.utils.checkpoint.checkpoint = orig
     assert torch.isfinite(g_ckpt).all() and torch.allclose(g_ckpt, pred.grad, atol=1e-6)
+
+
+def _square_with_dot(size=64):
+    """A dark 32 px square on light ground with a 3 px dot of another color inside it (a small thing)."""
+    t = torch.full((1, 3, size, size), 0.9)
+    t[..., 16:48, 16:48] = 0.2
+    t[:, 0, 30:33, 30:33] = 0.9
+    return t
+
+
+def test_simplify_removes_small_things_and_keeps_big_edges_hard():
+    from overpaintai.losses import simplify
+
+    t = _square_with_dot()
+    s = simplify(t, 9, 2)
+    assert (s[..., 28:35, 28:35] - 0.2).abs().max() < 1e-6  # the dot is gone
+    assert (s[..., 32, 14] - 0.9).abs().max() < 1e-6 and (s[..., 32, 17] - 0.2).abs().max() < 1e-6  # hard edge
+
+
+def test_block_in_ignores_small_things_far_off_but_not_soft_big_edges():
+    from overpaintai.losses import _gaussian_blur
+
+    t = _square_with_dot()
+    loss = MultiScalePaintLoss(detail_weight=1, scales=(), simplify_size=9, simplify_weight=10)  # (coarse terms always count)
+    far = torch.full((1, 1, 64, 64), 0.02)  # readiness of a canvas that is still far off
+    square = t.clone()
+    square[:, 0, 30:33, 30:33] = 0.2  # the square without its dot
+    # Far off, the dot barely matters; once the area is ready it counts fully
+    dot_far = loss(square, t, readiness=far)[0] - loss(t, t, readiness=far)[0]
+    dot_near = loss(square, t, readiness=torch.ones_like(far))[0] - loss(t, t, readiness=torch.ones_like(far))[0]
+    assert dot_far < 0.05 * dot_near
+    # ...but a blurry square costs, far off as well
+    assert loss(_gaussian_blur(square, 2.0), t, readiness=far)[0] > 2 * loss(square, t, readiness=far)[0]
+
+
+def test_readiness_one_is_the_plain_loss_and_passes_no_gradient():
+    t = _square_with_dot()
+    pred = (t + 0.1 * torch.randn_like(t)).clamp(0, 1).requires_grad_(True)
+    kw = dict(detail_weight=1, scales=(4, 16), edge_weight=0.5, shift_detail_weight=5, texture_weight=10)
+    plain = MultiScalePaintLoss(**kw)(pred, t)[0]
+    ready = MultiScalePaintLoss(simplify_size=9, simplify_weight=10, **kw)
+    assert torch.allclose(ready(pred, t, readiness=torch.ones(1, 1, 64, 64))[0], plain)
+    total, logs = ready(pred, t)
+    assert 0 < logs["ready"] < 1
+    total.backward()
+    assert torch.isfinite(pred.grad).all()
+
+
+def test_shape_bias_prefers_long_large_visible_strokes_and_is_finite_for_dots():
+    pts = torch.tensor([[[[0.5, 0.5], [0.5, 0.5], [0.5, 0.5]],  # a dot
+                         [[0.4, 0.5], [0.5, 0.5], [0.6, 0.5]]]], requires_grad=True)  # a 13 px line
+    radii = torch.full((1, 2, 2), 0.02, requires_grad=True)
+    vis = torch.ones(1, 2)
+    b = stroke_shape_bias(pts, radii, vis, 127, length_weight=1.0, size_weight=0.5)
+    b.sum().backward()
+    assert torch.isfinite(pts.grad).all() and torch.isfinite(radii.grad).all()
+    assert radii.grad.lt(0).all()  # larger brushes lower it
+    assert pts.grad[0, 1, 2, 0] < 0 < pts.grad[0, 1, 0, 0]  # the line's ends are pushed apart
+    longer = pts.detach().clone()
+    longer[0, 1, 0, 0], longer[0, 1, 2, 0] = 0.3, 0.7
+    assert stroke_shape_bias(longer, radii, vis, 127, 1.0) < stroke_shape_bias(pts, radii, vis, 127, 1.0)
+    # An invisible stroke's shape is worth nothing
+    only_dot = torch.tensor([[1.0, 0.0]])
+    assert torch.allclose(stroke_shape_bias(longer, radii, only_dot, 127, 1.0),
+                          stroke_shape_bias(pts, radii, only_dot, 127, 1.0))

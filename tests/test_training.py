@@ -444,3 +444,22 @@ def test_loose_detail_losses_pick_best_by_validation_loss_and_log_detail_metrics
                  "--out", str(plain)])
     ckpt = torch.load(plain / "best.pt", weights_only=False)
     assert ckpt["select_by"] == "loss" and ckpt["epoch"] == 1
+
+
+def test_block_in_loss_trains_and_validates_without_readiness(tmp_path):
+    out = tmp_path / "block"
+    main(TINY + ["--mode", "unroll", "--epochs", "1", "--val-long-steps", "4", "--detail-weight", "0",
+                 "--scales", "16,32", "--scale-weights", "0.2,1", "--shift-detail-weight", "20",
+                 "--texture-weight", "40", "--simplify-size", "5", "--out", str(out)])
+    ckpt = torch.load(out / "best.pt", weights_only=False)
+    row = ckpt["history"][-1]
+    assert 0 < row["train_ready"] < 1 and row["train_block"] > 0
+    assert ckpt["select_by"] == "loss" and math.isfinite(row["val_long_loss"])
+
+
+def test_shape_bias_trains_and_logs_stroke_shape(tmp_path):
+    out = tmp_path / "shape"
+    main(TINY + ["--mode", "unroll", "--epochs", "1", "--length-bias", "0.02", "--size-bias", "0.005",
+                 "--out", str(out)])
+    row = torch.load(out / "last.pt", weights_only=False)["history"][-1]
+    assert row["train_stroke_len"] > 0 and row["train_stroke_radius"] > 0 and math.isfinite(row["train_loss"])
