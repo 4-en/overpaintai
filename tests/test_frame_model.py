@@ -101,9 +101,72 @@ def test_strokes_see_each_other_and_their_samples():
     assert g.abs().sum() > 0  # what the frame samples see enters the latents
 
 
+def test_proposals_and_look_ahead_start_out_as_the_model_without_them():
+    torch.manual_seed(5)
+    old = _model().eval()
+    _spread(old)
+    new = _model(stroke_proposals=True).eval()
+    missing, unexpected = new.load_state_dict(old.state_dict(), strict=False)
+    assert not unexpected and missing and all(k.startswith(("propose.", "proposal_proj.")) for k in missing)
+    new.propose[-1].weight.data.zero_(), new.propose[-1].bias.data.zero_()  # as --init-from leaves them
+    x, boxes = torch.rand(2, 12, R, R), views.whole_image_boxes(2)
+    a = old(x, boxes, torch.zeros(2)).strokes
+    b = new(x, boxes, torch.zeros(2)).strokes
+    assert torch.allclose(a.points, b.points, atol=1e-6) and torch.allclose(a.radii, b.radii, atol=1e-6)
+    # learned points with look-ahead start where they were (only the caps are new)
+    ahead = _model(look_ahead=True)
+    h = torch.randn(1, 4, 64)
+    p = torch.tensor([[[0.2, 0.5], [0.5, 0.5], [0.8, 0.5]]]).expand(1, 4, 3, 2)
+    r = torch.full((1, 4, 3), 0.05)
+    lp, _ = ahead._learned_points(ahead.refine[0], h, p, r, R)
+    lp0, _ = old._learned_points(old.refine[0], h, p, r, R)
+    assert torch.allclose(lp, lp0, atol=1e-6)
+
+
+def test_look_ahead_sees_far_past_the_ends():
+    model = _model(look_ahead=True).eval()
+    p = torch.tensor([[[[0.3, 0.5], [0.5, 0.5], [0.7, 0.5]]]])
+    r = torch.full((1, 1, 3), 0.02)
+    pts, coords = model._frame_points(p, r, R)
+    px = 1.0 / (R - 1)
+    caps = pts[0, 0, coords[:, 3] == 1]
+    assert torch.allclose(caps[:, 1], torch.full_like(caps[:, 1], 0.5), atol=1e-6)  # on the stroke's line
+    assert (caps[:, 0] > 0.7 + 0.02 + 31 * px).any() and (caps[:, 0] < 0.3 - 0.02 - 31 * px).any()
+    # learned points can go past the ends, straight on along the tangent
+    layer = model.refine[0]
+    with torch.no_grad():
+        layer["learned"].bias.view(-1, 3)[:, 0] = 20.0  # t -> 1.5
+    lp, lc = model._learned_points(layer, torch.zeros(1, 1, 64), p, r, R)
+    assert torch.allclose(lc[..., 0], torch.full_like(lc[..., 0], 1.5), atol=1e-4)
+    want = 0.7 + 0.5 * (0.4 + 16 * px)
+    assert torch.allclose(lp[..., 0], torch.full_like(lp[..., 0], want), atol=1e-4)
+
+
+def test_strokes_start_from_the_proposal_where_they_land():
+    torch.manual_seed(6)
+    model = _model(stroke_proposals=True).eval()
+    with torch.no_grad():
+        model.propose[-1].bias.copy_(torch.tensor([0.0, math.atanh(0.2 / 0.35), 0.0, 0.0, 0.0]))  # half (0.2, 0)
+    s = model(torch.rand(1, 12, R, R), views.whole_image_boxes(1), torch.zeros(1)).strokes
+    chord = s.points[:, :, 0] - s.points[:, :, 2]
+    assert torch.allclose(chord, torch.tensor([0.4, 0.0]).expand_as(chord), atol=0.01)  # decoder adds ~nothing
+    # the score map moves the queries: a high score in one corner pulls them there
+    with torch.no_grad():
+        model.propose[-1].bias.zero_()
+    x = torch.rand(1, 12, R, R)
+    base = model(x, views.whole_image_boxes(1), torch.zeros(1)).anchors
+    score = model.propose[-1]
+    hook = score.register_forward_hook(lambda m, i, o: o + torch.cat(
+        [20.0 * (torch.arange(o.shape[-1]) < 2).float().view(1, 1, 1, -1).expand(1, 1, o.shape[-2], -1),
+         torch.zeros_like(o[:, 1:])], 1))
+    pulled = model(x, views.whole_image_boxes(1), torch.zeros(1)).anchors
+    hook.remove()
+    assert (pulled[..., 0] < base[..., 0]).all() and (pulled[..., 0] < 0.15).all()
+
+
 def test_gradients_reach_every_parameter_through_the_renderer():
     torch.manual_seed(3)
-    model = _model(stroke_gate=True)
+    model = _model(stroke_gate=True, stroke_proposals=True, look_ahead=True)
     model.mask_tool = True
     engine = DifferentiableCanvasEngine(canvas_size=48, min_opacity=0.0, opaque=True, eraser_mode="mask")
     target = torch.rand(2, 3, 48, 48)
@@ -234,3 +297,29 @@ def test_harness_reuses_the_target_encoding():
     tile_rounds = sum(1 for st in result.stats if st["tiles"] > 0)
     # whole image once (shared with the tile rounds' global tokens), then once per tile set (both passes)
     assert len(calls) == 1 + tile_rounds, (len(calls), tile_rounds)
+
+
+def test_teacher_proposal_loss_is_zero_for_the_ground_truth_in_either_direction():
+    from types import SimpleNamespace
+
+    from overpaintai.train import Trainer
+
+    model = _model(stroke_proposals=True)
+    p0, p1, p2 = torch.tensor([0.3, 0.4]), torch.tensor([0.5, 0.45]), torch.tensor([0.6, 0.6])
+    half = 0.5 * (p0 - p2)
+    normal = torch.stack([-half[1], half[0]]) / half.norm()
+    bend = ((p1 - 0.5 * (p0 + p2)) * normal).sum()
+    radius = torch.tensor(0.03)
+    r_lo, r_hi = (math.log(r) for r in model.radius_range)
+    u, u0 = (math.log(radius) - r_lo) / (r_hi - r_lo), (math.log(0.1) - r_lo) / (r_hi - r_lo)
+    r_raw = math.log(u / (1 - u)) - math.log(u0 / (1 - u0))
+    trainer = SimpleNamespace(model=model)
+    for sign in (1.0, -1.0):  # the proposal as one direction or the other
+        raw = torch.tensor([*torch.atanh(sign * half / 0.35), torch.atanh(sign * bend / 0.35), r_raw])
+        maps = raw.view(1, 4, 1, 1).expand(1, 4, 8, 8).contiguous()
+        gt = views.Strokes(points=torch.stack([p0, p1, p2]).view(1, 1, 3, 2), radii=radius.view(1, 1, 1).expand(1, 1, 3),
+                           opacity=torch.ones(1, 1, 3), hardness=torch.ones(1, 1, 1), color=torch.ones(1, 1, 3))
+        loss, length = Trainer.proposal_loss(trainer, maps, gt)
+        assert loss.abs().max() < 1e-5 and torch.isclose(length, 2 * half.norm(), atol=1e-5)
+        wrong, _ = Trainer.proposal_loss(trainer, maps.flip(1) * 0.5, gt)
+        assert wrong.min() > 0.01

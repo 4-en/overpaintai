@@ -105,6 +105,7 @@ class StrokeOutput:
     gate: torch.Tensor  # (B, N) in [0, 1]: how much of each stroke to paint (1 for models without a gate)
     gate_logit: Optional[torch.Tensor] = None  # (B, N) pre-sigmoid gate (for the range penalty in training)
     samples: Optional["StrokeSamples"] = None  # the random draws of this output (sampled placement / gates)
+    proposals: Optional[torch.Tensor] = None  # (B, 4, r, r) raw stroke proposals per cell (frame model, see there)
 
 
 @dataclass

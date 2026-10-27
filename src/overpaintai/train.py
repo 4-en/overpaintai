@@ -124,6 +124,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                    help="Frame arch with --target-unet: its input resolution as a multiple of --view-res (from the "
                         "full-resolution image; use --image-size >= this x --view-res)")
     g.add_argument("--target-base", type=int, default=16, help="Frame arch: target U-Net width at full resolution")
+    g.add_argument("--stroke-proposals", action=argparse.BooleanOptionalAction, default=True,
+                   help="Frame arch: every 4 x 4 px cell proposes a whole stroke (direction, length, bend, radius) "
+                        "and a learned placement score; each stroke starts from the proposal where it lands "
+                        "instead of a dot. Zero-initialized, so --init-from an older frame model starts unchanged; "
+                        "teacher mode supervises the proposals directly")
+    g.add_argument("--look-ahead", action=argparse.BooleanOptionalAction, default=True,
+                   help="Frame arch: strokes also sample 4 / 8 / 16 / 32 px past their ends, and learned sample "
+                        "points can sit beyond the ends (to see whether to grow)")
     g.add_argument("--opaque-canvas", action=argparse.BooleanOptionalAction, default=None,
                    help="New models: paint on an opaque canvas (blank = the background at alpha 1; no transparency; "
                         "default: on for --arch frame, off otherwise)")
@@ -385,7 +393,8 @@ class Trainer:
                                          plan_slots=args.plan_slots, pressure=not args.no_pressure,
                                          frame_along=args.frame_along, learned_points=args.learned_points,
                                          target_unet=args.target_unet, target_res=args.target_res,
-                                         target_base=args.target_base)
+                                         target_base=args.target_base, stroke_proposals=args.stroke_proposals,
+                                         look_ahead=args.look_ahead)
             if args.joint_strokes:
                 self.model_config["joint_strokes"] = True
             if args.opaque_canvas if args.opaque_canvas is not None else frame:
@@ -560,6 +569,9 @@ class Trainer:
         canvas = self.painter.composite(self.painter.render(layer, params, self.painter.tool_weights(out.tool_logits)))
         render_loss, terms = self.loss_fn(canvas, gt_canvas)
         heat_loss = self.heatmap_loss(out.placement_logits, gt, assign)  # (B,)
+        prop_loss = torch.zeros(B, device=self.device)
+        if out.proposals is not None:
+            prop_loss, prop_len = self.proposal_loss(out.proposals, gt)
         gate_loss = (1.0 - out.gate).mean(-1)  # every ground-truth stroke is real: matched strokes stay on
         # Different strokes that get the pixels right are not wrong: the stroke terms fade out per image as the
         # step's pixel error goes to zero (relative to the error of not painting); the pixel loss always counts
@@ -571,7 +583,8 @@ class Trainer:
             else:
                 relax = torch.ones(B, device=self.device)
         loss = a.render_weight * render_loss + (
-            relax * (a.match_weight * match_loss + a.heatmap_weight * heat_loss + 0.1 * gate_loss)).mean()
+            relax * (a.match_weight * (match_loss + prop_loss) + a.heatmap_weight * heat_loss + 0.1 * gate_loss)
+        ).mean()
         if out.gate_logit is not None:
             # Keep gate logits in range, as in unroll training. The gate's leaky gradient never fades, so the push
             # towards "on" grew the logits without bound (and with them the stroke head's shared layers, until
@@ -583,6 +596,8 @@ class Trainer:
                    "heatmap": heat_loss.mean().detach(), "relax": relax.mean()}
         if self.model.stroke_gate:
             metrics["gate"] = out.gate.mean().detach()
+        if out.proposals is not None:  # proposal length (view pixels) at the ground-truth strokes
+            metrics["proposal"], metrics["prop_len"] = prop_loss.mean().detach(), prop_len * (a.view_res - 1)
         if len(self.tools) > 1:  # supervise tool choice on matched pairs
             b = torch.arange(B, device=self.device).unsqueeze(1)
             logits = out.tool_logits[b, assign[0]]
@@ -614,6 +629,28 @@ class Trainer:
         t = t / t.sum(-1, keepdim=True).clamp(min=1e-12)
         log_p = logits[b, assign[0]].log_softmax(dim=-1)
         return -(t * log_p).sum(-1).mean(-1)  # (B,)
+
+    def proposal_loss(self, proposals: torch.Tensor, gt: "views.Strokes"):
+        """
+        Every ground-truth stroke should be the proposal at its curve midpoint B(0.5) (where `heatmap_loss` puts
+        a query): L1 of half-vector and bend (better of both directions) and log radius, weighted as in
+        `matched_stroke_loss`, per image `(B,)`; and the mean proposed length there (view units, for logging).
+        """
+        model = self.model
+        p0, p1, p2 = gt.points.unbind(dim=2)  # (B, M, 2)
+        mid = 0.25 * p0 + 0.5 * p1 + 0.25 * p2
+        raw = F.grid_sample(proposals, (mid * 2.0 - 1.0).unsqueeze(2).to(proposals.dtype), mode="bilinear",
+                            align_corners=True)[..., 0].transpose(1, 2).float()  # (B, M, 4)
+        half, bend, r_raw = model.proposal_strokes(raw)
+        g_half = 0.5 * (p0 - p2)
+        normal = torch.stack([-g_half[..., 1], g_half[..., 0]], -1) / g_half.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        g_bend = ((p1 - 0.5 * (p0 + p2)) * normal).sum(-1)
+        # the reverse stroke: half-vector and normal flip, so the bend does too
+        err = torch.minimum((half - g_half).abs().sum(-1) + (bend - g_bend).abs(),
+                            (half + g_half).abs().sum(-1) + (bend + g_bend).abs())
+        r_err = (torch.log(model.proposal_radius(r_raw)) - torch.log(gt.radii.mean(-1).clamp(min=1e-4))).abs()
+        loss = (err + 0.25 * r_err).mean(-1) / 4.0
+        return loss, (2.0 * half.norm(dim=-1)).mean().detach()
 
     @torch.no_grad()
     def start_canvas(self, target: torch.Tensor, window: int, target_hr: Optional[torch.Tensor] = None):

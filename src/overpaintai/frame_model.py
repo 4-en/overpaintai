@@ -20,6 +20,13 @@ to each other and to the plan) at U-Net speed, with high detail only where each 
 4. Each point also sees the predicted result: every stroke's coverage there (as the renderer computes it, without
    rendering) and the canvas after the joint step, so a stroke sees where it would actually land, whether it
    misses a line, cuts into an edge or overlaps another stroke.
+5. With `stroke_proposals`, placement picks whole strokes: a small conv head on the R/4 map proposes per cell a
+   stroke centred there (half-vector p0 -> chord middle, bend, radius) and a learned score that is added to the
+   placement logits. Each query starts from the proposal at its anchor instead of a dot, so the first refinement
+   layer already samples along a stroke of sensible length and direction (a cell's features see far beyond the
+   cell: a cell on an edge can propose a long stroke along it). Zero-initialized: a model starts out as without.
+   With `look_ahead`, the end caps also look 4 / 8 / 16 / 32 px past each end, and learned points may sit up to
+   half a stroke beyond the ends, so a stroke can see whether to grow instead of hedging with tapered ends.
 
 A stroke's latent attends over its own point tokens, then to the other strokes, then to the plan. Sampling
 positions come from the stroke decoded without gradient (as in `PlanStrokePredictor`: through the positions the
@@ -50,6 +57,9 @@ ERASER = 4  # tool index of the eraser, the mask with `mask_tool`
 # Fixed points across a stroke: (sign-free multiple of the radius, extra view pixels), mirrored to both sides
 ACROSS = ((0.0, 0.0), (0.5, 0.0), (1.0, -1.0), (1.0, 0.0), (1.0, 1.0), (1.0, 2.0), (1.5, 0.0))
 CAPS = ((1.0, -1.0), (1.0, 0.0), (1.0, 1.0), (1.0, 2.0))  # beyond each end, along the tangent
+LOOK_AHEAD = ((1.0, 4.0), (1.0, 8.0), (1.0, 16.0), (1.0, 32.0))  # further ones with `look_ahead`
+PROPOSAL_REACH = 0.35  # largest proposed half-length and bend (view units)
+OVERSHOOT_PX = 16.0  # learned points beyond an end: (t - 1) x (chord + this many view pixels) past it
 PROFILE_STAMPS = 12  # curve samples for the predicted coverage
 
 
@@ -119,6 +129,8 @@ class FrameStrokePredictor(nn.Module):
             only reads canvas and error.
         target_res: its input resolution as a multiple of the view's (1, 2, 4).
         target_base: its width at full resolution (doubling per level, at most the coarse path's widest).
+        stroke_proposals: a dense stroke proposal per R/4 cell and a learned placement score (module docstring).
+        look_ahead: end-cap samples far past the ends; learned points beyond the ends.
     """
 
     IN_CHANNELS = StrokePredictor.IN_CHANNELS
@@ -151,6 +163,8 @@ class FrameStrokePredictor(nn.Module):
         target_unet: bool = False,
         target_res: int = 2,
         target_base: int = 16,
+        stroke_proposals: bool = False,
+        look_ahead: bool = False,
     ):
         super().__init__()
         self.num_strokes = num_strokes
@@ -173,6 +187,8 @@ class FrameStrokePredictor(nn.Module):
         self.max_offset = max_offset
         self.radius_range = radius_range
         self.learned_points = learned_points
+        self.stroke_proposals = stroke_proposals
+        self.look_ahead = look_ahead
         self.placement_noise = 0.0  # runtime switches, as in StrokePredictor
         self.sample_in_eval = False
         self.mask_tool = False  # set by build_model: the eraser is a per-step mask (for the predicted result)
@@ -245,11 +261,19 @@ class FrameStrokePredictor(nn.Module):
         self.error_gain = nn.Parameter(torch.tensor(1.0))
         init_dim = P + w3 + 3
         self.init_proj = nn.Sequential(nn.LayerNorm(init_dim), nn.Linear(init_dim, D))
+        if stroke_proposals:
+            # per cell from its features and log error: score, half-vector 2, bend, radius logit
+            self.propose = nn.Sequential(nn.Conv2d(P + 1, P, 3, padding=1), nn.SiLU(),
+                                         nn.Conv2d(P, P, 3, padding=1), nn.SiLU(), nn.Conv2d(P, 5, 1))
+            self.proposal_proj = nn.Linear(4, D)  # the chosen proposal into the latent
+            for layer in (self.propose[-1], self.proposal_proj):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
 
         # Stroke-frame points: fixed grid (along x across, end caps) + learned offsets per layer
         self.register_buffer("t_along", torch.linspace(0.0, 1.0, frame_along), persistent=False)
         self.register_buffer("across", _frame_offsets(), persistent=False)
-        self.register_buffer("caps", torch.tensor(CAPS), persistent=False)
+        self.register_buffer("caps", torch.tensor(CAPS + (LOOK_AHEAD if look_ahead else ())), persistent=False)
         # per point: target + canvas 6, error x4 and signed sqrt 6, gradients 4, own coverage and shape 2, predicted
         # error x4 and signed sqrt 6; coarse features; frame coordinates (t, radius multiple, pixels, cap, learned)
         # and sin / cos of t at 3 frequencies 11
@@ -349,10 +373,22 @@ class FrameStrokePredictor(nn.Module):
         return self._tokens(self._encode(whole_inputs, cond, target)[2], boxes, self.global_grid, kind=0)
 
     # --- strokes ------------------------------------------------------------------------------------
-    def _decode(self, h: torch.Tensor, anchor0: torch.Tensor, imgs: _Images):
+    def proposal_strokes(self, raw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Raw proposals `(..., 4)` -> (half-vector p0 - chord middle `(..., 2)`, bend: p1 off the chord middle
+        along the chord's normal `(...)`, radius logit offset `(...)`), in view units."""
+        return PROPOSAL_REACH * torch.tanh(raw[..., 0:2]), PROPOSAL_REACH * torch.tanh(raw[..., 2]), raw[..., 3]
+
+    def proposal_radius(self, r_raw: torch.Tensor) -> torch.Tensor:
+        """The radius a radius logit offset gives with the decoder's own correction at zero."""
+        r_lo, r_hi = (math.log(r) for r in self.radius_range)
+        r_init = (math.log(0.1) - r_lo) / (r_hi - r_lo)
+        return torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
+
+    def _decode(self, h: torch.Tensor, anchor0: torch.Tensor, imgs: _Images, proposal: Optional[torch.Tensor] = None):
         """
         The stroke a latent describes: (anchor, points, radii, opacity, hardness, color, tool logits, raw gate logit).
         The anchor is the initial anchor plus a shift and the middle of the chord p0 -> p2 (see `PlanStrokePredictor`).
+        With a `proposal` `(B, N, 4)` (raw, see `proposal_strokes`), the decoder's outputs correct that stroke.
         The colour is a correction to the target averaged over the stroke's interior (centre line and half a
         radius to each side, full resolution), looked up at the detached stroke.
         """
@@ -363,10 +399,13 @@ class FrameStrokePredictor(nn.Module):
         anchor = anchor0 + 0.15 * torch.tanh(shift)
         off = self.max_offset * torch.tanh(offsets.unflatten(-1, (3, 2)))  # (B, N, 3, 2)
         half = 0.5 * (off[..., 0, :] - off[..., 2, :])
-        points = torch.stack([anchor + half, anchor + 0.5 * off[..., 1, :], anchor - half], 2)
-        r_lo, r_hi = (math.log(r) for r in self.radius_range)
-        r_init = (math.log(0.1) - r_lo) / (r_hi - r_lo)  # start at radius ~0.1 view units
-        radii = torch.exp(r_lo + (r_hi - r_lo) * torch.sigmoid(r_raw + math.log(r_init / (1.0 - r_init))))
+        bend = 0.5 * off[..., 1, :]
+        if proposal is not None:
+            p_half, p_bend, p_r = self.proposal_strokes(proposal.float())
+            normal = torch.stack([-p_half[..., 1], p_half[..., 0]], -1) / (p_half.norm(dim=-1, keepdim=True) + 1e-3)
+            half, bend, r_raw = half + p_half, bend + p_bend.unsqueeze(-1) * normal, r_raw + p_r.unsqueeze(-1)
+        points = torch.stack([anchor + half, anchor + bend, anchor - half], 2)
+        radii = self.proposal_radius(r_raw)  # starts at radius ~0.1 view units
         opacity = 0.05 + 0.95 * torch.sigmoid(a_raw)
         with torch.no_grad():
             interior = self._frame_points(points.detach(), radii.detach(), imgs.R, interior=True)[0]
@@ -422,12 +461,18 @@ class FrameStrokePredictor(nn.Module):
         frame coordinates `(B, N, L, 3)`: t, radius multiple, view pixels."""
         L = self.learned_points
         raw = layer["learned"](h).float().view(*h.shape[:2], L, 3)
-        # Spread along the stroke at the start (zero-initialized offsets -> t evenly spaced)
-        base_t = torch.logit(torch.linspace(0.1, 0.9, L, device=h.device)).view(1, 1, L)
-        t = torch.sigmoid(raw[..., 0] + base_t)
+        # Spread along the stroke at the start (zero-initialized offsets -> t evenly spaced); with look-ahead t
+        # spans (-0.5, 1.5), starting at the same places
+        base = torch.linspace(0.1, 0.9, L, device=h.device)
+        lo, span = (-0.5, 2.0) if self.look_ahead else (0.0, 1.0)
+        t = lo + span * torch.sigmoid(raw[..., 0] + torch.logit((base - lo) / span).view(1, 1, L))
         k_r, k_px = 2.0 * torch.tanh(raw[..., 1]), 3.0 * torch.tanh(raw[..., 2])
-        pos, normal, _, r = self._frame(points, radii, t)
         px = 1.0 / max(R - 1, 1)
+        pos, normal, tangent, r = self._frame(points, radii, t.clamp(0.0, 1.0))
+        if self.look_ahead:  # beyond an end: straight on along its tangent (the curve itself would bend away)
+            over = (t - 1.0).clamp(min=0.0) - (-t).clamp(min=0.0)  # signed: + past p2, - before p0
+            chord = (points[:, :, 2] - points[:, :, 0]).norm(dim=-1, keepdim=True)
+            pos = pos + tangent * (over * (chord + OVERSHOOT_PX * px)).unsqueeze(-1)
         pts = pos + normal * (r * k_r + px * k_px).unsqueeze(-1)
         return pts, torch.stack([t, k_r, k_px], dim=-1)
 
@@ -535,7 +580,12 @@ class FrameStrokePredictor(nn.Module):
         logits = logits - d_sq / (2.0 * self.ref_log_sigma.exp() ** 2)
         err = _blur(inputs[:, 6:9].float().abs().mean(1, keepdim=True), _odd(9 * R / 128))
         err = F.adaptive_avg_pool2d(err, Rc)
-        logits = logits + self.error_gain * torch.log(err.flatten(2) + 1e-3)
+        log_err = torch.log(err + 1e-3)
+        logits = logits + self.error_gain * log_err.flatten(2)
+        proposal_map = None
+        if self.stroke_proposals:  # a learned score on top of the priors, and a stroke per cell
+            proposal_map = self.propose(torch.cat([pixel, log_err.to(pixel.dtype)], 1)).float()  # (B, 5, Rc, Rc)
+            logits = logits + proposal_map[:, 0].flatten(1).unsqueeze(1)
         prob = logits.softmax(dim=-1)
         place_seed, place_prob = None, prob
         if self.placement_noise > 0 and (sampling or (samples is not None and samples.place_seed is not None)):
@@ -549,12 +599,16 @@ class FrameStrokePredictor(nn.Module):
         with torch.no_grad(), torch.autocast(inputs.device.type, enabled=False):
             color0 = imgs.sample(at0)[..., 0:3]
         h = h + self.init_proj(torch.cat([_sample(pixel, at0), _sample(m, at0), color0.to(pixel.dtype)], -1)[:, :, 0])
+        proposal = None
+        if proposal_map is not None:  # the proposal where the query landed
+            proposal = _sample(proposal_map[:, 1:], at0)[:, :, 0]  # (B, N, 4)
+            h = h + self.proposal_proj(proposal.to(h.dtype))
 
         # Refinement in the strokes' frames
         edge = 2.0 * math.log(9.0) * (R - 1)  # the renderer's 1-px hard edge, in view units
         for layer in self.refine:
             with torch.no_grad():
-                decoded = self._decode(h, anchor0, imgs)
+                decoded = self._decode(h, anchor0, imgs, proposal)
             state = self._stroke_state(decoded, R)
             fixed, fixed_coords = self._frame_points(state[0], state[1], R)  # (B, N, Q0, 2), (Q0, 4)
             Q0 = fixed.shape[2]
@@ -575,7 +629,8 @@ class FrameStrokePredictor(nn.Module):
             h = layer["cross_attn"](h, context=tokens)
 
         # The output: the same decoder on the last latent
-        anchor, points, radii, opacity, hardness, color, tool_logits, gate_raw = self._decode(h, anchor0, imgs)
+        anchor, points, radii, opacity, hardness, color, tool_logits, gate_raw = self._decode(
+            h, anchor0, imgs, proposal)
         gate_logit, gate_on = None, None
         if self.stroke_gate:  # start with every stroke on (sigmoid(3) = 0.95)
             gate_logit = gate_raw + 3.0
@@ -597,6 +652,7 @@ class FrameStrokePredictor(nn.Module):
         return StrokeOutput(
             strokes=strokes, tool_logits=tool_logits, anchors=anchor.float(), anchor_entropy=entropy,
             placement_logits=logits, gate=gate, gate_logit=gate_logit, samples=StrokeSamples(place_seed, gate_on),
+            proposals=None if proposal_map is None else proposal_map[:, 1:],
         )
 
 
