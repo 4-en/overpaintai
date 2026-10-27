@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
@@ -16,6 +17,11 @@ from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.synthetic import random_strokes, render_targets
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+# Our own art folders hold very large pieces (splash arts up to ~100 MP): above Pillow's default decompression-bomb
+# limit (89 MP warns, twice that fails). Allow up to ~400 MP; broken EXIF metadata only loses the metadata
+Image.MAX_IMAGE_PIXELS = 200_000_000
+warnings.filterwarnings("ignore", message="Corrupt EXIF data", category=UserWarning)
 
 
 # ----------------------------------------------------------------------------------------------------

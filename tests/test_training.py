@@ -138,11 +138,12 @@ def test_new_losses_tile_cores_and_quality_metrics(tmp_path):
     out = tmp_path / "features"
     main(TINY + ["--mode", "unroll", "--tile-prob", "1", "--loss", "pixel", "--epochs", "1", "--out", str(out)])
     hist = torch.load(out / "last.pt", weights_only=False)["history"][-1]
-    for key in ("train_edge", "train_value", "train_gate", "train_outside", "val_sharpness", "val_strokes",
-                "val_faint_share", "val_gain_per_100", "val_lineart_edge_err", "val_tile_gate"):
+    for key in ("train_edge", "train_value", "train_outside", "val_sharpness", "val_strokes",
+                "val_faint_share", "val_gain_per_100", "val_lineart_edge_err"):
         assert key in hist, key
     cfg = torch.load(out / "last.pt", weights_only=False)["model_config"]
-    assert cfg["stroke_gate"] and cfg["paintable_mask"] and cfg["stationary"] and cfg["hard_gate"]
+    assert not cfg["stroke_gate"] and cfg["paintable_mask"] and cfg["stationary"] and not cfg["hard_gate"]
+    assert "train_gate" not in hist and "val_tile_gate" not in hist  # no gate: every stroke is painted
 
 
 def test_long_validation(tmp_path):
@@ -428,3 +429,36 @@ def test_loss_presets_and_fine_tune_defaults():
     tuned = parse_args(["--init-from", "x.pt", "--texture-weight", "10", "--simplify-size", "0"])
     assert tuned.lr == 1e-4 and tuned.warmup_steps == 100
     assert tuned.texture_weight == 10 and tuned.simplify_size == 0 and tuned.shift_detail_weight == 20  # overrides
+
+
+def test_shape_bias_is_a_share_of_each_steps_loss(tmp_path):
+    from overpaintai.train import Trainer, parse_args
+
+    losses = []
+    for bias in ("0", "0.02"):
+        torch.manual_seed(0)
+        trainer = Trainer(parse_args(TINY + ["--mode", "unroll", "--tile-prob", "0", "--seed", "3", "--length-bias",
+                                             bias, "--placement-spread", "0", "--out", str(tmp_path / bias)]))
+        with torch.no_grad():
+            losses.append(trainer.unroll_batch()["loss"].item())
+    # loss x (1 - 0.02 x mean log(1 + length)): a few percent lower, for lengths of a few view pixels
+    assert 0.9 * losses[0] < losses[1] < losses[0]
+
+
+@pytest.mark.parametrize("arch", ["unet", "plan", "frame"])
+def test_init_from_a_gated_checkpoint_drops_only_the_gate(tmp_path, arch):
+    from overpaintai.plan_model import build_model
+    from overpaintai.train import Trainer, parse_args
+
+    small = ["--arch", arch, "--view-tokens", "4", "--refine-layers", "1", "--learned-points", "2"]
+    plain = Trainer(parse_args(TINY + small + ["--out", str(tmp_path / "a")]))
+    cfg = dict(plain.model_config, stroke_gate=True, hard_gate=True)  # as models were built before
+    gated = build_model(cfg)
+    torch.save({"model_config": cfg, "model": gated.state_dict()}, tmp_path / "gated.pt")
+    trainer = Trainer(parse_args(TINY + small + ["--init-from", str(tmp_path / "gated.pt"), "--out", str(tmp_path / "b")]))
+    assert not trainer.model.stroke_gate
+    old, new = gated.state_dict(), trainer.model.state_dict()
+    shrunk = [k for k in new if new[k].shape != old[k].shape]
+    assert len(shrunk) == 2  # the stroke head's last weight and bias: one output row less
+    for k in new:  # everything else copied, the head without its last (gate) row
+        assert torch.equal(new[k], old[k][: new[k].shape[0]] if k in shrunk else old[k]), k

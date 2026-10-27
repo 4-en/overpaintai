@@ -93,22 +93,51 @@ def stroke_edge_sharpness(pyramid: torch.Tensor, points: torch.Tensor, radii: to
     return s / (s + ref)
 
 
+def painted_length(points: torch.Tensor, radii: torch.Tensor, opacity: Optional[torch.Tensor] = None,
+                   samples: int = 9) -> torch.Tensor:
+    """
+    `(B, N)` length of what a stroke visibly paints, in `points` units: the spread of its paint along its main
+    axis (`sqrt(12 * variance)` of the curve positions, weighted by radius x opacity along the profile). A
+    uniform stroke gets exactly its chord; one whose ends taper to thin, faint tails only gets its body, so
+    tails are no way to look long; a stroke doubling back gains nothing. `radii` / `opacity` (B, N, 2 or 3)
+    in `views.Strokes` layout (start, end[, middle]); without `opacity`, the radius profile alone.
+    """
+    def profile(v: torch.Tensor) -> torch.Tensor:  # (B, N, samples) quadratic profile, as the renderer's
+        mid = v[..., 2] if v.shape[-1] == 3 else v.mean(-1)
+        return omt * omt * v[..., :1] + 2.0 * omt * t * mid.unsqueeze(-1) + t * t * v[..., 1:2]
+
+    t = torch.linspace(0.0, 1.0, samples, device=points.device, dtype=points.dtype)
+    omt = 1.0 - t
+    pos = (omt * omt).view(-1, 1) * points[:, :, 0:1] + (2.0 * omt * t).view(-1, 1) * points[:, :, 1:2] \
+        + (t * t).view(-1, 1) * points[:, :, 2:3]  # (B, N, samples, 2)
+    m = profile(radii).clamp(min=1e-6)
+    if opacity is not None:
+        m = m * profile(opacity).clamp(min=1e-6)
+    m = m / m.sum(-1, keepdim=True)
+    c = pos - (m.unsqueeze(-1) * pos).sum(-2, keepdim=True)
+    xx, yy, xy = [(m * v).sum(-1) for v in (c[..., 0] ** 2, c[..., 1] ** 2, c[..., 0] * c[..., 1])]
+    major = 0.5 * (xx + yy) + torch.sqrt(0.25 * (xx - yy) ** 2 + xy * xy + 1e-12)  # largest covariance eigenvalue
+    # samples spread a uniform stroke's variance as chord^2 (s + 1) / (12 (s - 1)), not chord^2 / 12
+    return torch.sqrt(12.0 * major * (samples - 1) / (samples + 1) + 1e-12)
+
+
 def stroke_shape_bias(points: torch.Tensor, radii: torch.Tensor, visible: torch.Tensor, pixels: float,
-                      length_weight: float = 0.0, size_weight: float = 0.0) -> torch.Tensor:
+                      length_weight: float = 0.0, size_weight: float = 0.0,
+                      opacity: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Painterly bias `(B,)` (lower = longer, larger strokes): minus the mean of `length_weight * log(1 + chord)` and
-    `size_weight * log(radius)` over a step's strokes, weighted by how visible they are (`visible` (B, N), detached:
-    a faint or switched-off stroke gains nothing from its shape, so making strokes faint is no way to collect it).
-    Lengths in pixels of `pixels` per unit (`points` (B, N, 3, 2), `radii` (B, N, k)). The chord, not the arc, so
-    a stroke can't gain length by doubling back. Logs: every doubling is worth the same, and the pull on a stroke
-    that is already long fades (1 / length).
+    Painterly bias `(B,)` (lower = longer, larger strokes): minus the mean of `length_weight * log(1 + length)` and
+    `size_weight * log(radius)` over a step's strokes, each times how visible it is (`visible` (B, N) in [0, 1], detached). A
+    mean over all N, not normalized by the visible total: normalized, a step of only faint strokes still collected
+    the whole bias, and the frame model learned exactly that (long, faint strokes, 11% visible).
+    Lengths in pixels of `pixels` per unit (`points` (B, N, 3, 2), `radii` (B, N, k)). The length is
+    `painted_length` (with the stroke's `opacity` profile when given): its visible body, not the chord, so
+    tapering both ends into thin, faint tails gains nothing, and neither does doubling back. Logs: every doubling
+    is worth the same, and the pull on a stroke that is already long fades (1 / length).
     """
-    d = points[:, :, 2] - points[:, :, 0]
-    chord = torch.sqrt((d * d).sum(-1) + 1e-12) * pixels  # (sqrt with eps: a dot's gradient stays finite)
+    length = painted_length(points, radii, opacity) * pixels
     r = (radii.mean(-1) * pixels).clamp(min=0.25)
-    w = visible.detach()
-    w = w / w.sum(-1, keepdim=True).clamp(min=1e-6)
-    return -(w * (length_weight * torch.log1p(chord) + size_weight * torch.log(r))).sum(-1)
+    w = visible.detach().clamp(0.0, 1.0) / visible.shape[-1]
+    return -(w * (length_weight * torch.log1p(length) + size_weight * torch.log(r))).sum(-1)
 
 
 def robust_color_error(pred: torch.Tensor, target: torch.Tensor, tau: float) -> torch.Tensor:
@@ -292,6 +321,12 @@ class MultiScalePaintLoss(nn.Module):
         simplify_passes: median passes of the simplification.
         readiness_tau: color error of the simplified images at which the details count half.
         simplify_weight: weight of the block-in term.
+        simplify_sharpness: weight of edge sharpness within it (vs color at 1), both ways: missing edges and
+            edges the target doesn't have.
+        simplify_soft: an extra one-sided weight on block-in edges that are softer than the target's. Early strokes
+            can't line up with most of the target's edges, so a two-sided match mostly punishes their borders
+            (where the target is smooth) and makes them softer (raising `simplify_sharpness` did); this only asks
+            for crispness where the target has it. E.g. 2.
         extra_terms: optional named terms added on top (e.g. a perceptual or adversarial loss later),
             as `name -> (weight, fn(pred, target, mask))`.
     """
@@ -318,6 +353,8 @@ class MultiScalePaintLoss(nn.Module):
         simplify_passes: int = 2,
         readiness_tau: float = 0.05,
         simplify_weight: float = 1.0,
+        simplify_sharpness: float = 0.5,
+        simplify_soft: float = 0.0,
     ):
         super().__init__()
         self.detail_weight = detail_weight
@@ -334,6 +371,8 @@ class MultiScalePaintLoss(nn.Module):
         self.simplify_passes = simplify_passes
         self.readiness_tau = readiness_tau
         self.simplify_weight = simplify_weight
+        self.simplify_sharpness = simplify_sharpness
+        self.simplify_soft = simplify_soft
         self.scales = tuple(scales)
         self.scale_weights = tuple(scale_weights) if scale_weights is not None else (1.0,) * len(self.scales)
         assert len(self.scale_weights) == len(self.scales)
@@ -379,7 +418,10 @@ class MultiScalePaintLoss(nn.Module):
             return x if ready is None else ready * x
 
         if ready is not None:  # the block-in: large shapes in place, with the target's hard edges
-            block = (s_pred - s_target).abs() + 0.5 * (local_sharpness(s_pred) - local_sharpness(s_target)).abs()
+            sp, st = local_sharpness(s_pred), local_sharpness(s_target)
+            block = (s_pred - s_target).abs() + self.simplify_sharpness * (sp - st).abs()
+            if self.simplify_soft > 0:  # too soft where the target is sharp, never "too sharp"
+                block = block + self.simplify_soft * (st - sp).clamp(min=0.0)
             terms["block"] = self.simplify_weight * mean((1.0 - ready) * block, valid_mask)
 
         if self.detail_weight > 0 and self.robust_tau > 0:

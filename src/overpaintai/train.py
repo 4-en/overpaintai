@@ -40,7 +40,7 @@ from overpaintai import views
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
 from overpaintai.data import ImageFolderDataset, SyntheticSource, load_image
 from overpaintai.degrade import degraded_canvas, touchup_pair
-from overpaintai.losses import MultiScalePaintLoss, _gaussian_blur, psnr, stroke_shape_bias
+from overpaintai.losses import MultiScalePaintLoss, _gaussian_blur, painted_length, psnr, stroke_shape_bias
 from overpaintai.matching import matched_stroke_loss
 from overpaintai.metrics import ACTIVE_OPACITY, painting_metrics
 from overpaintai.model import GATE_LOGIT_RANGE, TransformerBlock
@@ -127,7 +127,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--opaque-canvas", action=argparse.BooleanOptionalAction, default=None,
                    help="New models: paint on an opaque canvas (blank = the background at alpha 1; no transparency; "
                         "default: on for --arch frame, off otherwise)")
-    g.add_argument("--no-stroke-gate", action="store_true", help="New models: no per-stroke gate output")
     g.add_argument("--no-paintable-mask", action="store_true", help="New models: no paintable-mask input")
     g.add_argument("--joint-strokes", action=argparse.BooleanOptionalAction, default=True,
                    help="New models: render each step's strokes as one order-independent operation (per pixel the "
@@ -163,9 +162,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--length-bias", type=float, default=0.0,
                    help="Unroll: painterly bias towards longer strokes, relative to each step's loss: doubling the "
                         "length of every visible stroke is worth 0.69 x this share of the step's loss (log of the "
-                        "chord in view pixels). The loss barely depends on length (doubling all strokes costs "
-                        "0.1-1.5%% of it after the first few steps), so it's left to drift short; 0.01-0.02 is a "
-                        "slight bias. Logged (always): stroke_len, the mean chord of visible strokes in view pixels")
+                        "painted length in view pixels: the stroke's visible body, so thin, faint tails don't count). "
+                        "The loss barely depends on length (doubling all strokes costs 0.1-1.5%% of it after the "
+                        "first few steps), so it's left to drift short; 0.01-0.02 is a slight bias. Logged "
+                        "(always): stroke_len, the mean painted length of visible strokes in view pixels")
     g.add_argument("--size-bias", type=float, default=0.0,
                    help="Unroll: the same towards larger brushes (log radius). Width costs detail, unlike length, "
                         "so keep it below --length-bias, e.g. 0.005. Logged: stroke_radius (view pixels)")
@@ -206,6 +206,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         "little). 0 = off. Validation and best.pt use the loss without it (its value is not "
                         "monotone)")
     g.add_argument("--simplify-weight", type=float, default=10.0, help="--simplify-size: weight of the block-in term")
+    g.add_argument("--block-soft-penalty", type=float, default=0.0,
+                   help="--simplify-size: extra cost for block-in edges softer than the target's (one-sided: hard "
+                        "edges where the target is smooth aren't punished by it), e.g. 2. The block-in alone makes early "
+                        "strokes softer than without it (step-1 hardness 0.57 vs 0.82): a soft edge hedges an uncertain "
+                        "position. Probe on unet_block_test: best hardness at steps 2-3 0.62 / 0.58 -> 0.74 / 0.68 at 2")
     g.add_argument("--texture-window", type=float, default=16.0, help="Window std of the texture loss, px")
     g.add_argument("--texture-bands", default="0.7,1.5,3",
                    help="Blur scales (px) splitting the image into the texture loss's frequency bands")
@@ -365,11 +370,11 @@ class Trainer:
             if "mask" in names and not args.joint_strokes:
                 raise SystemExit("the mask tool only exists within joint steps: drop --no-joint-strokes")
             self.model_config = dict(
-                num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=not args.no_stroke_gate,
+                num_strokes=self.N, **MODEL_PRESETS[args.model_size], stroke_gate=False,
                 global_blocks=args.global_blocks or (6 if plan else 3 if frame else 2),
                 query_blocks=args.query_blocks or (4 if plan else 2),
                 paintable_mask=not args.no_paintable_mask, stationary=True, error_progress=False,
-                hard_gate=not args.no_stroke_gate,
+                hard_gate=False,
             )
             if plan:
                 self.model_config.update(arch="plan", refine_layers=args.refine_layers, view_tokens=args.view_tokens,
@@ -414,7 +419,8 @@ class Trainer:
         )
         self.loss_fn = MultiScalePaintLoss(
             args.detail_weight, scales, weights, simplify_size=args.simplify_size, simplify_passes=args.simplify_passes,
-            readiness_tau=args.readiness_tau, simplify_weight=args.simplify_weight, **loss_kw,
+            readiness_tau=args.readiness_tau, simplify_weight=args.simplify_weight,
+            simplify_soft=args.block_soft_penalty, **loss_kw,
         )
         # Comparing canvases (validation, best.pt) needs a monotone loss: the training loss without the block-in
         # readiness (whose value rises as areas get ready)
@@ -574,7 +580,9 @@ class Trainer:
             loss = loss + 0.01 * (over * over).mean()
 
         metrics = {"match": match_loss.mean().detach(), "render": render_loss.detach(),
-                   "heatmap": heat_loss.mean().detach(), "gate": out.gate.mean().detach(), "relax": relax.mean()}
+                   "heatmap": heat_loss.mean().detach(), "relax": relax.mean()}
+        if self.model.stroke_gate:
+            metrics["gate"] = out.gate.mean().detach()
         if len(self.tools) > 1:  # supervise tool choice on matched pairs
             b = torch.arange(B, device=self.device).unsqueeze(1)
             logits = out.tool_logits[b, assign[0]]
@@ -651,7 +659,7 @@ class Trainer:
         B, S = target.shape[0], target.shape[-1]
         total = (depth + window).float()  # this painting's length so far: `depth` steps are already on the canvas
         loss, weight_sum, entropy, hardness, gates, outside, gate_range = 0.0, 0.0, [], [], [], [], []
-        overlap, crowding, shape_bias, shape_stats = [], [], [], []
+        overlap, crowding, shape_stats = [], [], []
         shaped = a.length_bias > 0 or a.size_bias > 0
         with torch.no_grad():
             start_psnr = psnr(self.painter.composite(layer), target)  # (B,)
@@ -702,6 +710,8 @@ class Trainer:
 
             canvas = self.painter.composite(layer)
             full, terms = self.loss_fn(canvas, target, per_sample=True)
+            st = res.output.strokes
+            visible = st.opacity.mean(-1) * res.gate
             w = 1.0 if last else a.intermediate_weight
             if w > 0:
                 step_loss = full
@@ -709,32 +719,36 @@ class Trainer:
                     region = boxes[:, 0] if cores is None else cores
                     tile_loss, _ = self.loss_fn(canvas, target, box_mask(region, S), per_sample=True)
                     step_loss = 0.5 * (step_loss + tile_loss)
+                if shaped:
+                    # A share of this step's own loss (detached: the loss keeps its full gradient, the bias only
+                    # adds a pull of that size), weighted like the step: a slightly worse longer / larger stroke
+                    # can win, never a much worse one, and late in a painting the trade shrinks with the error.
+                    # Not loss x (1 - bias): that would also scale the loss's gradient down for long strokes
+                    # and turn negative for large ones
+                    bias = stroke_shape_bias(st.points, st.radii, visible, a.view_res - 1, a.length_bias,
+                                             a.size_bias, opacity=st.opacity)
+                    step_loss = step_loss + bias.view(B, -1).mean(1) * step_loss.detach()
                 loss = loss + w * step_loss
                 weight_sum += w
-            st = res.output.strokes
-            visible = st.opacity.mean(-1) * res.gate
-            if shaped:  # in units of this step's loss, so the bias stays a fixed share of what painting gains
-                bias = stroke_shape_bias(st.points, st.radii, visible, a.view_res - 1, a.length_bias, a.size_bias)
-                shape_bias.append(bias.view(B, -1).mean(1) * full.detach())
-            with torch.no_grad():  # mean chord and radius of the visible strokes, in view pixels
+            with torch.no_grad():  # mean painted length and radius of the visible strokes, in view pixels
                 vw = visible / visible.sum(-1, keepdim=True).clamp(min=1e-6)
-                chord = (st.points[:, :, 2] - st.points[:, :, 0]).norm(dim=-1)
-                shape_stats.append(torch.stack([(vw * chord).sum(-1).mean(), (vw * st.radii.mean(-1)).sum(-1).mean()]))
+                length = painted_length(st.points, st.radii, st.opacity)
+                shape_stats.append(torch.stack([(vw * length).sum(-1).mean(), (vw * st.radii.mean(-1)).sum(-1).mean()]))
 
         loss = loss.mean() / weight_sum
         if gate_range:
             loss = loss + 0.01 * torch.stack(gate_range).mean()
-        if shape_bias:
-            loss = loss + torch.stack(shape_bias).mean()
         if a.placement_spread > 0:
             loss = loss + a.placement_spread * torch.stack(crowding).mean()
         with torch.no_grad():
             final_psnr = psnr(self.painter.composite(layer), target)
             metrics = {"psnr": final_psnr.mean(), "entropy": torch.stack(entropy).mean(),
                        "hardness": torch.stack(hardness).mean(), "start_psnr": start_psnr.mean(),
-                       "gate": torch.stack(gates).mean(), "depth": depth.float().mean(),
+                       "depth": depth.float().mean(),
                        "overlap": torch.stack(overlap).mean(),
                        "gain": (final_psnr - start_psnr).mean()}  # improvement of this window over its start
+            if self.model.stroke_gate:
+                metrics["gate"] = torch.stack(gates).mean()
             if outside:
                 metrics["outside"] = torch.stack(outside).mean()
             metrics["stroke_len"], metrics["stroke_radius"] = torch.stack(shape_stats).mean(0) * (a.view_res - 1)
@@ -785,7 +799,7 @@ class Trainer:
             q = painting_metrics(canvases[-1], chunk, blank, strokes.opacity.mean(-1),
                                  strokes.radii.mean(-1) * (chunk.shape[-1] - 1))
             tile_steps = steps[a.steps:]
-            if tile_steps:  # catches tile views that stop painting (e.g. collapsed stroke gates)
+            if tile_steps and model.stroke_gate:  # catches tile views that stop painting (collapsed stroke gates)
                 q["tile_gate"] = torch.stack([r.gate.mean() for r in tile_steps]).mean().item()
             quality.append({k: v * chunk.shape[0] for k, v in q.items()})
         per_step = torch.cat(per_step, dim=1).mean(dim=1)
@@ -898,12 +912,17 @@ class Trainer:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         state = ckpt.get("ema") or ckpt["model"]  # EMA weights are the better starting point
         own = self.model.state_dict()
-        compatible, grown = {}, []
+        compatible, grown, dropped = {}, [], []
+        # A gated checkpoint into a model without the gate: the gate is the stroke head's last output row
+        drop_gate = ckpt.get("model_config", {}).get("stroke_gate", False) and not self.model.stroke_gate
         for k, v in state.items():
             if k not in own:
                 continue
             if own[k].shape == v.shape:
                 compatible[k] = v
+            elif drop_gate and v.dim() >= 1 and own[k].shape == (v.shape[0] - 1, *v.shape[1:]):
+                compatible[k] = v[:-1]
+                dropped.append(k)
             elif own[k].dim() == v.dim() and all(n >= o for n, o in zip(own[k].shape, v.shape)):
                 # Layer got bigger (new input channel / conditioning value / gate output): old weights in
                 # place, new parts zero, so the model starts out behaving exactly like the old one
@@ -913,6 +932,8 @@ class Trainer:
                 grown.append(k)
         if grown:
             print(f"grown layers (old weights copied, new parts zero): {', '.join(grown)}")
+        if dropped:
+            print(f"stroke gate dropped (all strokes are painted now): {', '.join(dropped)}")
         skipped = sorted(set(own) - set(compatible))
         self.model.load_state_dict(compatible, strict=False)
         # Transformer blocks the old model didn't have (a deeper model): zero their residual outputs, so they

@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 import torch
 
 from overpaintai.canvas_engine import DifferentiableCanvasEngine
@@ -284,3 +286,45 @@ def test_shape_bias_prefers_long_large_visible_strokes_and_is_finite_for_dots():
     only_dot = torch.tensor([[1.0, 0.0]])
     assert torch.allclose(stroke_shape_bias(longer, radii, only_dot, 127, 1.0),
                           stroke_shape_bias(pts, radii, only_dot, 127, 1.0))
+
+
+def test_block_soft_penalty_only_counts_edges_softer_than_the_target():
+    from overpaintai.losses import _gaussian_blur
+
+    t = _square_with_dot(96)
+    soft = _gaussian_blur(t, 3.0)  # the square's edges blurred
+    extra = t.clone()
+    extra[..., 64:80, 8:88] = 0.2  # a hard-edged band where the target is smooth (well away from the square)
+    ready = torch.full((1, 1, 96, 96), 0.2)
+
+    def block(x, penalty):
+        f = MultiScalePaintLoss(0.0, (), simplify_size=9, simplify_weight=1.0, simplify_soft=penalty)
+        return f(x, t, readiness=ready)[1]["block"]
+
+    assert block(soft, 2.0) > 1.5 * block(soft, 0.0)  # too soft: costs more
+    assert block(extra, 2.0) == pytest.approx(block(extra, 0.0), rel=0.05)  # too sharp: unchanged
+
+
+def test_painted_length_counts_the_visible_body_not_tapered_tails():
+    from overpaintai.losses import painted_length
+    line = torch.tensor([[[[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]]]])
+    even = torch.tensor([[[1.0, 1.0, 1.0]]])
+    assert torch.allclose(painted_length(line, even[..., :2]), torch.tensor([[10.0]]), atol=1e-4)  # = chord
+    assert torch.allclose(painted_length(line, even, even), torch.tensor([[10.0]]), atol=1e-4)
+    # Ends tapered to thin, faint tails: shorter than its chord, even though the chord is the same
+    taper_r, taper_a = torch.tensor([[[0.1, 0.1, 1.0]]]), torch.tensor([[[0.3, 0.3, 1.0]]])
+    assert painted_length(line, taper_r, taper_a) < 0.8 * painted_length(line, even, even)
+    # Doubling back gains nothing over going straight half the way
+    back = torch.tensor([[[[0.0, 0.0], [10.0, 0.0], [0.0, 0.0]]]])
+    assert painted_length(back, even) < painted_length(line, even)
+    # Widening the ends (more even pressure) lengthens it: the bias's pull on tapered strokes
+    r = taper_r.clone().requires_grad_(True)
+    painted_length(line, r, taper_a).sum().backward()
+    assert r.grad[..., :2].gt(0).all() and r.grad[..., 2].lt(0).all()
+
+
+def test_shape_bias_cannot_be_collected_by_making_every_stroke_faint():
+    pts = torch.tensor([[[[0.3, 0.5], [0.5, 0.5], [0.7, 0.5]]] * 2])
+    radii = torch.full((1, 2, 2), 0.02)
+    opaque, faint = torch.ones(1, 2), torch.full((1, 2), 0.05)
+    assert stroke_shape_bias(pts, radii, faint, 127, 1.0).abs() < 0.1 * stroke_shape_bias(pts, radii, opaque, 127, 1.0).abs()
