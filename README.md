@@ -218,6 +218,21 @@ Once the base model and unrolled training loop are validated, the following exte
     - the more damaged the input, the less certain the detail, so a pixel loss hedges into soft strokes. The loose loss, `--block-soft-penalty` and the hardness levers are the counterweight.
     - a VAE round trip copies the decoder's artifacts, not generation artifacts like wrong anatomy.
   - **First check:** run the current model on damaged inputs and measure the error against the clean originals, compared with clean inputs. Round strokes may already remove much of the damage, in which case the main gain is the knob.
+- **Inference-Time Controls**: knobs that change how the model paints, set per painting in the web UI. Each knob is one more value in the conditioning vector that already carries progress and view size into every stage. Its weights start at zero, so a finished model can be fine-tuned with `--init-from` to gain knobs without starting out any different. Add them only once the base model paints well. How a knob is trained decides whether it works:
+  - **Knobs that weight a loss term** ("loss-conditional training", also called "You Only Train Once"): each image in a batch draws a random weight for some term, and the model sees that weight as input. One model learns the whole range of trade-offs, and inference picks a point on it.
+    - Candidates: stroke length and size (`--length-bias` / `--size-bias`), sharpness (edge and hard-edge terms), opacity style (glazes vs opaque strokes), and a stroke flow direction (an optional angle map, with a loss on stroke direction against it, for hatching or directional brushwork).
+    - **Risk:** a knob is only as good as its term. Every exploit of the term shows up when the knob is turned up: the length bias was gamed with faint tails, and even fixed it hurt the frame model. Each term needs the same exploit check as a fixed bias.
+  - **Knobs that change what the model paints towards:** the input stays the real target, but the loss target is modified, so there is no term to game.
+    - **Abstraction / detail level**, probably the most useful: the loss target is simplified at a random scale s (as with `--simplify-size`), from loose block-in to full detail.
+    - **Faithfulness:** the degraded-targets entry above.
+  - **Knobs that are another kind of input:**
+    - **Colour palette:** K colours as extra tokens the strokes attend to. Each stroke's colour is a soft mix of them, with a small free correction. Train with palettes taken from the target by k-means, at random K, sometimes very small. The model then learns to paint well within a limited palette, and at inference any palette can be supplied. This changes which strokes the model chooses, unlike recolouring the result.
+    - **Style:** the artist-style entry above.
+    - **Brush type:** see the brush bank entry above.
+  - **Spatial maps instead of scalars:** any knob can also be a per-pixel channel, like the paintable mask: detail, sharpness or looseness painted onto regions (a sharp focal point, loose edges elsewhere). The global value is then just a constant map. Train with random smooth maps; it costs no more than a scalar.
+  - **Already there:** randomness. Sampled placement (`placement_noise`, `sample_in_eval`) gives different paintings of the same image. It just needs a control in the web UI.
+  - **Leave out:** saturation, colour temperature and contrast. They are image edits: change the target before painting instead of teaching the model.
+  - **Check per knob:** sweep it at inference over fixed images and measure the matching statistic (stroke length, edge hardness, detail kept, colours used). A knob the model ignores, or that only works at one end of its range, shows up immediately.
 
 ## High-Resolution Inference Harness
 
